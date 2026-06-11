@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     # Ingest
     ingest_max_bytes: int = 10 * 1024 * 1024
     ingest_max_redirects: int = 3
+    ingest_fetch_rate_capacity: float = 20.0
+    ingest_fetch_rate_refill: float = 10.0
+
+    # Swarm correlation
+    swarm_min_guilds: int = 3
+    swarm_window_seconds: int = 300
+    swarm_match_radius: int = 6
 
     # Detection
     decode_timeout_seconds: float = 5.0

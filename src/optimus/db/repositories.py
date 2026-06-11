@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.db.models import (
     Detection,
+    GlobalHash,
     Guild,
     GuildHash,
     GuildWhitelist,
@@ -101,6 +102,18 @@ class WhitelistRepository:
     async def list(self) -> Sequence[GuildWhitelist]:
         """Return all whitelist entries for this guild."""
         stmt = select(GuildWhitelist).where(GuildWhitelist.guild_id == self._guild_id)
+        return (await self._session.execute(stmt)).scalars().all()
+
+
+class GlobalHashRepository:
+    """Read access to globally-shared promoted scam hashes (not guild-scoped)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def list_promoted(self) -> Sequence[GlobalHash]:
+        """Return all promoted global hashes (the set every worker indexes)."""
+        stmt = select(GlobalHash).where(GlobalHash.status == "promoted")
         return (await self._session.execute(stmt)).scalars().all()
 
 

@@ -19,6 +19,9 @@ SUBJECT_VERDICT = "events.verdict.v1"
 SUBJECT_ACTION_RESULT = "events.action_result.v1"
 SUBJECT_SWARM_ALERT = "events.swarm_alert.v1"
 
+#: Core-NATS (non-JetStream) pub/sub subject for hash-index invalidation.
+SUBJECT_INDEX_INVALIDATE = "control.index_invalidate.v1"
+
 #: Stream name carrying every ``events.*`` subject.
 STREAM_EVENTS = "OPTIMUS_EVENTS"
 
@@ -87,7 +90,12 @@ class MessageImageEvent(_Event):
 
 
 class ImageFetchedEvent(_Event):
-    """A validated, in-bounds image ready for decoding. Subject: ``image_fetched.v1``."""
+    """A validated, in-bounds image ready for decoding. Subject: ``image_fetched.v1``.
+
+    The raw image bytes ride inline as base64 (``data_b64``) so detection workers
+    never touch disk. Streams are bounded, so the inline payload is acceptable for
+    the small images this pipeline accepts.
+    """
 
     guild_id: int
     channel_id: int
@@ -98,6 +106,7 @@ class ImageFetchedEvent(_Event):
     content_type: str
     size_bytes: int
     sha256: str
+    data_b64: str
 
 
 class HashSet(BaseModel):
@@ -139,6 +148,16 @@ class ActionResultEvent(_Event):
     action: Action
     success: bool
     detail: str | None = None
+
+
+class IndexInvalidateEvent(_Event):
+    """Signals detection workers to reload a guild's (or the global) hash index.
+
+    Subject: ``control.index_invalidate.v1``. A ``guild_id`` of ``None`` means the
+    global promoted-hash set changed and every worker should reload it.
+    """
+
+    guild_id: int | None = None
 
 
 class SwarmAlertEvent(_Event):

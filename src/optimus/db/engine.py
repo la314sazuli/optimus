@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from optimus.core.config import get_settings
+
+#: A zero-arg factory yielding a transactional :class:`AsyncSession` scope.
+SessionScope = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 def create_engine(url: str | None = None, *, echo: bool = False) -> AsyncEngine:
