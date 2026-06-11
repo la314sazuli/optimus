@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import hikari
 
 from optimus.bus.nats import EventBus
-from optimus.contracts.events import SUBJECT_MESSAGE_IMAGE
+from optimus.contracts.events import (
+    SUBJECT_GUILD_JOINED,
+    SUBJECT_MESSAGE_IMAGE,
+    GuildJoinedEvent,
+)
 from optimus.core.config import Settings, get_settings
 from optimus.core.guild_config import GuildConfig, GuildConfigCache
 from optimus.core.health import HealthServer
@@ -111,6 +116,22 @@ class GatewayService:
                     images=len(events),
                 )
 
+    async def on_guild_join(self, event: hikari.GuildJoinEvent) -> None:
+        """Publish a ``guild_joined.v1`` event so moderation can provision setup."""
+        guild = event.guild
+        with correlation_context() as cid:
+            await self._bus.publish(
+                SUBJECT_GUILD_JOINED,
+                GuildJoinedEvent(
+                    correlation_id=cid,
+                    occurred_at=datetime.now(UTC),
+                    guild_id=int(event.guild_id),
+                    guild_name=guild.name if guild is not None else None,
+                    owner_id=int(guild.owner_id) if guild is not None else None,
+                ),
+            )
+        _log.info("gateway_guild_joined", guild_id=int(event.guild_id))
+
     @staticmethod
     def _should_scan(config: GuildConfig, msg: IncomingMessage) -> bool:
         return config.should_scan(
@@ -159,6 +180,10 @@ async def _amain() -> None:
     @bot.listen(hikari.GuildMessageCreateEvent)
     async def _on_message(event: hikari.GuildMessageCreateEvent) -> None:
         await service.on_message(event)
+
+    @bot.listen(hikari.GuildJoinEvent)
+    async def _on_guild_join(event: hikari.GuildJoinEvent) -> None:
+        await service.on_guild_join(event)
 
     try:
         await bot.start()
