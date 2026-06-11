@@ -5,11 +5,21 @@ from __future__ import annotations
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from optimus.db.models import Detection, Guild, GuildHash, GuildWhitelist
+from optimus.db.models import (
+    Appeal,
+    Detection,
+    Guild,
+    GuildHash,
+    GuildTrustedUser,
+    GuildWhitelist,
+    ModAction,
+)
 from optimus.db.repositories import (
     DetectionRepository,
     GuildHashRepository,
+    GuildPurgeRepository,
     GuildRepository,
+    UserOptoutRepository,
     WhitelistRepository,
 )
 
@@ -103,3 +113,89 @@ async def test_detection_idempotency_scoped(session: AsyncSession) -> None:
 
     recent = await repo.list_recent()
     assert len(recent) == 1
+
+
+# --- opt-out / right to erasure ------------------------------------------------
+
+
+async def test_optout_is_idempotent(session: AsyncSession) -> None:
+    repo = UserOptoutRepository(session)
+    assert await repo.is_opted_out(42) is False
+    await repo.opt_out(42)
+    await repo.opt_out(42)  # second call must not raise or duplicate
+    assert await repo.is_opted_out(42) is True
+
+
+async def test_purge_user_removes_rows_but_keeps_tombstone(session: AsyncSession) -> None:
+    await _make_guild(session, 1)
+    det_repo = DetectionRepository(session, guild_id=1)
+    await det_repo.record(
+        Detection(
+            message_id=1,
+            channel_id=2,
+            attachment_id=3,
+            uploader_id=99,
+            distances={},
+            verdict="scam",
+            idempotency_key="k1",
+        )
+    )
+    session.add(GuildTrustedUser(guild_id=1, user_id=99))
+    await session.flush()
+
+    repo = UserOptoutRepository(session)
+    await repo.opt_out(99)
+    deleted = await repo.purge_user(99)
+
+    assert deleted >= 2
+    assert await det_repo.get_by_idempotency_key("k1") is None
+    # The opt-out tombstone survives so the user stays excluded.
+    assert await repo.is_opted_out(99) is True
+
+
+# --- full guild erasure (/delete_server_data) ----------------------------------
+
+
+async def test_guild_purge_removes_every_owned_row(session: AsyncSession) -> None:
+    await _make_guild(session, 1)
+    await _make_guild(session, 2)
+    det_repo = DetectionRepository(session, guild_id=1)
+    await det_repo.record(
+        Detection(
+            message_id=1,
+            channel_id=2,
+            attachment_id=3,
+            uploader_id=5,
+            distances={},
+            verdict="scam",
+            idempotency_key="g1",
+        )
+    )
+    detection = await det_repo.get_by_idempotency_key("g1")
+    assert detection is not None
+    session.add(Appeal(guild_id=1, detection_id=detection.id, user_id=5))
+    session.add(ModAction(guild_id=1, actor_id=7, action="ban"))
+    session.add(GuildHash(hash_id="h", phash=1, dhash=1, whash=1, guild_id=1))
+    # A second guild's data must be untouched.
+    other = DetectionRepository(session, guild_id=2)
+    await other.record(
+        Detection(
+            message_id=9,
+            channel_id=9,
+            attachment_id=9,
+            uploader_id=9,
+            distances={},
+            verdict="scam",
+            idempotency_key="keep",
+        )
+    )
+    await session.flush()
+
+    deleted = await GuildPurgeRepository(session, guild_id=1).purge()
+
+    assert deleted >= 4
+    assert await GuildRepository(session).get(1) is None
+    assert await det_repo.get_by_idempotency_key("g1") is None
+    # Guild 2 is left intact.
+    assert await GuildRepository(session).get(2) is not None
+    assert await other.get_by_idempotency_key("keep") is not None

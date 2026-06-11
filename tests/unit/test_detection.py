@@ -73,6 +73,23 @@ def test_whitelist_always_wins() -> None:
     assert outcome.whitelisted is True
 
 
+def test_guild_whitelist_overrides_global_match() -> None:
+    # Regression: a per-guild whitelist must suppress a hash promoted to the
+    # GLOBAL index, not just guild-local entries. The candidate exactly matches
+    # a global scam hash, yet the guild's whitelist forces CLEAN.
+    wl = [WhitelistEntry(phash=CANDIDATE["phash"])]
+    outcome = match(
+        CANDIDATE,
+        guild_index=EMPTY,
+        global_index=_guild_index(),
+        whitelist=wl,
+        sensitivity=Sensitivity.STRICT,
+    )
+    assert outcome.verdict is Verdict.CLEAN
+    assert outcome.whitelisted is True
+    assert outcome.matched_hash_id is None
+
+
 def test_is_whitelisted_radius() -> None:
     wl = [WhitelistEntry(phash=0x0)]
     assert is_whitelisted(0x1, wl, radius=4)

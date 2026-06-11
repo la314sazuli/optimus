@@ -137,6 +137,21 @@ class GlobalHash(Base):
     status: Mapped[str] = mapped_column(String(16), default="candidate", nullable=False, index=True)
     campaign_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitter_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    submitter_guild_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = _ts()
+
+
+class GlobalSubmitter(Base):
+    """A user's reputation as a contributor to the global hash database."""
+
+    __tablename__ = "global_submitters"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    reputation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    submitted: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confirmed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rejected: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = _ts()
 
 

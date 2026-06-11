@@ -19,11 +19,17 @@ from optimus.db.models import (
     Detection,
     Evidence,
     GlobalHash,
+    GlobalHashApproval,
+    GlobalSubmitter,
     Guild,
+    GuildChannelIgnored,
     GuildHash,
+    GuildRoleIgnored,
+    GuildTrustedUser,
     GuildWhitelist,
     ModAction,
     StatsRollup,
+    UserOptout,
 )
 
 
@@ -111,7 +117,7 @@ class WhitelistRepository:
 
 
 class GlobalHashRepository:
-    """Read access to globally-shared promoted scam hashes (not guild-scoped)."""
+    """Access to globally-shared scam hashes (candidate/promoted/revoked)."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -120,6 +126,116 @@ class GlobalHashRepository:
         """Return all promoted global hashes (the set every worker indexes)."""
         stmt = select(GlobalHash).where(GlobalHash.status == "promoted")
         return (await self._session.execute(stmt)).scalars().all()
+
+    async def get(self, hash_id: str) -> GlobalHash | None:
+        """Return a global hash by id, regardless of status."""
+        return await self._session.get(GlobalHash, hash_id)
+
+    async def submit_candidate(
+        self,
+        *,
+        hash_id: str,
+        phash: int,
+        dhash: int,
+        whash: int,
+        submitter_user_id: int,
+        submitter_guild_id: int,
+    ) -> GlobalHash:
+        """Insert a new candidate, or return the existing row for ``hash_id``."""
+        existing = await self.get(hash_id)
+        if existing is not None:
+            return existing
+        row = GlobalHash(
+            hash_id=hash_id,
+            phash=phash,
+            dhash=dhash,
+            whash=whash,
+            status="candidate",
+            submitter_user_id=submitter_user_id,
+            submitter_guild_id=submitter_guild_id,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def add_approval(
+        self, *, hash_id: str, approver_user_id: int, approver_guild_id: int
+    ) -> Sequence[GlobalHashApproval]:
+        """Record an approval (idempotent per user) and return all approvals."""
+        stmt = select(GlobalHashApproval).where(
+            GlobalHashApproval.hash_id == hash_id,
+            GlobalHashApproval.approver_user_id == approver_user_id,
+        )
+        if (await self._session.execute(stmt)).scalar_one_or_none() is None:
+            self._session.add(
+                GlobalHashApproval(
+                    hash_id=hash_id,
+                    approver_user_id=approver_user_id,
+                    approver_guild_id=approver_guild_id,
+                )
+            )
+            await self._session.flush()
+        return await self.list_approvals(hash_id)
+
+    async def list_approvals(self, hash_id: str) -> Sequence[GlobalHashApproval]:
+        """Return all approvals recorded for ``hash_id``."""
+        stmt = select(GlobalHashApproval).where(GlobalHashApproval.hash_id == hash_id)
+        return (await self._session.execute(stmt)).scalars().all()
+
+    async def promote(self, hash_id: str, *, signature: str) -> None:
+        """Mark a candidate promoted and attach its Ed25519 signature."""
+        row = await self.get(hash_id)
+        if row is None:
+            raise KeyError(hash_id)
+        row.status = "promoted"
+        row.signature = signature
+        await self._session.flush()
+
+    async def revoke(self, hash_id: str) -> None:
+        """Mark a hash revoked so consumers stop trusting it."""
+        row = await self.get(hash_id)
+        if row is None:
+            raise KeyError(hash_id)
+        row.status = "revoked"
+        await self._session.flush()
+
+
+class GlobalSubmitterRepository:
+    """Submitter reputation for the global hash database (not guild-scoped)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_or_create(self, user_id: int) -> GlobalSubmitter:
+        """Return the submitter row for ``user_id``, creating it at zero."""
+        row = await self._session.get(GlobalSubmitter, user_id)
+        if row is None:
+            row = GlobalSubmitter(user_id=user_id)
+            self._session.add(row)
+            await self._session.flush()
+        return row
+
+    async def record_submission(self, user_id: int) -> GlobalSubmitter:
+        """Increment a submitter's submission counter."""
+        row = await self.get_or_create(user_id)
+        row.submitted += 1
+        await self._session.flush()
+        return row
+
+    async def adjust_reputation(
+        self, user_id: int, *, confirmed: int = 0, rejected: int = 0
+    ) -> GlobalSubmitter:
+        """Apply confirm/reject reputation deltas to a submitter."""
+        from optimus.globaldb.promotion import reputation_after
+
+        row = await self.get_or_create(user_id)
+        row.confirmed += confirmed
+        row.rejected += rejected
+        row.reputation = reputation_after(
+            row.reputation, confirmed=confirmed, rejected=rejected
+        )
+        await self._session.flush()
+        return row
 
 
 class DetectionRepository:
@@ -328,3 +444,75 @@ class GuildListRepository:
         """Return a guild's configured retention window in days."""
         stmt = select(Guild.retention_days).where(Guild.guild_id == guild_id)
         return (await self._session.execute(stmt)).scalar_one_or_none()
+
+
+class UserOptoutRepository:
+    """Tracks users who have exercised their right to erasure (not guild-scoped)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def is_opted_out(self, user_id: int) -> bool:
+        """Return whether ``user_id`` has opted out of processing."""
+        return (await self._session.get(UserOptout, user_id)) is not None
+
+    async def opt_out(self, user_id: int) -> UserOptout:
+        """Record an opt-out for ``user_id`` (idempotent)."""
+        row = await self._session.get(UserOptout, user_id)
+        if row is None:
+            row = UserOptout(user_id=user_id)
+            self._session.add(row)
+            await self._session.flush()
+        return row
+
+    async def purge_user(self, user_id: int) -> int:
+        """Delete a user's rows across every guild-scoped table; return rows deleted.
+
+        Detections (and their cascading appeals/evidence) plus any trusted-user
+        entries are removed. The opt-out tombstone itself is left in place so the
+        user remains excluded from future processing.
+        """
+        total = 0
+        for stmt in (
+            delete(Detection).where(Detection.uploader_id == user_id),
+            delete(Appeal).where(Appeal.user_id == user_id),
+            delete(GuildTrustedUser).where(GuildTrustedUser.user_id == user_id),
+        ):
+            result = await self._session.execute(stmt)
+            total += cast("CursorResult[Any]", result).rowcount or 0
+        await self._session.flush()
+        return total
+
+
+class GuildPurgeRepository:
+    """Full per-guild data erasure for the ``/delete_server_data`` GDPR flow."""
+
+    def __init__(self, session: AsyncSession, guild_id: int) -> None:
+        self._session = session
+        self._guild_id = guild_id
+
+    async def purge(self) -> int:
+        """Delete every row owned by this guild; return total rows deleted.
+
+        The ``guilds`` config row is removed last so its ``ON DELETE CASCADE``
+        children (ignored channels/roles, trusted users, guild hashes, whitelist)
+        are torn down with it.
+        """
+        gid = self._guild_id
+        total = 0
+        for stmt in (
+            delete(Appeal).where(Appeal.guild_id == gid),
+            delete(Detection).where(Detection.guild_id == gid),
+            delete(ModAction).where(ModAction.guild_id == gid),
+            delete(StatsRollup).where(StatsRollup.guild_id == gid),
+            delete(GuildHash).where(GuildHash.guild_id == gid),
+            delete(GuildWhitelist).where(GuildWhitelist.guild_id == gid),
+            delete(GuildChannelIgnored).where(GuildChannelIgnored.guild_id == gid),
+            delete(GuildRoleIgnored).where(GuildRoleIgnored.guild_id == gid),
+            delete(GuildTrustedUser).where(GuildTrustedUser.guild_id == gid),
+            delete(Guild).where(Guild.guild_id == gid),
+        ):
+            result = await self._session.execute(stmt)
+            total += cast("CursorResult[Any]", result).rowcount or 0
+        await self._session.flush()
+        return total

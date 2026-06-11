@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
+from optimus.i18n import translate
+
 CUSTOM_ID_PREFIX = "om:v1"
 
 
@@ -67,28 +69,37 @@ class ReportData:
     matched_hash_id: str | None = None
     swarm_guilds: int | None = None
     evidence_url: str | None = None
+    locale: str = "en"
 
 
 def report_title(data: ReportData) -> str:
-    """A short, human title for the report."""
-    return f"Scam detection #{data.detection_id} — {data.verdict.upper()}"
+    """A short, localized title for the report."""
+    return translate(
+        "report.title", data.locale, detection_id=data.detection_id, verdict=data.verdict.upper()
+    )
 
 
 def report_fields(data: ReportData) -> list[tuple[str, str]]:
-    """The ordered (name, value) field pairs for the report embed."""
+    """The ordered (localized name, value) field pairs for the report embed."""
+    loc = data.locale
     fields: list[tuple[str, str]] = [
-        ("Uploader", f"<@{data.uploader_id}>"),
-        ("Channel", f"<#{data.channel_id}>"),
-        ("Message", str(data.message_id)),
-        ("Confidence", f"{data.confidence:.2f}"),
-        ("Action taken", data.action_taken),
+        (translate("report.field_uploader", loc), f"<@{data.uploader_id}>"),
+        (translate("report.field_channel", loc), f"<#{data.channel_id}>"),
+        (translate("report.field_message", loc), str(data.message_id)),
+        (translate("report.field_confidence", loc), f"{data.confidence:.2f}"),
+        (translate("report.field_action", loc), data.action_taken),
     ]
     if data.matched_hash_id:
-        fields.append(("Matched hash", data.matched_hash_id))
+        fields.append((translate("report.field_matched_hash", loc), data.matched_hash_id))
     if data.swarm_guilds:
-        fields.append(("Swarm", f"seen across {data.swarm_guilds} guilds"))
+        fields.append(
+            (
+                translate("report.field_swarm", loc),
+                translate("report.field_swarm_value", loc, count=data.swarm_guilds),
+            )
+        )
     if data.evidence_url:
-        fields.append(("Evidence", data.evidence_url))
+        fields.append((translate("report.field_evidence", loc), data.evidence_url))
     return fields
 
 

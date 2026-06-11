@@ -23,22 +23,13 @@ from optimus.contracts.events import Action
 from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.circuit import CircuitBreaker, CircuitOpenError
 from optimus.core.ratelimit import RateLimit, RateLimiter
+from optimus.i18n import translate
 from optimus.services.moderation.cooldown import Cooldown
-
-#: Built-in DM warning templates keyed by locale (i18n-ready; English default).
-DM_TEMPLATES: dict[str, str] = {
-    "en": (
-        "Your message in **{guild}** was removed because it matched a known "
-        "scam/phishing image. If you believe this was a mistake, contact the "
-        "server moderators."
-    ),
-}
 
 
 def render_dm(locale: str, *, guild: str) -> str:
-    """Render the localized DM warning, falling back to English."""
-    template = DM_TEMPLATES.get(locale, DM_TEMPLATES["en"])
-    return template.format(guild=guild)
+    """Render the localized DM warning from the i18n catalog (English fallback)."""
+    return translate("dm.warning", locale, guild=guild)
 
 
 class RestActions(Protocol):

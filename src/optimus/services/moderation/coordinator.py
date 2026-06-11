@@ -169,5 +169,6 @@ class ModerationCoordinator:
                 confidence=event.confidence,
                 action_taken=action.value,
                 matched_hash_id=event.matched_hash_id,
+                locale=cfg.locale,
             ),
         )
