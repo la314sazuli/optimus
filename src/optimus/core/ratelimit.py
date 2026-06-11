@@ -75,6 +75,8 @@ class RedisRateLimiter:
 
     async def acquire(self, key: str, limit: RateLimit, cost: float = 1.0) -> bool:
         """Consume ``cost`` tokens atomically in Redis."""
+        if cost <= 0:
+            raise ValueError("cost must be positive")
         full_key = f"{self._prefix}:{key}"
         result = await self._redis.eval(  # type: ignore[attr-defined]
             _BUCKET_SCRIPT,
@@ -106,6 +108,8 @@ class InMemoryRateLimiter:
 
     async def acquire(self, key: str, limit: RateLimit, cost: float = 1.0) -> bool:
         """Consume ``cost`` tokens for ``key`` in process memory."""
+        if cost <= 0:
+            raise ValueError("cost must be positive")
         now = self._now()
         bucket = self._buckets.get(key)
         if bucket is None:
@@ -118,3 +122,21 @@ class InMemoryRateLimiter:
             bucket.tokens -= cost
             return True
         return False
+
+    def evict_idle(self, limit: RateLimit) -> int:
+        """Drop buckets that have fully refilled, returning how many were freed.
+
+        The bucket map otherwise retains one entry per key ever seen. A caller
+        that uses this limiter as a long-lived fallback (Redis unavailable)
+        should call this periodically to bound memory under high key churn.
+        """
+        now = self._now()
+        stale = [
+            key
+            for key, b in self._buckets.items()
+            if min(limit.capacity, b.tokens + max(0.0, now - b.ts) * limit.refill_rate)
+            >= limit.capacity
+        ]
+        for key in stale:
+            del self._buckets[key]
+        return len(stale)

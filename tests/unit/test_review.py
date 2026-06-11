@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from optimus.services.moderation import review as review_mod
 from optimus.services.moderation.review import (
     REVIEW_BUTTONS,
     ReportData,
     ReviewAction,
+    build_action_rows,
     decode_custom_id,
     encode_custom_id,
     report_fields,
@@ -34,6 +36,27 @@ def test_decode_rejects_foreign_custom_id() -> None:
 
 def test_all_buttons_are_offered() -> None:
     assert set(REVIEW_BUTTONS) == set(ReviewAction)
+
+
+def test_build_action_rows_default_layout() -> None:
+    rows = build_action_rows(42)
+    sizes = [len(row.components) for row in rows]  # type: ignore[attr-defined]
+    assert sum(sizes) == len(REVIEW_BUTTONS)
+    assert all(0 < n <= 5 for n in sizes)
+
+
+@pytest.mark.parametrize("count", [1, 4, 5, 6, 10, 11])
+def test_build_action_rows_never_emits_empty_or_overfull_row(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    # A button count that is a multiple of 5 previously produced a trailing
+    # empty action row, which Discord rejects.
+    buttons = tuple((list(ReviewAction) * 3)[:count])
+    monkeypatch.setattr(review_mod, "REVIEW_BUTTONS", buttons)
+    rows = build_action_rows(1)
+    sizes = [len(row.components) for row in rows]  # type: ignore[attr-defined]
+    assert sum(sizes) == count
+    assert all(0 < n <= 5 for n in sizes)
 
 
 def test_report_title_and_fields() -> None:

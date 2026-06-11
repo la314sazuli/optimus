@@ -139,7 +139,8 @@ def build_action_rows(detection_id: int) -> list[object]:
 
     rows: list[object] = []
     row = hikari.impl.MessageActionRowBuilder()
-    for i, action in enumerate(REVIEW_BUTTONS):
+    buttons_in_row = 0
+    for action in REVIEW_BUTTONS:
         style = (
             hikari.ButtonStyle.SUCCESS
             if action is ReviewAction.CONFIRM_SCAM
@@ -147,16 +148,19 @@ def build_action_rows(detection_id: int) -> list[object]:
             if action in (ReviewAction.BAN_UPLOADER, ReviewAction.FALSE_POSITIVE)
             else hikari.ButtonStyle.SECONDARY
         )
+        # Discord allows up to 5 buttons per row; start a fresh row when full.
+        if buttons_in_row == 5:
+            rows.append(row)
+            row = hikari.impl.MessageActionRowBuilder()
+            buttons_in_row = 0
         row.add_interactive_button(
             cast("Any", style),
             encode_custom_id(action, detection_id),
             label=BUTTON_LABELS[action],
         )
-        # Discord allows up to 5 buttons per row.
-        if (i + 1) % 5 == 0:
-            rows.append(row)
-            row = hikari.impl.MessageActionRowBuilder()
-    rows.append(row)
+        buttons_in_row += 1
+    if buttons_in_row:
+        rows.append(row)
     return rows
 
 

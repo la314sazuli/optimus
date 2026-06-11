@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 
 import pytest
@@ -104,6 +105,122 @@ async def test_circuit_call_fast_fails_when_open() -> None:
         await cb.call(fn)
 
 
+async def test_circuit_half_open_admits_single_trial_concurrently() -> None:
+    clock = {"t": 0.0}
+    cb = CircuitBreaker(failure_threshold=1, recovery_time=5.0, time_source=lambda: clock["t"])
+    cb.record_failure()
+    clock["t"] = 5.0  # recovery elapsed -> half-open on next state read
+
+    gate = asyncio.Event()
+    started = {"n": 0}
+
+    async def slow() -> int:
+        started["n"] += 1
+        await gate.wait()
+        return 1
+
+    # The first trial reserves the only permit and parks on the gate; while it
+    # is in flight, further calls must fail fast rather than pile on.
+    first = asyncio.create_task(cb.call(slow))
+    await asyncio.sleep(0)  # let `first` reserve its permit and start awaiting
+
+    for _ in range(5):
+        with pytest.raises(CircuitOpenError):
+            await cb.call(slow)
+
+    assert started["n"] == 1  # only the permitted trial actually ran
+    gate.set()
+    assert await first == 1
+    assert cb.state is CircuitState.CLOSED  # success closed the circuit
+
+
+async def test_circuit_half_open_permits_match_success_threshold() -> None:
+    clock = {"t": 0.0}
+    cb = CircuitBreaker(
+        failure_threshold=1,
+        recovery_time=5.0,
+        success_threshold=2,
+        time_source=lambda: clock["t"],
+    )
+    cb.record_failure()
+    clock["t"] = 5.0
+
+    gate = asyncio.Event()
+    started = {"n": 0}
+
+    async def slow() -> int:
+        started["n"] += 1
+        await gate.wait()
+        return 1
+
+    t1 = asyncio.create_task(cb.call(slow))
+    t2 = asyncio.create_task(cb.call(slow))
+    await asyncio.sleep(0)
+
+    # Two permits available, so a third concurrent trial is rejected.
+    with pytest.raises(CircuitOpenError):
+        await cb.call(slow)
+    assert started["n"] == 2
+
+    gate.set()
+    assert await t1 == 1
+    assert await t2 == 1
+    assert cb.state is CircuitState.CLOSED
+
+
+async def test_circuit_half_open_permit_freed_after_failure_reopens() -> None:
+    clock = {"t": 0.0}
+    cb = CircuitBreaker(failure_threshold=1, recovery_time=5.0, time_source=lambda: clock["t"])
+    cb.record_failure()
+    clock["t"] = 5.0
+    assert cb.state is CircuitState.HALF_OPEN
+
+    async def boom() -> int:
+        raise RuntimeError("trial failed")
+
+    with pytest.raises(RuntimeError):
+        await cb.call(boom)
+    # The failed trial re-opens the circuit and leaves no leaked permits behind.
+    assert cb.state is CircuitState.OPEN
+    assert cb._trials_in_flight == 0
+
+
+async def test_circuit_half_open_reopens_then_recovers_again() -> None:
+    clock = {"t": 0.0}
+    cb = CircuitBreaker(failure_threshold=1, recovery_time=5.0, time_source=lambda: clock["t"])
+    cb.record_failure()
+    clock["t"] = 5.0
+
+    async def boom() -> int:
+        raise RuntimeError("nope")
+
+    async def ok() -> int:
+        return 1
+
+    with pytest.raises(RuntimeError):
+        await cb.call(boom)
+    assert cb.state is CircuitState.OPEN
+
+    clock["t"] = 10.0  # second recovery window elapses
+    assert cb.state is CircuitState.HALF_OPEN
+    assert await cb.call(ok) == 1
+    assert cb.state is CircuitState.CLOSED
+
+
+async def test_circuit_closed_allows_unbounded_concurrency() -> None:
+    cb = CircuitBreaker(failure_threshold=3)
+    assert cb.state is CircuitState.CLOSED
+
+    async def ok() -> int:
+        await asyncio.sleep(0)
+        return 1
+
+    results = await asyncio.gather(*(cb.call(ok) for _ in range(50)))
+    assert results == [1] * 50
+    assert cb.state is CircuitState.CLOSED  # no spurious permit starvation
+    assert cb._trials_in_flight == 0
+
+
 # --- rate limiting -------------------------------------------------------------
 
 
@@ -123,6 +240,43 @@ async def test_rate_limit_keys_are_independent() -> None:
     limit = RateLimit(capacity=1, refill_rate=1.0)
     assert await limiter.acquire("a", limit)
     assert await limiter.acquire("b", limit)
+
+
+async def test_in_memory_rate_limit_rejects_nonpositive_cost() -> None:
+    limiter = InMemoryRateLimiter()
+    limit = RateLimit(capacity=2, refill_rate=1.0)
+    with pytest.raises(ValueError, match="cost must be positive"):
+        await limiter.acquire("k", limit, cost=0)
+    with pytest.raises(ValueError, match="cost must be positive"):
+        await limiter.acquire("k", limit, cost=-1)
+
+
+async def test_in_memory_rate_limit_evict_idle_bounds_memory() -> None:
+    clock = {"t": 0.0}
+    limiter = InMemoryRateLimiter(time_source=lambda: clock["t"])
+    limit = RateLimit(capacity=2, refill_rate=1.0)
+    for i in range(50):
+        assert await limiter.acquire(f"key-{i}", limit)  # 1 token left each
+    assert len(limiter._buckets) == 50
+    # Nothing has refilled yet, so a sweep now frees nothing.
+    assert limiter.evict_idle(limit) == 0
+    assert len(limiter._buckets) == 50
+    # After a full refill window every bucket is back at capacity and is freed.
+    clock["t"] = 10.0
+    assert limiter.evict_idle(limit) == 50
+    assert len(limiter._buckets) == 0
+
+
+async def test_evict_idle_keeps_actively_throttled_buckets() -> None:
+    clock = {"t": 0.0}
+    limiter = InMemoryRateLimiter(time_source=lambda: clock["t"])
+    limit = RateLimit(capacity=3, refill_rate=1.0)
+    assert await limiter.acquire("busy", limit)
+    assert await limiter.acquire("busy", limit)
+    assert await limiter.acquire("busy", limit)  # drained to 0
+    clock["t"] = 1.0  # only 1 token back -> still below capacity
+    assert limiter.evict_idle(limit) == 0
+    assert "busy" in limiter._buckets
 
 
 # --- idempotency ---------------------------------------------------------------
