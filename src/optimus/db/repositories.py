@@ -8,17 +8,22 @@ top of Postgres RLS (multi-tenant mode).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, select
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.db.models import (
+    Appeal,
     Detection,
+    Evidence,
     GlobalHash,
     Guild,
     GuildHash,
     GuildWhitelist,
+    ModAction,
+    StatsRollup,
 )
 
 
@@ -147,3 +152,179 @@ class DetectionRepository:
             .limit(limit)
         )
         return (await self._session.execute(stmt)).scalars().all()
+
+    async def set_action_taken(self, detection_id: int, action: str) -> int:
+        """Record the action applied to a detection; return rows affected."""
+        from sqlalchemy import update
+
+        stmt = (
+            update(Detection)
+            .where(Detection.guild_id == self._guild_id, Detection.id == detection_id)
+            .values(action_taken=action)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+    async def count_in_window(self, start: datetime, end: datetime) -> int:
+        """Count detections created in ``[start, end)`` for this guild."""
+        stmt = select(func.count()).where(
+            Detection.guild_id == self._guild_id,
+            Detection.created_at >= start,
+            Detection.created_at < end,
+        )
+        return int((await self._session.execute(stmt)).scalar_one())
+
+    async def delete_older_than(self, cutoff: datetime) -> int:
+        """Delete detections older than ``cutoff``; return rows deleted."""
+        stmt = delete(Detection).where(
+            Detection.guild_id == self._guild_id, Detection.created_at < cutoff
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+
+class ModActionRepository:
+    """Append-only audit log of administrative actions, scoped per guild."""
+
+    def __init__(self, session: AsyncSession, guild_id: int) -> None:
+        self._session = session
+        self._guild_id = guild_id
+
+    async def record(
+        self,
+        *,
+        actor_id: int,
+        action: str,
+        target: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> ModAction:
+        """Append an audit row for this guild."""
+        row = ModAction(
+            guild_id=self._guild_id,
+            actor_id=actor_id,
+            action=action,
+            target=target,
+            payload=payload or {},
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def list_recent(self, limit: int = 100) -> Sequence[ModAction]:
+        """Return the most recent audit rows for this guild."""
+        stmt = (
+            select(ModAction)
+            .where(ModAction.guild_id == self._guild_id)
+            .order_by(ModAction.created_at.desc())
+            .limit(limit)
+        )
+        return (await self._session.execute(stmt)).scalars().all()
+
+    async def delete_older_than(self, cutoff: datetime) -> int:
+        """Delete audit rows older than ``cutoff``; return rows deleted."""
+        stmt = delete(ModAction).where(
+            ModAction.guild_id == self._guild_id, ModAction.created_at < cutoff
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+
+class AppealRepository:
+    """Guild-scoped user appeals against detections."""
+
+    def __init__(self, session: AsyncSession, guild_id: int) -> None:
+        self._session = session
+        self._guild_id = guild_id
+
+    async def open(self, *, detection_id: int, user_id: int) -> Appeal:
+        """Open a new appeal for a detection."""
+        row = Appeal(guild_id=self._guild_id, detection_id=detection_id, user_id=user_id)
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def delete_older_than(self, cutoff: datetime) -> int:
+        """Delete appeals older than ``cutoff``; return rows deleted."""
+        stmt = delete(Appeal).where(
+            Appeal.guild_id == self._guild_id, Appeal.created_at < cutoff
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+
+class StatsRollupRepository:
+    """Per-guild hourly statistics rollups (upserted by bucket)."""
+
+    def __init__(self, session: AsyncSession, guild_id: int) -> None:
+        self._session = session
+        self._guild_id = guild_id
+
+    async def upsert(
+        self,
+        *,
+        bucket_start: datetime,
+        detections: int,
+        false_positives: int,
+        actions: dict[str, Any],
+    ) -> StatsRollup:
+        """Insert or replace the rollup for ``bucket_start``."""
+        stmt = select(StatsRollup).where(
+            StatsRollup.guild_id == self._guild_id,
+            StatsRollup.bucket_start == bucket_start,
+        )
+        existing = (await self._session.execute(stmt)).scalar_one_or_none()
+        if existing is None:
+            existing = StatsRollup(guild_id=self._guild_id, bucket_start=bucket_start)
+            self._session.add(existing)
+        existing.detections = detections
+        existing.false_positives = false_positives
+        existing.actions = actions
+        await self._session.flush()
+        return existing
+
+
+class EvidenceRepository:
+    """Tracks stored evidence objects and their expiry (not guild-scoped)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record(self, *, detection_id: int, object_key: str, expires_at: datetime) -> Evidence:
+        """Persist a reference to a stored evidence object."""
+        row = Evidence(detection_id=detection_id, object_key=object_key, expires_at=expires_at)
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def list_expired(self, now: datetime, limit: int = 500) -> Sequence[Evidence]:
+        """Return evidence rows whose TTL has elapsed."""
+        stmt = select(Evidence).where(Evidence.expires_at < now).limit(limit)
+        return (await self._session.execute(stmt)).scalars().all()
+
+    async def delete(self, evidence_id: int) -> int:
+        """Delete an evidence row by id; return rows deleted."""
+        stmt = delete(Evidence).where(Evidence.id == evidence_id)
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+
+class GuildListRepository:
+    """Account-wide guild enumeration (not guild-scoped) for sweep jobs."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def all_ids(self) -> Sequence[int]:
+        """Return every configured guild id."""
+        stmt = select(Guild.guild_id)
+        return (await self._session.execute(stmt)).scalars().all()
+
+    async def retention_days(self, guild_id: int) -> int | None:
+        """Return a guild's configured retention window in days."""
+        stmt = select(Guild.retention_days).where(Guild.guild_id == guild_id)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
