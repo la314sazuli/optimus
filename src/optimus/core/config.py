@@ -83,9 +83,48 @@ class Settings(BaseSettings):
     # Rate limiting
     ratelimit_redis_prefix: str = "optimus:rl"
 
+    # Moderation
+    #: Confidence at or above which a verdict is queued for moderator review.
+    mod_queue_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: Confidence at or above which the configured action is auto-applied.
+    mod_auto_act_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    #: Per-guild Discord REST action budget (token bucket).
+    mod_action_rate_capacity: float = 5.0
+    mod_action_rate_refill: float = 1.0
+    #: Cooldown between DM warnings to the same user (seconds).
+    mod_dm_cooldown_seconds: int = Field(default=3600, ge=1)
+    #: Default timeout applied by DELETE_TIMEOUT (seconds).
+    mod_timeout_seconds: int = Field(default=3600, ge=1)
+    mod_circuit_failure_threshold: int = Field(default=5, ge=1)
+    mod_circuit_recovery_seconds: float = 30.0
+
+    # Safe mode (anomaly-driven auto report-only)
+    #: Multiplier of standard deviations above baseline that trips safe mode.
+    safemode_sigma: float = Field(default=4.0, gt=0.0)
+    #: EWMA smoothing factor for the rolling baseline (0..1).
+    safemode_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
+    #: Minimum baseline mean before safe mode can trip (avoids small-sample noise).
+    safemode_min_floor: float = Field(default=5.0, ge=0.0)
+    #: Lifetime of the baseline state in Redis (seconds).
+    safemode_ttl_seconds: int = Field(default=7 * 24 * 3600, ge=1)
+
     # Evidence storage
     evidence_enabled: bool = False
     evidence_ttl_seconds: int = Field(default=3600, ge=1, le=86_400)
+    evidence_max_ttl_seconds: int = Field(default=86_400, ge=1, le=86_400)
+    evidence_bucket: str = "optimus-evidence"
+    evidence_endpoint_url: str = ""
+    evidence_region: str = "us-east-1"
+    evidence_sse: str = "AES256"
+    evidence_presign_seconds: int = Field(default=300, ge=1, le=3600)
+
+    # Scheduler intervals (seconds)
+    scheduler_retention_interval: int = Field(default=3600, ge=1)
+    scheduler_evidence_interval: int = Field(default=600, ge=1)
+    scheduler_rollup_interval: int = Field(default=900, ge=1)
+    scheduler_index_rebuild_interval: int = Field(default=1800, ge=1)
+    scheduler_health_interval: int = Field(default=300, ge=1)
+    scheduler_jitter_fraction: float = Field(default=0.1, ge=0.0, le=1.0)
 
     # Global hash DB signing (Ed25519, base64-encoded)
     global_signing_public_key: str = ""

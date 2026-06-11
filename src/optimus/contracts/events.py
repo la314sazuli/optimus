@@ -18,6 +18,7 @@ SUBJECT_IMAGE_FETCHED = "events.image_fetched.v1"
 SUBJECT_VERDICT = "events.verdict.v1"
 SUBJECT_ACTION_RESULT = "events.action_result.v1"
 SUBJECT_SWARM_ALERT = "events.swarm_alert.v1"
+SUBJECT_GUILD_JOINED = "events.guild_joined.v1"
 
 #: Core-NATS (non-JetStream) pub/sub subject for hash-index invalidation.
 SUBJECT_INDEX_INVALIDATE = "control.index_invalidate.v1"
@@ -32,6 +33,7 @@ EVENT_SUBJECTS: tuple[str, ...] = (
     SUBJECT_VERDICT,
     SUBJECT_ACTION_RESULT,
     SUBJECT_SWARM_ALERT,
+    SUBJECT_GUILD_JOINED,
 )
 
 
@@ -167,3 +169,14 @@ class SwarmAlertEvent(_Event):
     distinct_guilds: int = Field(ge=1)
     window_seconds: int = Field(ge=1)
     sample_guild_ids: list[int] = Field(default_factory=list)
+
+
+class GuildJoinedEvent(_Event):
+    """The bot was added to a guild. Subject: ``guild_joined.v1``.
+
+    Triggers one-time provisioning such as the private mod-review channel.
+    """
+
+    guild_id: int
+    guild_name: str | None = None
+    owner_id: int | None = None
