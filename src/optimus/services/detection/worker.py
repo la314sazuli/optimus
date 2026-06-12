@@ -48,6 +48,11 @@ DUPLICATE_SKIPPED = Counter(
     "optimus_detection_duplicate_skipped_total",
     "Images skipped because their idempotency key was already claimed.",
 )
+PAYLOAD_REJECTED = Counter(
+    "optimus_detection_payload_rejected_total",
+    "Image payloads rejected before decode (resolved as non-decisions).",
+    ["reason"],
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +116,15 @@ class DetectionWorker:
             DUPLICATE_SKIPPED.inc()
             return None
 
-        data = base64.b64decode(event.data_b64)
+        # A malformed/oversized inline payload must resolve as a non-decision, not
+        # raise — an exception here would nak the message and redeliver the same
+        # bad payload until ``max_deliver``, a pure waste under a hostile flood.
+        try:
+            data = base64.b64decode(event.data_b64, validate=True)
+        except ValueError:  # includes binascii.Error (malformed base64)
+            PAYLOAD_REJECTED.labels(reason="decode").inc()
+            _log.warning("detection_payload_rejected", reason="decode")
+            return DetectionResult(verdict=self._verdict(event, _non_decision()))
         # Decode (subprocess wall-wait) and perceptual hashing (numpy/Python,
         # up to max_frames frames) are both blocking and CPU/IO-bound. Run them
         # off the event loop so the NATS consumer loop and health server stay

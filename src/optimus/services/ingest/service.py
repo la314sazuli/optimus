@@ -61,7 +61,9 @@ def build_worker(settings: Settings, redis: object | None) -> IngestWorker:
     async def _fetch(url: str) -> FetchedImage:
         return await fetch(url)
 
-    return IngestWorker(_fetch, limiter, rate=rate)
+    return IngestWorker(
+        _fetch, limiter, rate=rate, max_inline_bytes=settings.ingest_max_inline_bytes
+    )
 
 
 async def _amain() -> None:

@@ -6,6 +6,8 @@ import asyncio
 import time
 
 import aiohttp
+import pytest
+from pydantic import ValidationError
 
 from optimus.core.config import Sensitivity, Settings, Tenancy
 from optimus.core.health import HealthServer
@@ -16,6 +18,21 @@ def test_settings_defaults() -> None:
     assert settings.tenancy is Tenancy.SINGLE
     assert settings.is_multi_tenant is False
     assert settings.sensitivity_default is Sensitivity.BALANCED
+
+
+def test_payload_hardening_defaults() -> None:
+    settings = Settings(_env_file=None)
+    # Inline cap is bounded and at/below the streamed download cap.
+    assert settings.ingest_max_inline_bytes == 8 * 1024 * 1024
+    assert settings.ingest_max_inline_bytes <= settings.ingest_max_bytes
+    assert settings.gateway_max_attachments == 10
+
+
+def test_inline_cap_must_not_exceed_download_cap(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("OPTIMUS_INGEST_MAX_BYTES", str(1024))
+    monkeypatch.setenv("OPTIMUS_INGEST_MAX_INLINE_BYTES", str(2048))
+    with pytest.raises(ValidationError, match="ingest_max_inline_bytes"):
+        Settings(_env_file=None)
 
 
 def test_retention_and_pool_defaults() -> None:

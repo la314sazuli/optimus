@@ -124,7 +124,9 @@ class GatewayService:
         if not self._should_scan(config, msg):
             return
         with correlation_context() as cid:
-            events = build_events(msg, correlation_id=cid)
+            events = build_events(
+                msg, correlation_id=cid, max_images=self._settings.gateway_max_attachments
+            )
             for image_event in events:
                 await self._bus.publish(SUBJECT_MESSAGE_IMAGE, image_event)
             if events:

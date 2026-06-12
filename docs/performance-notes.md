@@ -200,6 +200,67 @@ latency for nothing.
   (`test_redelivered_image_does_not_double_act`,
   `test_redelivered_verdict_dedups_on_msg_id`, `test_persist_swallows_unique_race`).
 
+### Image payload hardening for huge-server scale (`scale/payload-hardening`)
+- **Location:** `src/optimus/core/config.py` (`ingest_max_inline_bytes`,
+  `gateway_max_attachments`, inline-cap validator); `src/optimus/services/gateway/extract.py`
+  (`build_events` attachment cap + `optimus_gateway_images_dropped_total`);
+  `src/optimus/services/ingest/worker.py` (inline-size cap + `oversize_inline`
+  rejection); `src/optimus/services/detection/worker.py` (base64-decode guard +
+  `optimus_detection_payload_rejected_total`).
+- **The flow (audited).** Gateway publishes `message_image.v1` carrying only the
+  attachment/embed **URL** (no bytes). Ingest fetches once through the streaming,
+  SSRF-pinned `fetch_image` (DNS pinned, redirects re-validated, body read in
+  64 KiB chunks and **aborted mid-stream** the instant it passes `ingest_max_bytes`,
+  Content-Length pre-checked, header allowlist + magic-byte sniff). It then
+  publishes `image_fetched.v1` with the validated bytes **inline as base64** plus
+  a SHA-256. Detection base64-decodes and decodes in a **sandboxed subprocess**
+  (CPU/AS/FSIZE rlimits, Pillow `MAX_IMAGE_PIXELS` pixel cap enforced *before* a
+  full decode, parent-side wall-clock timeout); any decode/limit failure is a
+  `NON_DECISION`. So raw bytes do **not** flow on the gateway hop, but they **do**
+  ride inline on `image_fetched` (base64, ~+33%).
+- **Why keep bytes inline rather than re-fetch from the CDN URL in detection.**
+  Discord CDN URLs are now **signed and time-limited** (`ex`/`is`/`hm` query
+  params, ~24h). Under a raid the `image_fetched` queue can buffer deep in
+  JetStream (back-pressure is *designed* to let it); if detection re-fetched from
+  the URL, a message that waited out the queue could find its URL **expired** →
+  unfetchable → forced non-decision, i.e. a raid could make us silently stop
+  inspecting exactly when it matters most. Re-fetching would also double outbound
+  bandwidth and re-expose the SSRF surface in a second service. The pipeline
+  deliberately fetches **once** in ingest; we keep that and instead **hard-bound
+  the inline payload** so it can never balloon NATS or replica memory.
+- **The bounds added (all settings-driven, sensible defaults):**
+  - *Inline size cap* — `ingest_max_inline_bytes` (default **8 MiB**, validated
+    `<= ingest_max_bytes`). The fetcher may stream up to `ingest_max_bytes`, but
+    anything larger than the inline cap is **dropped in the ingest worker**
+    (counted `optimus_ingest_images_rejected_total{reason="oversize_inline"}`,
+    returns `None` → the message is **acked**, never nak-looped). This is the
+    bound that actually caps what a single `image_fetched` message puts on the
+    stream and into a detection replica's memory.
+  - *Per-message attachment cap* — `gateway_max_attachments` (default **10**).
+    `build_events` stops after that many inspectable images per message and counts
+    the rest (`optimus_gateway_images_dropped_total{reason="attachment_cap"}`), so
+    one message cannot fan out an unbounded number of fetch/decode jobs.
+  - *Download size / timeout / content-type / pixel-count / redirect caps* already
+    existed (`ingest_max_bytes`, `fetch_image` `total_timeout`, `ALLOWED_CONTENT_TYPES`
+    + magic-byte sniff, `DecodeLimits.max_image_pixels`, `ingest_max_redirects`);
+    this pass verified them and folds them into one documented contract.
+- **Resolve, never nak-loop.** Every oversize/timeout/bomb/malformed-payload case
+  resolves the message (ack + reason-labeled metric/log), consistent with the
+  PR #14 redelivery/idempotency design. The detection worker now base64-decodes
+  with `validate=True` inside a guard: a corrupt inline payload becomes a
+  `NON_DECISION` (counted `optimus_detection_payload_rejected_total{reason="decode"}`)
+  instead of raising — a raise would nak and redeliver the same poison until
+  `max_deliver`, pure wasted work under a flood.
+- **Tested by:** `tests/unit/test_gateway.py` (attachment cap counts dropped
+  extras, spans attachments+content URLs, no cap when unset),
+  `tests/unit/test_ingest_worker.py` (oversize-inline drop + boundary publish),
+  `tests/unit/test_detection.py` (malformed-base64 resolves not raises,
+  decompression-bomb pixel-cap → non-decision, decode-timeout → non-decision,
+  normal image still flows), `tests/unit/test_config_and_health.py` (defaults +
+  inline-cap-must-not-exceed-download-cap validator), plus the existing
+  `tests/integration/test_fetcher.py` streaming/size-cap/timeout coverage and
+  `tests/unit/test_decoder.py` pixel-cap/timeout coverage.
+
 ## Documented (real, deferred — too invasive for a single-fix pass)
 
 ### Unused `_use_embedding` flag on the detection worker

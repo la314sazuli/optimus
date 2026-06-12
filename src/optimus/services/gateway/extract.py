@@ -10,7 +10,17 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from prometheus_client import Counter
+
 from optimus.contracts.events import MessageImageEvent
+
+#: Images dropped at extraction time because a single message exceeded the
+#: per-message attachment cap (raid guard).
+IMAGES_DROPPED = Counter(
+    "optimus_gateway_images_dropped_total",
+    "Inspectable images dropped before publish.",
+    ["reason"],
+)
 
 _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 _IMAGE_CONTENT_PREFIX = "image/"
@@ -61,21 +71,41 @@ def extract_image_urls_from_content(content: str) -> list[str]:
 
 
 def build_events(
-    msg: IncomingMessage, *, correlation_id: str, now: datetime | None = None
+    msg: IncomingMessage,
+    *,
+    correlation_id: str,
+    now: datetime | None = None,
+    max_images: int | None = None,
 ) -> list[MessageImageEvent]:
     """Build one :class:`MessageImageEvent` per inspectable image in ``msg``.
 
     Deduplicates by URL and synthesizes stable attachment ids for embedded
     content-URLs (which lack a Discord attachment id) from a hash of the URL.
+
+    When ``max_images`` is set, at most that many events are produced for a
+    single message; any further images are dropped (counted under the
+    ``attachment_cap`` reason) so one message cannot fan out an unbounded number
+    of downstream fetch/decode jobs during a raid. Attachments are preferred over
+    embed/content URLs when the cap forces a choice.
     """
     occurred = now or datetime.now(UTC)
     events: list[MessageImageEvent] = []
     seen_urls: set[str] = set()
+    dropped = 0
+
+    def _capped() -> bool:
+        nonlocal dropped
+        if max_images is not None and len(events) >= max_images:
+            dropped += 1
+            return True
+        return False
 
     for att in msg.attachments:
         if not _is_image_attachment(att) or att.url in seen_urls:
             continue
         seen_urls.add(att.url)
+        if _capped():
+            continue
         events.append(
             MessageImageEvent(
                 correlation_id=correlation_id,
@@ -98,6 +128,8 @@ def build_events(
         if url in seen_urls:
             continue
         seen_urls.add(url)
+        if _capped():
+            continue
         synthetic_id = _synthetic_attachment_id(msg.message_id, url)
         events.append(
             MessageImageEvent(
@@ -115,6 +147,9 @@ def build_events(
                 is_webhook=msg.is_webhook,
             )
         )
+
+    if dropped:
+        IMAGES_DROPPED.labels(reason="attachment_cap").inc(dropped)
     return events
 
 

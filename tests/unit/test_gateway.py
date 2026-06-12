@@ -67,6 +67,42 @@ def test_build_events_from_content_urls() -> None:
     assert [e.url for e in events] == ["https://x.test/free.gif"]
 
 
+def test_build_events_caps_attachment_count() -> None:
+    from optimus.services.gateway.extract import IMAGES_DROPPED
+
+    atts = tuple(
+        Attachment(id=100 + i, url=f"https://cdn.test/{i}.png", filename=f"{i}.png")
+        for i in range(15)
+    )
+    before = IMAGES_DROPPED.labels(reason="attachment_cap")._value.get()
+    events = build_events(_msg(attachments=atts), correlation_id=CID, max_images=10)
+    assert len(events) == 10  # only the first 10 of 15 are published
+    # The 5 dropped extras are counted under the attachment_cap reason.
+    after = IMAGES_DROPPED.labels(reason="attachment_cap")._value.get()
+    assert after - before == 5
+
+
+def test_build_events_cap_counts_content_urls_too() -> None:
+    # Cap spans attachments + embed/content URLs; attachments are kept first.
+    att = Attachment(id=10, url="https://cdn.test/a.png", filename="a.png")
+    msg = _msg(
+        attachments=(att,),
+        embed_image_urls=("https://cdn.test/b.png", "https://cdn.test/c.png"),
+    )
+    events = build_events(msg, correlation_id=CID, max_images=2)
+    assert len(events) == 2
+    assert events[0].url == "https://cdn.test/a.png"
+
+
+def test_build_events_no_cap_when_unset() -> None:
+    atts = tuple(
+        Attachment(id=200 + i, url=f"https://cdn.test/u{i}.png", filename=f"u{i}.png")
+        for i in range(20)
+    )
+    events = build_events(_msg(attachments=atts), correlation_id=CID)
+    assert len(events) == 20
+
+
 # --- scan filtering ---------------------------------------------------------
 
 

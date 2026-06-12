@@ -8,6 +8,7 @@ from unittest import mock
 
 from optimus.contracts.events import ImageFetchedEvent, Verdict
 from optimus.core.config import Sensitivity
+from optimus.hashing.decoder import DecodeLimits
 from optimus.services.detection.index import HashIndex, KnownHash
 from optimus.services.detection.matcher import (
     MatchOutcome,
@@ -201,6 +202,22 @@ async def test_worker_non_decodable_is_non_decision() -> None:
     assert result.verdict.verdict is Verdict.NON_DECISION
 
 
+async def test_worker_malformed_base64_resolves_not_raises() -> None:
+    # A corrupt inline payload must resolve as a NON_DECISION (acked), never
+    # raise — raising would nak and redeliver the same poison until max_deliver.
+    from optimus.services.detection.worker import PAYLOAD_REJECTED
+
+    worker = _worker(guild_index=EMPTY)
+    ev = _event(key="poison")
+    object.__setattr__(ev, "data_b64", "!!!not base64!!!")
+    before = PAYLOAD_REJECTED.labels(reason="decode")._value.get()
+    result = await worker.handle(ev)
+    assert result is not None
+    assert result.verdict.verdict is Verdict.NON_DECISION
+    after = PAYLOAD_REJECTED.labels(reason="decode")._value.get()
+    assert after - before == 1
+
+
 def _scam_png() -> bytes:
     import io
 
@@ -212,6 +229,56 @@ def _scam_png() -> bytes:
     buf = io.BytesIO()
     Image.fromarray(arr, "RGB").save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _worker_with_limits(limits: DecodeLimits) -> DetectionWorker:
+    async def gi(_gid: int) -> HashIndex:
+        return EMPTY
+
+    async def gx() -> HashIndex:
+        return EMPTY
+
+    async def wl(_gid: int) -> list[WhitelistEntry]:
+        return []
+
+    async def sens(_gid: int) -> Sensitivity:
+        return Sensitivity.BALANCED
+
+    return DetectionWorker(
+        guild_index=gi,
+        global_index=gx,
+        whitelist=wl,
+        sensitivity=sens,
+        idempotency_acquire=_OnceGuard().acquire,
+        limits=limits,
+    )
+
+
+async def test_worker_decompression_bomb_resolves_to_non_decision() -> None:
+    # A 100x100 image under a 100-pixel cap: Pillow's MAX_IMAGE_PIXELS guard in
+    # the sandboxed child trips before a full decode, and the worker resolves it
+    # as a NON_DECISION (acked) rather than raising (which would nak-loop).
+    worker = _worker_with_limits(DecodeLimits(max_image_pixels=100))
+    result = await worker.handle(_event(key="bomb", data=_scam_png()))
+    assert result is not None
+    assert result.verdict.verdict is Verdict.NON_DECISION
+
+
+async def test_worker_decode_timeout_resolves_to_non_decision() -> None:
+    # A wall-clock timeout in the decode subprocess must also resolve, not raise.
+    worker = _worker_with_limits(DecodeLimits(wall_timeout=0.000001))
+    result = await worker.handle(_event(key="slow", data=_scam_png()))
+    assert result is not None
+    assert result.verdict.verdict is Verdict.NON_DECISION
+
+
+async def test_worker_normal_image_still_flows() -> None:
+    # Regression: a normal in-bounds image decodes and produces a real verdict.
+    worker = _worker_with_limits(DecodeLimits())
+    result = await worker.handle(_event(key="normal", data=_scam_png()))
+    assert result is not None
+    assert result.verdict.verdict in (Verdict.CLEAN, Verdict.AMBIGUOUS, Verdict.SCAM)
+    assert result.verdict.hashes is not None
 
 
 async def test_worker_swarm_escalates_and_alerts() -> None:

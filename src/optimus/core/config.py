@@ -125,7 +125,18 @@ class Settings(BaseSettings):
 
     # Ingest
     ingest_max_bytes: int = 10 * 1024 * 1024
+    #: Hard cap on the raw image size shipped inline (base64) through NATS in an
+    #: ``image_fetched`` payload. A fetch may stream up to ``ingest_max_bytes``,
+    #: but anything larger than this is resolved (dropped + metric) rather than
+    #: ballooning the JetStream stream and detection-replica memory under a raid.
+    #: Defaults below ``ingest_max_bytes`` so the inline path stays bounded even
+    #: if the download cap is later raised; must not exceed ``ingest_max_bytes``.
+    ingest_max_inline_bytes: int = 8 * 1024 * 1024
     ingest_max_redirects: int = 3
+    #: Max inspectable images processed per Discord message. Beyond this the
+    #: extras are dropped (counted) so one message with a flood of attachments
+    #: cannot fan out an unbounded number of fetch/decode jobs.
+    gateway_max_attachments: int = Field(default=10, ge=1)
     ingest_fetch_rate_capacity: float = 20.0
     ingest_fetch_rate_refill: float = 10.0
     #: Opportunistic idle-bucket sweep cadence for the in-memory rate-limiter
@@ -274,6 +285,20 @@ class Settings(BaseSettings):
                 raise ValueError("shard_ids resolved to an empty set")
             return parsed
         return value
+
+    @model_validator(mode="after")
+    def _validate_inline_cap(self) -> Self:
+        """Keep the inline-payload cap at or below the download cap.
+
+        The inline base64 payload is what actually rides through NATS; allowing
+        it to exceed the streamed download cap would defeat the bound.
+        """
+        if self.ingest_max_inline_bytes > self.ingest_max_bytes:
+            raise ValueError(
+                "ingest_max_inline_bytes must be <= ingest_max_bytes "
+                f"({self.ingest_max_inline_bytes} > {self.ingest_max_bytes})"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_sharding(self) -> Self:

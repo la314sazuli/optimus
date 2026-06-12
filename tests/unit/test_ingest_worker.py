@@ -30,9 +30,18 @@ def _event(guild_id: int = 1, url: str = "https://cdn.test/a.png") -> MessageIma
     )
 
 
-def _worker(fetch, *, capacity: float = 10.0, refill: float = 10.0) -> IngestWorker:  # type: ignore[no-untyped-def]
+def _worker(  # type: ignore[no-untyped-def]
+    fetch,
+    *,
+    capacity: float = 10.0,
+    refill: float = 10.0,
+    max_inline_bytes: int = 8 * 1024 * 1024,
+) -> IngestWorker:
     return IngestWorker(
-        fetch, InMemoryRateLimiter(), rate=RateLimit(capacity=capacity, refill_rate=refill)
+        fetch,
+        InMemoryRateLimiter(),
+        rate=RateLimit(capacity=capacity, refill_rate=refill),
+        max_inline_bytes=max_inline_bytes,
     )
 
 
@@ -72,6 +81,33 @@ async def test_handle_rate_limited_raises() -> None:
     assert await worker.handle(_event()) is not None
     with pytest.raises(RateLimitedError):
         await worker.handle(_event())
+
+
+async def test_handle_oversize_inline_returns_none() -> None:
+    big = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+
+    async def fetch(url: str) -> FetchedImage:
+        return FetchedImage(data=big, content_type="image/png", final_url=url)
+
+    from optimus.services.ingest.worker import IMAGES_REJECTED
+
+    before = IMAGES_REJECTED.labels(reason="oversize_inline")._value.get()
+    # Cap below the fetched size: the image is resolved (dropped), not published.
+    worker = _worker(fetch, max_inline_bytes=1024)
+    assert await worker.handle(_event()) is None
+    after = IMAGES_REJECTED.labels(reason="oversize_inline")._value.get()
+    assert after - before == 1
+
+
+async def test_handle_inline_cap_boundary_publishes() -> None:
+    data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+    async def fetch(url: str) -> FetchedImage:
+        return FetchedImage(data=data, content_type="image/png", final_url=url)
+
+    # Exactly at the cap is allowed (cap is an upper bound, inclusive).
+    worker = _worker(fetch, max_inline_bytes=len(data))
+    assert await worker.handle(_event()) is not None
 
 
 async def test_rate_limit_is_per_guild() -> None:

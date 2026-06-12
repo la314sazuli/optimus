@@ -54,11 +54,13 @@ class IngestWorker:
         limiter: RateLimiter,
         *,
         rate: RateLimit,
+        max_inline_bytes: int,
         ratelimit_prefix: str = "optimus:rl:ingest",
     ) -> None:
         self._fetch = fetch
         self._limiter = limiter
         self._rate = rate
+        self._max_inline_bytes = max_inline_bytes
         self._prefix = ratelimit_prefix
 
     async def handle(self, event: MessageImageEvent) -> ImageFetchedEvent | None:
@@ -79,6 +81,21 @@ class IngestWorker:
             reason = "ssrf" if isinstance(exc, SSRFError) else "fetch"
             IMAGES_REJECTED.labels(reason=reason).inc()
             _log.warning("ingest_rejected", reason=reason, guild_id=event.guild_id)
+            return None
+
+        # The fetcher streams under ``ingest_max_bytes``; this is the tighter
+        # bound on what may ride inline (base64) through NATS. Dropping here
+        # (rather than publishing) keeps the JetStream stream and detection
+        # replica memory bounded under a raid. Returning None acks the message,
+        # so an oversized image is resolved permanently, never nak-looped.
+        if len(fetched.data) > self._max_inline_bytes:
+            IMAGES_REJECTED.labels(reason="oversize_inline").inc()
+            _log.warning(
+                "ingest_rejected",
+                reason="oversize_inline",
+                guild_id=event.guild_id,
+                size_bytes=len(fetched.data),
+            )
             return None
 
         digest = hashlib.sha256(fetched.data).hexdigest()
