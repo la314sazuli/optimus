@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 from contextlib import AbstractAsyncContextManager
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.bus.nats import EventBus
@@ -68,7 +69,9 @@ class DetectionService:
         if result is None:
             return
         await self._persist(result)
-        await self._bus.publish(SUBJECT_VERDICT, result.verdict)
+        await self._bus.publish(
+            SUBJECT_VERDICT, result.verdict, msg_id=result.verdict.idempotency_key
+        )
         if result.swarm_alert is not None:
             await self._bus.publish(SUBJECT_SWARM_ALERT, result.swarm_alert)
 
@@ -83,18 +86,28 @@ class DetectionService:
             repo = DetectionRepository(session, v.guild_id)
             if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
                 return
-            await repo.record(
-                Detection(
-                    guild_id=v.guild_id,
-                    message_id=v.message_id,
-                    channel_id=v.channel_id,
-                    attachment_id=v.attachment_id,
-                    uploader_id=v.uploader_id,
-                    distances=dict(v.distances),
-                    verdict=v.verdict.value,
-                    idempotency_key=v.idempotency_key,
-                )
-            )
+            # The insert runs in a savepoint so a unique-constraint loss only
+            # rolls back the failed row, not the surrounding transaction.
+            # Concurrent redelivery can race two replicas past the read-check;
+            # the loser hits the unique key on idempotency_key. The constraint is
+            # the authority, so we swallow it as a no-op rather than nak (which
+            # would redeliver a message whose row already exists, forever).
+            try:
+                async with session.begin_nested():
+                    await repo.record(
+                        Detection(
+                            guild_id=v.guild_id,
+                            message_id=v.message_id,
+                            channel_id=v.channel_id,
+                            attachment_id=v.attachment_id,
+                            uploader_id=v.uploader_id,
+                            distances=dict(v.distances),
+                            verdict=v.verdict.value,
+                            idempotency_key=v.idempotency_key,
+                        )
+                    )
+            except IntegrityError:
+                pass
 
 
 def build_service(settings: Settings, bus: EventBus, redis: object | None) -> DetectionService:
@@ -169,7 +182,7 @@ async def _amain() -> None:
     configure_logging(level=settings.log_level, service_name="optimus-detection")
 
     bus, nc = await EventBus.connect(settings.nats_url)
-    await bus.ensure_stream()
+    await bus.ensure_stream(duplicate_window=settings.bus_duplicate_window_seconds)
     redis = _open_redis(settings)
     service = build_service(settings, bus, redis)
 
@@ -192,6 +205,10 @@ async def _amain() -> None:
             durable="detection",
             model=ImageFetchedEvent,
             handler=service.on_image,
+            batch=settings.detection_fetch_batch,
+            max_deliver=settings.detection_max_deliver,
+            max_inflight=settings.detection_max_inflight,
+            ack_wait=settings.detection_ack_wait_seconds,
             stop_event=stop,
         )
     )

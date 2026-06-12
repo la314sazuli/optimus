@@ -43,13 +43,25 @@ class InMemoryBus:
     def __init__(self) -> None:
         self.published: list[tuple[str, BaseModel]] = []
         self._subs: dict[str, list[Handler]] = {}
+        # Tracks ``Nats-Msg-Id`` values already published per subject so the fake
+        # mirrors JetStream's server-side publish dedup within its window.
+        self._seen_msg_ids: set[tuple[str, str]] = set()
 
     def subscribe(self, subject: str, handler: Handler) -> None:
         """Register ``handler`` to receive every event published to ``subject``."""
         self._subs.setdefault(subject, []).append(handler)
 
-    async def publish(self, subject: str, event: BaseModel) -> None:
-        """Record ``event`` and fan it out to every subscriber of ``subject``."""
+    async def publish(self, subject: str, event: BaseModel, *, msg_id: str | None = None) -> None:
+        """Record ``event`` and fan it out to every subscriber of ``subject``.
+
+        A repeated ``msg_id`` on the same subject is dropped (no record, no
+        fan-out), faithfully emulating JetStream publish dedup.
+        """
+        if msg_id is not None:
+            key = (subject, msg_id)
+            if key in self._seen_msg_ids:
+                return
+            self._seen_msg_ids.add(key)
         self.published.append((subject, event))
         for handler in list(self._subs.get(subject, ())):
             await handler(event)

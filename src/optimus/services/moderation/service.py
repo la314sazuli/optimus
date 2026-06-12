@@ -114,6 +114,7 @@ class ModerationService:
                 success=result.success,
                 detail=result.detail,
             ),
+            msg_id=f"{event.idempotency_key}:{result.action.value}",
         )
 
 
@@ -271,7 +272,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     configure_logging(level=settings.log_level, service_name="optimus-moderation")
 
     bus, nc = await EventBus.connect(settings.nats_url)
-    await bus.ensure_stream()
+    await bus.ensure_stream(duplicate_window=settings.bus_duplicate_window_seconds)
 
     import redis.asyncio as aioredis
 
@@ -310,6 +311,10 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
                 durable="moderation",
                 model=VerdictEvent,
                 handler=service.on_verdict,
+                batch=settings.detection_fetch_batch,
+                max_deliver=settings.detection_max_deliver,
+                max_inflight=settings.detection_max_inflight,
+                ack_wait=settings.detection_ack_wait_seconds,
                 stop_event=stop,
             )
         ),
