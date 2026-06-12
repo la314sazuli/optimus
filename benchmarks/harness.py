@@ -42,17 +42,28 @@ class Scored:
     matched_campaign: str | None
 
 
+def _gray(img: CorpusImage) -> perceptual.FloatArray:
+    """Return the grayscale array for a corpus image."""
+    rgb = np.asarray(img.image.convert("RGB"), dtype=np.uint8)
+    return perceptual.to_grayscale(rgb)
+
+
 def _hashes(img: CorpusImage) -> dict[str, int]:
     """Compute the four perceptual hashes for a corpus image."""
-    rgb = np.asarray(img.image.convert("RGB"), dtype=np.uint8)
-    return perceptual.compute_all(perceptual.to_grayscale(rgb))
+    return perceptual.compute_all(_gray(img))
 
 
 def build_index(corpus: Corpus) -> HashIndex:
-    """Build a BK-tree hash index seeded with each campaign's base image."""
+    """Build a BK-tree hash index seeded with each campaign's base image.
+
+    Each base is indexed with its mirror (horizontal-flip) hash set so a flipped
+    re-share matches its source — the same flip-invariant indexing the
+    production pipeline performs when a scam image is added.
+    """
     entries: list[KnownHash] = []
     for base in corpus.bases:
-        h = _hashes(base)
+        gray = _gray(base)
+        h = perceptual.compute_all(gray)
         entries.append(
             KnownHash(
                 hash_id=base.name,
@@ -62,6 +73,7 @@ def build_index(corpus: Corpus) -> HashIndex:
                 ahash=h["ahash"],
                 source="guild",
                 campaign_id=base.campaign,
+                mirror=perceptual.compute_all_mirror(gray),
             )
         )
     return HashIndex(entries)

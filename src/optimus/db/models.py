@@ -132,6 +132,12 @@ class GuildHash(Base):
     dhash: Mapped[int] = mapped_column(Uint64, nullable=False)
     whash: Mapped[int] = mapped_column(Uint64, nullable=False)
     ahash: Mapped[int] = mapped_column(Uint64, nullable=False, default=0)
+    # Hashes of the horizontally-flipped source image, populated when the image
+    # was available at indexing time so mirrored re-shares match (NULL otherwise).
+    mphash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
+    mdhash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
+    mwhash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
+    mahash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
     embedding: Mapped[bytes | None] = mapped_column(nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="local", nullable=False)
     added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -165,6 +171,10 @@ class GlobalHash(Base):
     phash: Mapped[int] = mapped_column(Uint64, nullable=False)
     dhash: Mapped[int] = mapped_column(Uint64, nullable=False)
     whash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    # Hashes of the horizontally-flipped source image (NULL when unavailable).
+    mphash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
+    mdhash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
+    mwhash: Mapped[int | None] = mapped_column(Uint64, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="candidate", nullable=False, index=True)
     campaign_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -113,6 +113,51 @@ async def test_guild_index_unbounded_by_default(session: AsyncSession) -> None:
     assert len(mgr.cached_guilds()) == 10
 
 
+async def test_guild_index_builds_mirror_from_stored_columns(session: AsyncSession) -> None:
+    session.add(Guild(guild_id=GUILD_ID))
+    # A row whose mirror (flip) hashes were stored at indexing time.
+    session.add(
+        GuildHash(
+            guild_id=GUILD_ID,
+            hash_id="m1",
+            phash=1000,
+            dhash=2000,
+            whash=3000,
+            ahash=4000,
+            mphash=1111,
+            mdhash=2222,
+            mwhash=3333,
+            mahash=4444,
+            source="local",
+            status="active",
+        )
+    )
+    await session.commit()
+
+    mgr = IndexManager(_scope_factory(session))
+    idx = await mgr.guild_index(GUILD_ID)
+    # __len__ counts distinct sources, not the internal mirror sibling.
+    assert len(idx) == 1
+    # The original phash and the stored mirror phash both resolve to source "m1".
+    assert [k.hash_id for k in idx.candidates(1000, 0)] == ["m1"]
+    mirror_hits = idx.candidates(1111, 0)
+    assert [k.hash_id for k in mirror_hits] == ["m1"]
+    # The mirror candidate carries the flipped hashes for scoring.
+    assert mirror_hits[0].as_dict() == {"phash": 1111, "dhash": 2222, "whash": 3333, "ahash": 4444}
+
+
+async def test_guild_index_skips_mirror_when_columns_null(session: AsyncSession) -> None:
+    session.add(Guild(guild_id=GUILD_ID))
+    await _add_guild_hash(session, "h1", 1234)  # no mirror columns
+    await session.commit()
+
+    mgr = IndexManager(_scope_factory(session))
+    idx = await mgr.guild_index(GUILD_ID)
+    assert len(idx) == 1
+    # No mirror sibling indexed: only the original phash matches.
+    assert [k.hash_id for k in idx.candidates(1234, 0)] == ["h1"]
+
+
 async def test_global_index_invalidation(session: AsyncSession) -> None:
     session.add(GlobalHash(hash_id="g1", phash=42, dhash=0, whash=0, status="promoted"))
     session.add(GlobalHash(hash_id="g-cand", phash=43, dhash=0, whash=0, status="candidate"))

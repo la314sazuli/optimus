@@ -249,12 +249,21 @@ def _build_hash_from_options(options: dict[str, Any], *, added_by: int) -> Guild
         dhash = parse_hash_hex(str(d)) if d is not None else 0
         whash = parse_hash_hex(str(w)) if w is not None else 0
     hash_id = options.get("hash_id") or f"{phash:016x}"
+    # Mirror (flip) hashes are supplied as ints by the glue layer only when it
+    # hashed an actual attachment (it also flips the pixels); typed-hex adds have
+    # no image and leave them NULL.
+    mp, md, mw = options.get("mphash"), options.get("mdhash"), options.get("mwhash")
+    mirror_given = isinstance(mp, int) and isinstance(md, int) and isinstance(mw, int)
     return GuildHash(
         hash_id=str(hash_id),
         phash=phash,
         dhash=dhash,
         whash=whash,
         ahash=0,
+        mphash=mp if mirror_given else None,
+        mdhash=md if mirror_given else None,
+        mwhash=mw if mirror_given else None,
+        mahash=options.get("mahash") if mirror_given else None,
         source="local",
         added_by=added_by,
     )

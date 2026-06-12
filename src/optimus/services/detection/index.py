@@ -22,6 +22,25 @@ from optimus.hashing.bktree import BKTree
 
 _log = get_logger(__name__)
 
+# Internal BK-tree node-key suffix for a source's mirror sibling. The NUL byte
+# cannot occur in a real hash_id, so the suffixed key never collides.
+_MIRROR_SUFFIX = "\x00mirror"
+
+
+def _mirror_dict(
+    mphash: int | None, mdhash: int | None, mwhash: int | None, mahash: int | None
+) -> dict[str, int] | None:
+    """Assemble a mirror hash-set from stored columns, or ``None`` if absent.
+
+    The mirror is indexed only when its phash/dhash/whash are all present (rows
+    added before flip support, or via a hex/import path with no image, leave them
+    NULL and simply contribute no mirror entry).
+    """
+    if mphash is None or mdhash is None or mwhash is None:
+        return None
+    return {"phash": mphash, "dhash": mdhash, "whash": mwhash, "ahash": mahash or 0}
+
+
 GUILD_INDEX_EVICTED = Counter(
     "optimus_detection_guild_index_evicted_total",
     "Per-guild hash indexes evicted from the LRU cache.",
@@ -30,7 +49,15 @@ GUILD_INDEX_EVICTED = Counter(
 
 @dataclass(frozen=True, slots=True)
 class KnownHash:
-    """A known scam hash set with provenance for matching."""
+    """A known scam hash set with provenance for matching.
+
+    ``mirror`` optionally carries the hash set of the horizontally-flipped source
+    image. When present it is indexed as a sibling entry under the *same*
+    ``hash_id`` and ``campaign_id``, so a mirrored re-share matches back to the
+    same source detection (dedup/ownership preserved). Mirror hashes are the
+    actual hashes of the flipped pixels, not a permutation of the originals, so
+    the ensemble scores a flipped upload at ~zero distance.
+    """
 
     hash_id: str
     phash: int
@@ -39,6 +66,7 @@ class KnownHash:
     ahash: int
     source: str  # "guild" | "global"
     campaign_id: str | None = None
+    mirror: dict[str, int] | None = None
 
     def as_dict(self) -> dict[str, int]:
         """Return the four-hash mapping consumed by the ensemble."""
@@ -49,27 +77,64 @@ class KnownHash:
             "ahash": self.ahash,
         }
 
+    def mirror_entry(self) -> KnownHash | None:
+        """Return the mirrored sibling :class:`KnownHash`, or ``None``.
+
+        Shares this entry's ``hash_id`` and ``campaign_id`` so a match against
+        the mirror resolves to the same source. Its primary hashes are the
+        mirror hashes, and it carries no further mirror of its own.
+        """
+        if self.mirror is None:
+            return None
+        return KnownHash(
+            hash_id=self.hash_id,
+            phash=self.mirror["phash"],
+            dhash=self.mirror["dhash"],
+            whash=self.mirror["whash"],
+            ahash=self.mirror.get("ahash", 0),
+            source=self.source,
+            campaign_id=self.campaign_id,
+            mirror=None,
+        )
+
 
 class HashIndex:
     """A phash BK-tree plus a payload table mapping hash_id -> :class:`KnownHash`."""
 
     def __init__(self, entries: Sequence[KnownHash]) -> None:
         self._tree = BKTree()
-        self._by_id: dict[str, KnownHash] = {}
+        # Tree payloads are internal node keys -> KnownHash. An entry's mirror is
+        # stored under a suffixed key so its (flipped) hashes are what the
+        # ensemble scores, while the returned KnownHash keeps the original
+        # hash_id/campaign so a mirrored match resolves to the same source.
+        self._by_node: dict[str, KnownHash] = {}
+        seen: set[str] = set()
         for entry in entries:
             # Collisions on hash_id keep the last; phash collisions are fine.
-            self._by_id[entry.hash_id] = entry
+            seen.add(entry.hash_id)
+            self._by_node[entry.hash_id] = entry
             self._tree.add(entry.phash, entry.hash_id)
+            mirror = entry.mirror_entry()
+            if mirror is not None:
+                node_key = f"{entry.hash_id}{_MIRROR_SUFFIX}"
+                self._by_node[node_key] = mirror
+                self._tree.add(mirror.phash, node_key)
+        self._ids = seen
 
     def __len__(self) -> int:
-        return len(self._by_id)
+        return len(self._ids)
 
     def candidates(self, phash: int, radius: int) -> list[KnownHash]:
-        """Return known hashes whose phash is within ``radius`` of ``phash``."""
+        """Return known hashes whose phash is within ``radius`` of ``phash``.
+
+        Both originals and mirror siblings are eligible; a mirror match yields a
+        :class:`KnownHash` carrying the source ``hash_id``/``campaign_id`` but the
+        flipped hashes, so the ensemble scores the flipped upload correctly.
+        """
         out: list[KnownHash] = []
         for match in self._tree.query(phash, radius):
-            if match.payload is not None and match.payload in self._by_id:
-                out.append(self._by_id[match.payload])
+            if match.payload is not None and match.payload in self._by_node:
+                out.append(self._by_node[match.payload])
         return out
 
 
@@ -148,6 +213,7 @@ class IndexManager:
                     whash=r.whash,
                     ahash=r.ahash,
                     source="guild",
+                    mirror=_mirror_dict(r.mphash, r.mdhash, r.mwhash, r.mahash),
                 )
                 for r in rows
             ]
@@ -166,6 +232,7 @@ class IndexManager:
                     ahash=0,
                     source="global",
                     campaign_id=r.campaign_id,
+                    mirror=_mirror_dict(r.mphash, r.mdhash, r.mwhash, 0),
                 )
                 for r in rows
             ]

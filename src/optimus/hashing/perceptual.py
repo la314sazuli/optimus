@@ -127,3 +127,20 @@ def compute_all(gray: FloatArray) -> dict[str, int]:
         "phash": phash(gray),
         "whash": whash(gray),
     }
+
+
+def flip_horizontal(gray: FloatArray) -> FloatArray:
+    """Return ``gray`` mirrored left-to-right.
+
+    Perceptual hashes are not flip-invariant by construction, so the mirror hash
+    must be derived from the actually-mirrored pixels rather than a bit
+    permutation of the original hash (which area-resize and the DCT/median do not
+    preserve cleanly). Indexing ``compute_all(flip_horizontal(gray))`` lets a
+    mirrored re-share match its source at zero distance.
+    """
+    return np.fliplr(gray)
+
+
+def compute_all_mirror(gray: FloatArray) -> dict[str, int]:
+    """Compute the four hashes of the horizontally-mirrored image."""
+    return compute_all(flip_horizontal(gray))

@@ -72,13 +72,14 @@ def test_resize_and_recompress_are_caught() -> None:
     assert recall["base"][0] == recall["base"][1]
 
 
-def test_flip_is_not_caught() -> None:
-    # Perceptual hashes are not horizontal-flip invariant; this documents the
-    # known limitation as an executable expectation.
+def test_flip_is_caught_via_mirror_indexing() -> None:
+    # The index seeds each base together with its horizontal-flip mirror hash
+    # set, so mirrored re-shares now match. This is the executable counterpart of
+    # the flip-invariant indexing documented in docs/detection-eval.md.
     corpus = _tiny_corpus()
     scored = score_corpus(corpus)
     recall = perturbation_recall(scored, default_thresholds()[-1])
-    assert recall["flip"][0] == 0
+    assert recall["flip"][0] == recall["flip"][1]
 
 
 def test_no_match_image_gets_sentinel_score() -> None:
@@ -122,7 +123,8 @@ def test_report_and_json_render(tmp_path) -> None:
     # Round-trips and contains the headline sections.
     reloaded = json.loads(json.dumps(payload))
     assert reloaded["operating_point"]["fpr"] == 0.0
-    assert reloaded["perturbation_recall"]["flip"]["caught"] == 0
+    flip = reloaded["perturbation_recall"]["flip"]
+    assert flip["caught"] == flip["total"]
 
 
 def test_cli_writes_artifacts(tmp_path, capsys) -> None:
