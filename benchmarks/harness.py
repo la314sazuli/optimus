@@ -1,8 +1,9 @@
 """Run the real detection pipeline over a synthetic corpus and score it.
 
 The harness exercises the production code paths end to end: it computes the four
-perceptual hashes (:mod:`optimus.hashing.perceptual`), seeds a BK-tree
-:class:`~optimus.services.detection.index.HashIndex` from the campaign bases,
+perceptual hashes (:mod:`optimus.hashing.perceptual`), seeds a phash
+:class:`~optimus.services.detection.index.HashIndex` (multi-index hashing) from
+the campaign bases,
 gathers candidates by phash Hamming radius, and scores each candidate with the
 real ensemble (:func:`optimus.hashing.ensemble.compare`).
 
@@ -54,7 +55,7 @@ def _hashes(img: CorpusImage) -> dict[str, int]:
 
 
 def build_index(corpus: Corpus) -> HashIndex:
-    """Build a BK-tree hash index seeded with each campaign's base image.
+    """Build a phash hash index (MIH) seeded with each campaign's base image.
 
     Each base is indexed with its mirror (horizontal-flip) hash set so a flipped
     re-share matches its source — the same flip-invariant indexing the
@@ -86,7 +87,7 @@ def score_corpus(
 ) -> list[Scored]:
     """Score every corpus image against an index built from the bases.
 
-    For each image we gather BK-tree candidates within ``candidate_radius`` of
+    For each image we gather phash candidates within ``candidate_radius`` of
     its phash and keep the lowest ensemble score. Images with no candidate get
     :data:`NO_MATCH_SCORE`. The sensitivity passed to :func:`compare` only
     affects the verdict label, not the numeric ``score``, so any preset works

@@ -4,7 +4,7 @@ Where the :mod:`benchmarks` (accuracy) harness measures *what* the detection
 pipeline decides, this package measures *how fast* one detection replica can
 decide it. It pushes a configurable number of synthetic images concurrently
 through the real :class:`~optimus.services.detection.worker.DetectionWorker`
-(the same decode-subprocess + perceptual-hash + BK-tree + ensemble code path
+(the same decode-subprocess + perceptual-hash + phash-index + ensemble code path
 production runs, including the ``asyncio.to_thread`` decode/hash offload) and
 reports sustained images/sec, p50/p95/p99 end-to-end latency, and peak RSS.
 

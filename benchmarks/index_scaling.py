@@ -1,4 +1,4 @@
-"""Measure how the detection BK-tree HashIndex scales with entry count.
+"""Measure how the detection HashIndex (multi-index hashing) scales with entry count.
 
 The index-size axis is otherwise untested: the throughput harness
 (:mod:`benchmarks.load`) seeds the index from the small synthetic corpus, so it
@@ -7,7 +7,7 @@ of thousands of entries. This script fills that gap.
 
 For each requested size it builds a :class:`~optimus.services.detection.index.HashIndex`
 from ``N`` synthetic 64-bit hash sets (a configurable fraction of which carry a
-mirror sibling, so the tree holds the same mix of original + flipped entries the
+mirror sibling, so the index holds the same mix of original + flipped entries the
 production builder produces), then:
 
 * records process RSS before and after the build (so the delta attributes memory
@@ -20,9 +20,11 @@ production builder produces), then:
   the common case), so the percentiles reflect a realistic mix.
 
 Synthetic hashes are drawn from a seeded PRNG so runs are reproducible. They are
-uniformly random 64-bit values, which is the *worst case* for a BK-tree: real
-scam-campaign hashes cluster (near-duplicate re-shares), giving shallower, more
-prunable subtrees, so these latencies are conservative upper bounds.
+uniformly random 64-bit values. For multi-index hashing this is the *worst case*:
+uniform substrings spread evenly across the per-table buckets, maximizing the
+candidate set each query must verify. Real scam-campaign hashes cluster
+(near-duplicate re-shares) into fewer buckets, so these latencies are
+conservative upper bounds.
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ def _make_entries(n: int, *, mirror_fraction: float, seed: int) -> list[KnownHas
 
     Each entry's four hashes are independent uniform 64-bit values. A mirror
     sibling (when present) is an independent hash set, so it adds a second,
-    unrelated node to the tree exactly as a real flipped image would.
+    unrelated node to the index exactly as a real flipped image would.
     """
     rng = np.random.default_rng(seed)
     entries: list[KnownHash] = []
@@ -149,7 +151,7 @@ def measure_size(
     gc.collect()
     rss_after = _rss_bytes()
     index_rss = max(0, rss_after - rss_before)
-    tree_nodes = len(index._tree)  # benchmark introspection of BK-tree node count
+    tree_nodes = index.node_count  # indexed node count (originals + mirror siblings)
 
     latencies_us: list[float] = []
     total_candidates = 0
@@ -180,7 +182,7 @@ def measure_size(
 def _render(results: list[SizeResult], *, radius: int) -> str:
     """Render a Markdown summary table for the sweep."""
     lines = [
-        f"# Index scaling (BK-tree HashIndex), candidate radius {radius}",
+        f"# Index scaling (MIH HashIndex), candidate radius {radius}",
         "",
         "| Entries | Tree nodes | Build (s) | Index RSS (MB) | B/entry | "
         "q p50 (us) | q p95 (us) | q p99 (us) | q max (us) | mean cands |",
@@ -200,7 +202,7 @@ def _render(results: list[SizeResult], *, radius: int) -> str:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="benchmarks.index_scaling",
-        description="Measure BK-tree HashIndex build/memory/query cost vs entry count.",
+        description="Measure MIH HashIndex build/memory/query cost vs entry count.",
     )
     parser.add_argument(
         "--sizes",

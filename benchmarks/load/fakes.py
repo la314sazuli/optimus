@@ -5,13 +5,13 @@ async hooks (guild index, global index, whitelist, sensitivity) plus an
 idempotency-acquire callable. In production those are backed by Postgres
 (indexes), a DB whitelist, a guild-config lookup, and Redis (idempotency). For a
 throughput load test we want to exercise the *worker's* CPU/IO cost — decode
-subprocess, perceptual hashing, BK-tree candidate gather, ensemble vote — without
+subprocess, perceptual hashing, phash candidate gather, ensemble vote — without
 standing up any of that infrastructure, so each hook is replaced by a trivial
 in-memory stand-in that returns instantly.
 
 The guild index is the one that matters for realism: it is the *real*
 :class:`~optimus.services.detection.index.HashIndex`, seeded from the corpus
-campaign bases by reusing :func:`benchmarks.harness.build_index`, so the BK-tree
+campaign bases by reusing :func:`benchmarks.harness.build_index`, so the index
 candidate gather and ensemble vote do real work against a populated tree.
 """
 
@@ -53,7 +53,7 @@ class StaticIndexes:
 
     def __init__(self, corpus: Corpus) -> None:
         # Reuse the accuracy harness's index builder so the load test matches
-        # against the exact same BK-tree the eval harness scores against.
+        # against the exact same index the eval harness scores against.
         self._guild = build_index(corpus)
         self._global = HashIndex(())
 

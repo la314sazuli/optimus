@@ -148,7 +148,7 @@ dependency fails closed rather than hanging the probe, see
 ## The detection pipeline
 
 A single image flows fetch → decode (sandboxed) → perceptual hashing → match
-(BK-tree + ensemble) → swarm correlation → verdict → policy → action.
+(MIH + ensemble) → swarm correlation → verdict → policy → action.
 
 ```mermaid
 flowchart TD
@@ -159,7 +159,7 @@ flowchart TD
     C -- frames + HashSet --> D["match each frame<br/>guild + global index"]
     D --> E{whitelist hit?}
     E -- yes --> W[CLEAN — whitelist wins]
-    E -- no --> F["BK-tree query phash<br/>then ensemble.compare"]
+    E -- no --> F["MIH query phash<br/>then ensemble.compare"]
     F --> G["best outcome:<br/>SCAM &gt; AMBIGUOUS &gt; CLEAN"]
     G -->|SCAM or AMBIGUOUS| H[swarm.observe phash, guild]
     H -->|is_swarming| I["escalate verdict one band<br/>+ swarm_alert.v1"]
@@ -200,11 +200,14 @@ The four hashes are robust to *different* transforms (crop, recolor, recompress,
 resize, watermark), which is why the ensemble combines them rather than relying on
 any single hash.
 
-### Matching: BK-tree + ensemble
+### Matching: multi-index hashing + ensemble
 
-Candidate lookup uses a **BK-tree** keyed on pHash
-([`hashing/bktree.py`](../src/optimus/hashing/bktree.py)): metric-tree pruning via
-the triangle inequality gives sub-linear Hamming-radius queries. The
+Candidate lookup uses **multi-index hashing** (MIH) keyed on pHash
+([`hashing/mih.py`](../src/optimus/hashing/mih.py)): each 64-bit pHash is split
+into four disjoint 16-bit substrings with one exact-match table per substring, so
+a radius-18 query probes a small per-substring Hamming ball and verifies the true
+distance — exact results, sub-linear at large corpus sizes where a metric tree
+degrades toward a linear scan (see [capacity.md](capacity.md) § Experiment 1). The
 [`IndexManager`](../src/optimus/services/detection/index.py) lazily builds and
 caches one `HashIndex` per guild plus the global promoted-hash index, each rebuilt
 from Postgres and invalidated on the `index_invalidate` signal. The per-guild

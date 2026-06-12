@@ -4,10 +4,11 @@
 
 A single 800k-member Discord server fits comfortably within optimus on a small
 deployment, provided you (1) run NATS with a raised `max_payload` (now the
-shipped default, see [Exp 3](#experiment-3-nats-payload-limit)), (2) scale
-detection replicas to your sustained image rate, and (3) keep the **global** scam
-hash index from growing unbounded — the one axis where latency, not throughput,
-becomes the limit ([Exp 1](#experiment-1-index-scaling)).
+shipped default, see [Exp 3](#experiment-3-nats-payload-limit)) and (2) scale
+detection replicas to your sustained image rate. The index-scaling axis that was
+previously the headline limit is no longer one: the phash index now uses
+multi-index hashing (MIH), whose query cost stays low-ms into the hundreds of
+thousands of entries ([Exp 1](#experiment-1-index-scaling)).
 
 This document records *measured* evidence, not estimates. The harnesses live in
 [`benchmarks/index_scaling.py`](../benchmarks/index_scaling.py) and
@@ -31,8 +32,8 @@ The numbers below assume one very large, very active server:
 | ---- | ------ | -------------- |
 | Image burst absorption | **PASS** | in-flight bounded, no redelivery storm; surplus buffers in JetStream |
 | NATS payload | **BUG FOUND + FIXED** | 8 MiB inline images failed publish on the 1 MiB NATS default; now validated at startup + compose raised to 12 MiB |
-| Index scaling (query latency) | **WATCH** | global index query is ~linear at candidate radius 18; ~118 ms p50 at 100k, ~623 ms p50 at 500k entries |
-| Index memory / build | **FINE** | ~500 B/entry (~238 MB at 500k); cold build 6.6 s at 500k |
+| Index scaling (query latency) | **FIXED** | switched BK-tree → multi-index hashing (MIH); radius-18 query now **2.8 ms p50 at 10k, 24 ms at 100k, 134 ms at 500k** (was 7 / 118 / 623 ms) on uniform-random hashes — 2.6×/4.9×/4.6× faster, and far better on real clustered hashes |
+| Index memory / build | **FINE** | MIH ~406 B/entry (~194 MB at 500k, *lower* than the BK-tree's ~238 MB); cold build 4.7 s at 500k |
 | REST budget under raid | **FINE with tuning** | per-guild bucket, not the 50 req/s global, is the binding limit; PROTECT actions never dropped |
 | Postgres growth | **FINE** | ~31–62 MB/day of detections at this scale; inserts trivial; enable retention to bound it |
 
@@ -40,50 +41,78 @@ The numbers below assume one very large, very active server:
 
 ## Experiment 1: index scaling
 
-**The untested axis.** The throughput harness seeds the index from a tiny corpus,
-so per-guild/global index *size* was never characterized. A single mature
-deployment's **global** scam-hash index (cross-guild promoted hashes) grows over
-time and is queried on every image alongside the guild index
-([`matcher.py:92`](../src/optimus/services/detection/matcher.py)).
+**The axis that was the headline limit — now fixed.** The throughput harness seeds
+the index from a tiny corpus, so per-guild/global index *size* was never
+characterized. A single mature deployment's **global** scam-hash index
+(cross-guild promoted hashes) grows over time and is queried on every image
+alongside the guild index
+([`matcher.py`](../src/optimus/services/detection/matcher.py)).
+
+The original BK-tree degraded toward a linear scan at the production candidate
+radius 18 and was the documented scaling limit (~118 ms p50 at 100k, ~623 ms at
+500k). It has been **replaced by multi-index hashing** (MIH; Norouzi, Punjani &
+Fleet, CVPR 2012, [`hashing/mih.py`](../src/optimus/hashing/mih.py)). MIH splits
+each 64-bit phash into `m=4` disjoint 16-bit substrings with one exact-match hash
+table per substring. By the pigeonhole principle, two hashes within total Hamming
+distance `r` must agree to within `floor(r/m)` on at least one substring — so a
+radius-18 query enumerates each substring's `floor(18/4)=4` Hamming ball
+(`sum(C(16,k), k=0..4)=2,517` keys), unions the bucket ids, and verifies the true
+64-bit distance. Results are **identical to a linear scan** (exact, not
+approximate — proven by property tests in
+[`tests/unit/test_mih.py`](../tests/unit/test_mih.py) and
+[`tests/unit/test_index_equivalence.py`](../tests/unit/test_index_equivalence.py)),
+so matcher semantics, mirror siblings, and `hash_id`/`campaign_id` mapping are
+unchanged.
 
 Measured with [`benchmarks/index_scaling.py`](../benchmarks/index_scaling.py),
-building a real `HashIndex` (BK-tree) from N synthetic 64-bit hash sets (half
-carrying a mirror sibling, as the production builder produces) and running 2,000
+building a real `HashIndex` from N synthetic 64-bit hash sets (half carrying a
+mirror sibling, as the production builder produces) and running 1,000–2,000
 `candidates()` queries at the **production candidate radius 18**
 ([`DEFAULT_CANDIDATE_RADIUS`](../src/optimus/services/detection/matcher.py)):
 
-| Entries | Tree nodes | Build (s) | Index RSS | B/entry | q p50 | q p95 | q p99 | mean cands |
-| ------- | ---------- | --------- | --------- | ------- | ----- | ----- | ----- | ---------- |
-| 10,000  | 15,047     | 0.05      | 5.2 MB    | 541     | 7.1 ms | 8.7 ms | 10.6 ms | 5.2 |
-| 100,000 | 149,938    | 1.10      | 43.0 MB   | 451     | 117.8 ms | 133.2 ms | 141.7 ms | 46.7 |
-| 500,000 | 750,436    | 6.58      | 237.7 MB  | 499     | 623.0 ms | 703.3 ms | 746.6 ms | 231.9 |
+| Entries | Index nodes | Build (s) | Index RSS | B/entry | q p50 | q p95 | q p99 | mean cands |
+| ------- | ----------- | --------- | --------- | ------- | ----- | ----- | ----- | ---------- |
+| 10,000  | 15,022      | 0.05      | 12.0 MB   | 1,260   | 2.8 ms | 3.7 ms | 5.1 ms | 5.0 |
+| 100,000 | 149,701     | 1.06      | 59.7 MB   | 626     | 23.7 ms | 28.6 ms | 36.4 ms | 46.8 |
+| 500,000 | 749,656     | 4.74      | 193.6 MB  | 406     | 134.4 ms | 275.9 ms | 323.1 ms | 231.3 |
 
-(Synthetic hashes are uniform random — the **worst case** for a BK-tree. Real
-scam-campaign hashes cluster, giving shallower, more prunable subtrees, so these
-are conservative upper bounds.)
+**Before vs after** (radius 18, p50 query latency):
 
-**Memory and build are fine.** ~500 B/entry is flat; even 500k entries is ~238 MB
-and rebuilds cold (the per-replica warm-up paid on boot and on every
-`scheduler_index_rebuild_interval`) in **6.6 s**. Memory is not the bottleneck.
+| Entries | BK-tree p50 | MIH p50 | Speed-up |
+| ------- | ----------- | ------- | -------- |
+| 10,000  | 7.1 ms      | 2.8 ms  | 2.6×     |
+| 100,000 | 117.8 ms    | 23.7 ms | 5.0×     |
+| 500,000 | 623.0 ms    | 134.4 ms| 4.6×     |
 
-**Query latency is the bottleneck, and it is roughly linear.** Mean candidates
-examined grows ~linearly with size (5 → 47 → 232), and so does latency. The cause
-is intrinsic: pairwise Hamming distance between uniform 64-bit hashes is
-`Binomial(64, 0.5)` — mean 32, sd ~4 — so the radius-18 pruning window
-`[d−18, d+18]` around d≈32 spans `[14, 50]`, covering nearly the entire populated
-edge range. The triangle-inequality prune barely fires; the tree degrades toward
-a linear scan. Radius 18 (raised from 12 for border-crop recall, see
-[detection-eval.md](detection-eval.md)) is what makes this acute.
+(Synthetic hashes are uniform random — the **worst case** for MIH: uniform
+substrings spread evenly across the per-table buckets, maximizing both the
+candidate union each query must verify *and* the spurious near-collisions
+verified — `mean cands` itself grows with N because random 64-bit hashes
+genuinely collide within radius 18 more often as the corpus grows. Real
+scam-campaign hashes cluster into far fewer buckets, so production latency is
+lower than these upper bounds. The 10k B/entry figure is small-sample RSS noise;
+the asymptotic cost is ~406 B/entry, *below* the BK-tree's ~500.)
+
+**Why m=4, not m=8.** Tuning at radius 18 by measurement: m=8 (8-bit substrings,
+`floor(18/8)=2` ball of 37 keys) wins at 10k but **loses badly at scale** — its
+256-bucket tables are ~50× more populated than m=4's 65,536-bucket tables, so each
+of the 8 probes drags in a far larger candidate set to verify. Measured p50 at
+100k: m=4 **23.7 ms** vs m=8 **59 ms**; at 500k: m=4 **134 ms** vs m=8 **391 ms**.
+m=4 is the production choice ([`DEFAULT_SUBSTRING_COUNT`](../src/optimus/hashing/mih.py)).
+
+**Memory and build improved.** MIH is ~406 B/entry (the four substring tables cost
+more per node than tree nodes, but storing only one full 64-bit value per id keeps
+it under the BK-tree); 500k entries is ~194 MB (vs ~238 MB) and rebuilds cold in
+**4.7 s** (vs 6.6 s). Well under the 2 KB/entry budget.
 
 **What this means for 800k members.** Index size is *not* member count — it is the
-number of distinct scam-image hashes. A single guild's own index stays small
-(it only holds that guild's reported/detected scam hashes). The **global** index
-is the one that grows, and it is shared across the fleet. At ~100k global entries
-the per-image global lookup is already ~118 ms p50; with the guild lookup on top,
-a clean-image scan can exceed 100–250 ms — which, at a sustained 8 img/s into a
-single replica with `detection_max_inflight=10`, is within budget but leaves
-little headroom for bursts. Beyond ~100k–200k global entries, add detection
-replicas and/or prune the global index; do not let it grow unbounded.
+number of distinct scam-image hashes. A single guild's own index stays small. The
+**global** index is the one that grows, and it is shared across the fleet. At 100k
+global entries the per-image global lookup is now ~24 ms p50 (was ~118 ms); even
+500k is ~134 ms, comfortably within a single replica's budget at sustained image
+rates. The previous advice to keep the global index aggressively pruned is no
+longer load-bearing — the lookup scales sub-linearly in the regime that matters
+(clustered campaign hashes) and stays low-ms on the worst case well past 100k.
 
 ---
 
@@ -252,18 +281,21 @@ here and scale the one axis that turns red:
 
 ## Known limits
 
-* **Global hash-index query latency is the headline scaling limit.** At candidate
-  radius 18 the BK-tree lookup is ~linear in entry count: ~118 ms p50 at 100k,
-  ~623 ms p50 at 500k. Keep the **global** index pruned (it is shared fleet-wide);
-  add detection replicas to parallelize lookups. A guild-local index stays small.
-  Lowering the candidate radius would restore pruning but costs border-crop recall
-  (see [detection-eval.md](detection-eval.md)) — a precision/latency trade, not a
-  free win.
+* **Global hash-index query latency is no longer the headline scaling limit.** The
+  phash index uses multi-index hashing (MIH); at candidate radius 18 the lookup is
+  ~24 ms p50 at 100k and ~134 ms p50 at 500k on uniform-random hashes (was ~118 ms
+  / ~623 ms with the BK-tree), and lower on real clustered campaign hashes. Pruning
+  the **global** index is now an optimization, not a requirement; add detection
+  replicas to parallelize lookups under heavy sustained load. The candidate radius
+  18 (border-crop recall, see [detection-eval.md](detection-eval.md)) is unchanged
+  — MIH gives the recall *and* the speed, so it is no longer a precision/latency
+  trade.
 * **Per-guild action rate, not the Discord global limit, throttles one big
   guild.** Tune `mod_action_rate_*` for the server; PROTECT actions are never
   dropped regardless.
 * **Retention is off by default.** Detections accumulate one row per image
   (including CLEAN) forever until you enable a retention window.
 * These index numbers are a single-replica, worst-case (uniform-random hash)
-  characterization. Real clustered campaign hashes prune better; measure your own
-  global index with [`benchmarks/index_scaling.py`](../benchmarks/index_scaling.py).
+  characterization. Real clustered campaign hashes land in fewer MIH buckets and
+  have fewer spurious near-collisions to verify, so they are faster; measure your
+  own global index with [`benchmarks/index_scaling.py`](../benchmarks/index_scaling.py).

@@ -55,7 +55,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_CANDIDATE_RADIUS,
         help=(
-            "phash Hamming radius for BK-tree candidate gathering "
+            "phash Hamming radius for candidate gathering "
             f"(default: {DEFAULT_CANDIDATE_RADIUS}, the production matcher value)"
         ),
     )

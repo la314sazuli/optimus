@@ -1,10 +1,15 @@
-"""In-memory hash indexes (BK-trees) for guild-local and global scam hashes.
+"""In-memory hash indexes (multi-index hashing) for guild-local and global scam hashes.
 
-Each guild gets a lazily-built phash BK-tree keyed to its rows; a single global
-BK-tree holds promoted cross-guild hashes. The full hash set for each matched
+Each guild gets a lazily-built phash index keyed to its rows; a single global
+index holds promoted cross-guild hashes. The full hash set for each matched
 payload is retained so the ensemble can vote across all four hashes after the
-BK-tree narrows candidates by phash. Indexes rebuild from Postgres on boot and
-on demand when an invalidation arrives.
+phash index narrows candidates. Indexes rebuild from Postgres on boot and on
+demand when an invalidation arrives.
+
+The phash index is :class:`~optimus.hashing.mih.MultiIndexHash` (MIH): exact
+Hamming-radius lookup that stays sub-linear at the production candidate radius 18,
+where a BK-tree degrades toward a linear scan (see docs/capacity.md). Its results
+are identical to a linear scan, so matcher semantics are unchanged.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from prometheus_client import Counter
 from optimus.core.logging import get_logger
 from optimus.db.engine import SessionScope
 from optimus.db.repositories import GlobalHashRepository, GuildHashRepository
-from optimus.hashing.bktree import BKTree
+from optimus.hashing.mih import MultiIndexHash
 
 _log = get_logger(__name__)
 
@@ -99,11 +104,11 @@ class KnownHash:
 
 
 class HashIndex:
-    """A phash BK-tree plus a payload table mapping hash_id -> :class:`KnownHash`."""
+    """A phash MIH index plus a payload table mapping node key -> :class:`KnownHash`."""
 
     def __init__(self, entries: Sequence[KnownHash]) -> None:
-        self._tree = BKTree()
-        # Tree payloads are internal node keys -> KnownHash. An entry's mirror is
+        self._index = MultiIndexHash()
+        # Index ids are internal node keys -> KnownHash. An entry's mirror is
         # stored under a suffixed key so its (flipped) hashes are what the
         # ensemble scores, while the returned KnownHash keeps the original
         # hash_id/campaign so a mirrored match resolves to the same source.
@@ -113,16 +118,21 @@ class HashIndex:
             # Collisions on hash_id keep the last; phash collisions are fine.
             seen.add(entry.hash_id)
             self._by_node[entry.hash_id] = entry
-            self._tree.add(entry.phash, entry.hash_id)
+            self._index.add(entry.phash, entry.hash_id)
             mirror = entry.mirror_entry()
             if mirror is not None:
                 node_key = f"{entry.hash_id}{_MIRROR_SUFFIX}"
                 self._by_node[node_key] = mirror
-                self._tree.add(mirror.phash, node_key)
+                self._index.add(mirror.phash, node_key)
         self._ids = seen
 
     def __len__(self) -> int:
         return len(self._ids)
+
+    @property
+    def node_count(self) -> int:
+        """Number of indexed nodes (originals + mirror siblings)."""
+        return len(self._index)
 
     def candidates(self, phash: int, radius: int) -> list[KnownHash]:
         """Return known hashes whose phash is within ``radius`` of ``phash``.
@@ -132,9 +142,10 @@ class HashIndex:
         flipped hashes, so the ensemble scores the flipped upload correctly.
         """
         out: list[KnownHash] = []
-        for match in self._tree.query(phash, radius):
-            if match.payload is not None and match.payload in self._by_node:
-                out.append(self._by_node[match.payload])
+        for node_key in self._index.query(phash, radius):
+            known = self._by_node.get(node_key)
+            if known is not None:
+                out.append(known)
         return out
 
 

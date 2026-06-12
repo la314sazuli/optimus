@@ -37,7 +37,7 @@ Discord ──▶ gateway ──▶ ingest ──▶ detection ──▶ moderat
 | -------------- | -------------- |
 | `gateway`      | Connects to Discord, extracts image attachments/links, emits `message_image` events. |
 | `ingest`       | Fetches images through an **SSRF-hardened** fetcher (DNS pinning, size caps, magic-byte sniffing) and emits `image_fetched`. |
-| `detection`    | Decodes images under CPU/memory/pixel limits, computes the hash ensemble, matches against guild + global indexes (BK-tree), correlates cross-guild **swarms**, and emits a `verdict`. |
+| `detection`    | Decodes images under CPU/memory/pixel limits, computes the hash ensemble, matches against guild + global indexes (multi-index hashing), correlates cross-guild **swarms**, and emits a `verdict`. |
 | `moderation`   | Maps a verdict + guild policy onto an action (report / delete / timeout / ban), enforces per-guild rate limits and circuit breakers, posts to the mod-review channel, and can flip a guild into **safe mode** on anomalous spikes. |
 | `interactions` | Handles slash commands and review buttons (config, hash add/import/export, appeals) with server-side permission re-checks. |
 | `scheduler`    | Periodic jobs: data retention, metric rollups, evidence GC, and hash-index rebuilds. |

@@ -15,7 +15,7 @@ from optimus.hashing.ensemble import EnsembleResult, compare
 from optimus.hashing.perceptual import hamming
 from optimus.services.detection.index import HashIndex, KnownHash
 
-# phash Hamming radius used to gather BK-tree candidates before the full vote.
+# phash Hamming radius used to gather index candidates before the full vote.
 # Raised 12 -> 18 after the eval harness showed heavy border crops land at phash
 # distance 12-16 from the base: radius 18 recovers them (crop recall 33% -> 100%,
 # overall recall 0.792 -> 0.875) with zero precision/FPR loss. See

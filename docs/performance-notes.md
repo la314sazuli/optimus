@@ -10,7 +10,7 @@ pushes N synthetic images (the same deterministic corpus the accuracy benchmark
 uses) through the real `DetectionWorker.handle` with a configurable number
 concurrently in flight. It exercises the full production path — the sandboxed
 decode *subprocess*, perceptual hashing (both offloaded via `asyncio.to_thread`),
-BK-tree candidate gather, and the ensemble vote — over in-process fakes for the
+phash-index candidate gather, and the ensemble vote — over in-process fakes for the
 index/whitelist/sensitivity/idempotency hooks (no NATS/Redis/Postgres). Queue
 arrival is simulated with a saturated asyncio job pool, so each row is a
 sustained, always-busy worst case. See `benchmarks/load/`.
@@ -61,7 +61,7 @@ latency for nothing.
 
 ### `IndexManager` per-guild index cache is now LRU-bounded (Cycle 14)
 - **Location:** `src/optimus/services/detection/index.py` `IndexManager`
-- **Was:** `_guilds: dict[int, HashIndex]` retained one BK-tree index per guild
+- **Was:** `_guilds: dict[int, HashIndex]` retained one phash index per guild
   ever queried, never evicting. Growth was bounded by the number of guilds the
   bot is in (not per-message/per-user churn), and each index is expensive to
   rebuild (a Postgres query per guild) — a legitimate hot-path cache, but

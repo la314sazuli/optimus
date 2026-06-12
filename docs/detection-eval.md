@@ -1,11 +1,11 @@
 # Detection-quality evaluation harness
 
 The `benchmarks` package measures the offline detection quality of the
-perceptual-hash + BK-tree + ensemble pipeline: how well it re-identifies a known
+perceptual-hash + phash-index + ensemble pipeline: how well it re-identifies a known
 scam image after realistic re-share edits (recall), how often it flags benign
 uploads (false-positive rate), and how those trade off as the match threshold
-moves. It runs the **real** detection code — the same hash functions, BK-tree
-candidate gathering, and ensemble scoring the bot uses in production — over a
+moves. It runs the **real** detection code — the same hash functions, phash-index
+candidate gathering (multi-index hashing), and ensemble scoring the bot uses in production — over a
 deterministic synthetic image corpus, so the numbers reflect the shipped logic
 rather than a re-implementation.
 
@@ -30,7 +30,7 @@ It completes in ~1.5 s and needs no dependencies beyond the existing ones
 | `--clean-count N` | 18 | number of benign negative images |
 | `--steps N` | 25 | threshold-sweep granularity |
 | `--hi F` | 0.30 | upper bound of the threshold sweep |
-| `--candidate-radius N` | 18 | phash Hamming radius for BK-tree candidate gathering (production value) |
+| `--candidate-radius N` | 18 | phash Hamming radius for candidate gathering (production value) |
 | `--markdown PATH` | – | also write the report to a Markdown file |
 | `--json PATH` | – | write a machine-readable JSON artifact |
 
@@ -50,8 +50,8 @@ python -m benchmarks \
    q=35), `brightness`, `contrast`, `watermark` (text overlay), and `flip`
    (horizontal). Clean negatives are gradients, noise "photos", and bar charts.
    All seeds are fixed, so the corpus is byte-stable.
-2. **Scoring** (`benchmarks/harness.py`). It builds a BK-tree
-   `HashIndex` from the campaign *bases*, indexing each base together with its
+2. **Scoring** (`benchmarks/harness.py`). It builds a phash
+   `HashIndex` (multi-index hashing) from the campaign *bases*, indexing each base together with its
    horizontal-flip *mirror* hash set (the same flip-invariant indexing the
    production pipeline performs — see below). For every image it then gathers
    phash candidates within the candidate radius and keeps the lowest ensemble
@@ -135,7 +135,7 @@ gaps the harness had pinned down.
    fix is to index the mirror up front: when a scam image is added,
    `compute_all_mirror` hashes the horizontally-flipped pixels and those four
    hashes are stored (`mphash`/`mdhash`/`mwhash`/`mahash`, nullable — migration
-   `0004`) and indexed as a **sibling BK-tree entry under the same `hash_id` and
+   `0004`) and indexed as a **sibling index entry under the same `hash_id` and
    `campaign_id`** (`optimus.services.detection.index`). A mirrored re-share then
    matches the mirror entry at ~zero ensemble distance, and because the sibling
    carries the source `hash_id`, the match resolves back to the *same* source
@@ -166,7 +166,7 @@ Verify the intermediate row with `python -m benchmarks --candidate-radius 12`.
 
 ### On the candidate radius trade-off
 
-Radius 18 does marginally more BK-tree work per lookup and, on a larger and
+Radius 18 does marginally more index work per lookup and, on a larger and
 noisier real-world index, could surface more false *candidates* for the ensemble
 to reject — but on this corpus precision and FPR stay at 1.000 / 0.000 with wide
 margin, and the ensemble (not the radius) is what decides a match. The knob stays
