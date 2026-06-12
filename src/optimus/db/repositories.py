@@ -231,9 +231,7 @@ class GlobalSubmitterRepository:
         row = await self.get_or_create(user_id)
         row.confirmed += confirmed
         row.rejected += rejected
-        row.reputation = reputation_after(
-            row.reputation, confirmed=confirmed, rejected=rejected
-        )
+        row.reputation = reputation_after(row.reputation, confirmed=confirmed, rejected=rejected)
         await self._session.flush()
         return row
 
@@ -268,6 +266,15 @@ class DetectionRepository:
             .limit(limit)
         )
         return (await self._session.execute(stmt)).scalars().all()
+
+    async def belongs_to(self, detection_id: int, user_id: int) -> bool:
+        """Whether ``detection_id`` exists in this guild and ``user_id`` uploaded it."""
+        stmt = select(func.count()).where(
+            Detection.guild_id == self._guild_id,
+            Detection.id == detection_id,
+            Detection.uploader_id == user_id,
+        )
+        return int((await self._session.execute(stmt)).scalar_one()) > 0
 
     async def set_action_taken(self, detection_id: int, action: str) -> int:
         """Record the action applied to a detection; return rows affected."""
@@ -364,9 +371,7 @@ class AppealRepository:
 
     async def delete_older_than(self, cutoff: datetime) -> int:
         """Delete appeals older than ``cutoff``; return rows deleted."""
-        stmt = delete(Appeal).where(
-            Appeal.guild_id == self._guild_id, Appeal.created_at < cutoff
-        )
+        stmt = delete(Appeal).where(Appeal.guild_id == self._guild_id, Appeal.created_at < cutoff)
         result = await self._session.execute(stmt)
         await self._session.flush()
         return cast("CursorResult[Any]", result).rowcount or 0

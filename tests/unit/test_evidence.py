@@ -79,3 +79,23 @@ async def test_delete_removes_object() -> None:
     await store.store(guild_id=1, detection_id=2, data=b"x")
     await store.delete("evidence/1/2")
     assert "evidence/1/2" in backend.deleted
+
+
+async def test_presigned_url_uses_configured_expiry() -> None:
+    backend = _FakeStore()
+    store = EvidenceStore(backend, presign_seconds=45)
+    url = await store.presigned_url("evidence/9/9")
+    assert url == "https://store.local/evidence/9/9?exp=45"
+
+
+def test_s3_object_store_normalizes_empty_endpoint() -> None:
+    from optimus.evidence.store import S3ObjectStore
+
+    # An empty endpoint_url collapses to None (use AWS default), region is kept.
+    store = S3ObjectStore("mybucket", endpoint_url="", region="eu-west-1")
+    assert store._endpoint_url is None
+    assert store._region == "eu-west-1"
+    assert store._bucket == "mybucket"
+
+    explicit = S3ObjectStore("b", endpoint_url="https://minio.local")
+    assert explicit._endpoint_url == "https://minio.local"

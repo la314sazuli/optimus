@@ -43,6 +43,7 @@ class FakeDeps:
         self._hash_rate_ok = flags.get("hash_rate_ok", True)
         self._appeal_ok = flags.get("appeal_ok", True)
         self._recent_detection = flags.get("recent_detection", 555)
+        self._owned_detections: set[int] = set(flags.get("owned_detections", {77}))
         self._next_appeal_id = 1
         self._global_service = _FakeGlobalService(flags.get("submit_error"))
         self.global_submitted: list[str] = []
@@ -79,6 +80,9 @@ class FakeDeps:
 
     async def recent_detection_for(self, guild_id: int, user_id: int) -> int | None:
         return self._recent_detection
+
+    async def detection_belongs_to(self, guild_id: int, detection_id: int, user_id: int) -> bool:
+        return detection_id in self._owned_detections
 
     async def open_appeal(self, guild_id: int, detection_id: int, user_id: int) -> int:
         appeal_id = self._next_appeal_id
@@ -198,9 +202,7 @@ async def test_forget_me_allowed_in_dm_without_permission() -> None:
 @pytest.mark.asyncio
 async def test_scamhash_add_audits_and_stores() -> None:
     deps = FakeDeps()
-    resp = await handle_command(
-        _ctx("scamhash", subcommand="add", phash="deadbeef"), deps
-    )
+    resp = await handle_command(_ctx("scamhash", subcommand="add", phash="deadbeef"), deps)
     assert resp.i18n_key == "command.hash_added"
     assert deps.hashes
     assert deps.audits[0][2] == "scamhash.add"
@@ -292,6 +294,27 @@ async def test_appeal_open_button() -> None:
     resp = await handle_component(ctx, ComponentAction.APPEAL_OPEN, 77, deps)
     assert resp.i18n_key == "dm.appeal_submitted"
     assert deps.appeals[1]["detection_id"] == 77
+
+
+@pytest.mark.asyncio
+async def test_appeal_open_button_rejects_unowned_detection() -> None:
+    # The detection id rides in the forgeable custom id; a user must not be able
+    # to open an appeal for a detection that is not theirs (or does not exist).
+    deps = FakeDeps(owned_detections=set())
+    ctx = _ctx("", perms=NONE)
+    resp = await handle_component(ctx, ComponentAction.APPEAL_OPEN, 999, deps)
+    assert resp.i18n_key == "command.appeal_none"
+    assert not deps.appeals
+
+
+@pytest.mark.asyncio
+async def test_appeal_open_button_rejected_in_dm() -> None:
+    deps = FakeDeps()
+    ctx = _ctx("", perms=NONE, guild_id=None)
+    with pytest.raises(InteractionRejected) as excinfo:
+        await handle_component(ctx, ComponentAction.APPEAL_OPEN, 77, deps)
+    assert excinfo.value.reason is CommandError.GUILD_ONLY
+    assert not deps.appeals
 
 
 @pytest.mark.asyncio

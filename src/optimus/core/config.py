@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     ingest_max_redirects: int = 3
     ingest_fetch_rate_capacity: float = 20.0
     ingest_fetch_rate_refill: float = 10.0
+    #: Opportunistic idle-bucket sweep cadence for the in-memory rate-limiter
+    #: fallback (seconds), used only when Redis is unavailable.
+    ingest_inmemory_sweep_seconds: float = Field(default=300.0, gt=0.0)
 
     # Swarm correlation
     swarm_min_guilds: int = 3
@@ -79,9 +82,15 @@ class Settings(BaseSettings):
     sensitivity_default: Sensitivity = Sensitivity.BALANCED
     embedding_enabled: bool = False
     embedding_model_path: str = ""
+    #: Max per-guild hash indexes held resident (LRU); least-recently-used are
+    #: evicted and rebuilt on demand. Sized for very large fleets.
+    detection_guild_index_cap: int = Field(default=1024, ge=1)
 
     # Rate limiting
     ratelimit_redis_prefix: str = "optimus:rl"
+    #: Opportunistic idle-bucket sweep cadence for the interactions in-memory
+    #: rate-limiter fallback (seconds), used only when Redis is unavailable.
+    interactions_inmemory_sweep_seconds: float = Field(default=300.0, gt=0.0)
 
     # Moderation
     #: Confidence at or above which a verdict is queued for moderator review.

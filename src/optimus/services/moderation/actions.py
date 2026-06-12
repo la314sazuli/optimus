@@ -19,12 +19,45 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from prometheus_client import Counter, Gauge
+
 from optimus.contracts.events import Action
 from optimus.core.backoff import BackoffPolicy, retry_async
-from optimus.core.circuit import CircuitBreaker, CircuitOpenError
+from optimus.core.circuit import CircuitBreaker, CircuitOpenError, CircuitState
+from optimus.core.logging import get_logger
 from optimus.core.ratelimit import RateLimit, RateLimiter
 from optimus.i18n import translate
 from optimus.services.moderation.cooldown import Cooldown
+
+_log = get_logger(__name__)
+
+# 0/1/2 encode closed/half_open/open so a dashboard can alert on "> 0".
+_CIRCUIT_STATE_CODE = {
+    CircuitState.CLOSED: 0,
+    CircuitState.HALF_OPEN: 1,
+    CircuitState.OPEN: 2,
+}
+
+CIRCUIT_STATE = Gauge(
+    "optimus_moderation_circuit_state",
+    "Discord REST circuit breaker state (0=closed, 1=half_open, 2=open).",
+)
+CIRCUIT_TRANSITIONS = Counter(
+    "optimus_moderation_circuit_transitions_total",
+    "Discord REST circuit breaker state transitions.",
+    ["from_state", "to_state"],
+)
+
+
+def _observe_circuit_transition(previous: CircuitState, current: CircuitState) -> None:
+    """Record a breaker state change as a metric and a structured log line."""
+    CIRCUIT_STATE.set(_CIRCUIT_STATE_CODE[current])
+    CIRCUIT_TRANSITIONS.labels(from_state=previous.value, to_state=current.value).inc()
+    _log.warning(
+        "moderation_circuit_state_changed",
+        from_state=previous.value,
+        to_state=current.value,
+    )
 
 
 def render_dm(locale: str, *, guild: str) -> str:
@@ -95,7 +128,14 @@ class ActionExecutor:
         self._acquire = idempotency_acquire
         self._dm_cooldown = dm_cooldown
         self._breaker = breaker or CircuitBreaker()
+        # Attach metrics/logging to whichever breaker is used, including a
+        # caller-injected one; add_state_listener is idempotent so this never
+        # double-fires if the breaker was already wired with the observer.
+        self._breaker.add_state_listener(_observe_circuit_transition)
         self._backoff = backoff or BackoffPolicy(max_attempts=3)
+        # CIRCUIT_STATE is a process-global gauge; this assumes one executor per
+        # process (the standard single-service-per-process deployment).
+        CIRCUIT_STATE.set(_CIRCUIT_STATE_CODE[self._breaker.state])
 
     async def execute(self, req: ActionRequest) -> ActionResult:
         """Apply ``req`` exactly once, returning the outcome.
@@ -146,5 +186,11 @@ class ActionExecutor:
         content = render_dm(req.locale, guild=req.guild_name or str(req.guild_id))
         try:
             await self._rest.send_dm(req.uploader_id, content)
-        except Exception:
-            return
+        except Exception as exc:
+            # Closed DMs are routine; log without a stack trace at debug level so
+            # a systematic delivery failure is still observable per guild.
+            _log.debug(
+                "moderation_dm_failed",
+                guild_id=req.guild_id,
+                error=type(exc).__name__,
+            )

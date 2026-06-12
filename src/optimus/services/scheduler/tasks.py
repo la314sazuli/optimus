@@ -72,9 +72,7 @@ async def cleanup_evidence(
     return removed
 
 
-async def roll_up_stats(
-    scope: SessionScope, *, now: datetime | None = None
-) -> int:
+async def roll_up_stats(scope: SessionScope, *, now: datetime | None = None) -> int:
     """Upsert the previous hour's detection counts per guild.
 
     Returns the number of guild rollups written.

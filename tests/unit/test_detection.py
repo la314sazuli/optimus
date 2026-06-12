@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime
+from unittest import mock
 
 from optimus.contracts.events import ImageFetchedEvent, Verdict
 from optimus.core.config import Sensitivity
@@ -156,7 +157,12 @@ class _AlwaysSwarm:
         return SwarmObservation(distinct_guilds=5, is_swarming=True)
 
 
-def _worker(*, guild_index: HashIndex, swarm: object | None = None) -> DetectionWorker:
+def _worker(
+    *,
+    guild_index: HashIndex,
+    swarm: object | None = None,
+    cls: type[DetectionWorker] = DetectionWorker,
+) -> DetectionWorker:
     async def gi(_gid: int) -> HashIndex:
         return guild_index
 
@@ -170,7 +176,7 @@ def _worker(*, guild_index: HashIndex, swarm: object | None = None) -> Detection
         return Sensitivity.BALANCED
 
     guard = _OnceGuard()
-    return DetectionWorker(
+    return cls(
         guild_index=gi,
         global_index=gx,
         whitelist=wl,
@@ -232,6 +238,40 @@ async def test_worker_swarm_escalates_and_alerts() -> None:
     assert result.swarm_alert.distinct_guilds == 5
     # An exact match (SCAM) stays SCAM; escalation only lifts a lower band.
     assert result.verdict.verdict is Verdict.SCAM
+
+
+async def test_worker_offloads_decode_and_hash_to_thread() -> None:
+    # The decode subprocess wait and numpy hashing must not run on the event
+    # loop; the worker dispatches them via asyncio.to_thread.
+    import asyncio
+    import threading
+
+    calls: list[object] = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy(func: object, /, *args: object, **kwargs: object) -> object:
+        calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)  # type: ignore[arg-type]
+
+    # Behavioral check: record the thread the decode+hash actually runs on and
+    # assert it is *not* the event-loop thread, so a regression that inlined the
+    # work on the loop would fail even if it still routed through to_thread.
+    loop_thread = threading.get_ident()
+    ran_on: list[int] = []
+
+    class _ThreadProbe(DetectionWorker):
+        def _decode_and_hash(self, data: bytes):  # type: ignore[override]
+            ran_on.append(threading.get_ident())
+            return super()._decode_and_hash(data)
+
+    worker = _worker(guild_index=EMPTY, cls=_ThreadProbe)
+    with mock.patch.object(asyncio, "to_thread", spy):
+        result = await worker.handle(_event(key="offload", data=_scam_png()))
+    assert result is not None
+    assert calls, "decode+hash work was not offloaded via asyncio.to_thread"
+    assert calls[0] == worker._decode_and_hash
+    assert ran_on, "decode+hash did not run"
+    assert ran_on[0] != loop_thread, "decode+hash ran on the event-loop thread"
 
 
 async def test_worker_swarm_escalates_ambiguous_to_scam() -> None:

@@ -108,6 +108,48 @@ async def test_ban_deletes_and_bans_and_dms() -> None:
     assert rest.dms == [(42, rest.dms[0][1])]
 
 
+async def test_timeout_deletes_and_times_out_with_configured_seconds() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    req = ActionRequest(
+        guild_id=1,
+        channel_id=2,
+        message_id=3,
+        uploader_id=42,
+        action=Action.DELETE_TIMEOUT,
+        idempotency_key="t1",
+        timeout_seconds=600,
+    )
+    result = await _executor(rest, redis=redis).execute(req)
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message", "timeout_member"]
+    # The configured timeout is forwarded as the third positional arg.
+    assert rest.calls[1] == ("timeout_member", (1, 42, 600))
+
+
+async def test_kick_deletes_and_kicks() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    result = await _executor(rest, redis=redis).execute(_req(Action.DELETE_KICK, key="k"))
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message", "kick_member"]
+
+
+async def test_dm_failure_is_swallowed_and_action_still_succeeds() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+    class _DmFailingRest(_FakeRest):
+        async def send_dm(self, user_id: int, content: str) -> None:
+            raise RuntimeError("recipient has DMs closed")
+
+    rest = _DmFailingRest()
+    # A closed-DM failure must not fail the enforcement action.
+    result = await _executor(rest, redis=redis).execute(_req(Action.DELETE, key="dmfail"))
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message"]
+    assert rest.dms == []  # nothing recorded because send_dm raised
+
+
 async def test_idempotency_blocks_duplicate() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()
@@ -150,6 +192,23 @@ async def test_open_circuit_fails_fast() -> None:
     assert second.detail == "circuit_open"
 
 
+async def test_injected_breaker_emits_transition_metrics() -> None:
+    # A caller-supplied breaker must still drive the circuit-state metric, not
+    # only the executor's default breaker.
+    from optimus.services.moderation.actions import CIRCUIT_TRANSITIONS
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest(fail_times=100)
+    breaker = CircuitBreaker(failure_threshold=1, recovery_time=999.0)
+    before = CIRCUIT_TRANSITIONS.labels(from_state="closed", to_state="open")._value.get()
+
+    ex = _executor(rest, redis=redis, breaker=breaker)
+    await ex.execute(_req(key="trip"))  # one failure trips closed -> open
+
+    after = CIRCUIT_TRANSITIONS.labels(from_state="closed", to_state="open")._value.get()
+    assert after == before + 1
+
+
 async def test_dm_cooldown_suppresses_second_warning() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()
@@ -165,8 +224,12 @@ async def test_no_dm_to_self() -> None:
     rest = _FakeRest()
     ex = _executor(rest, redis=redis)
     req = ActionRequest(
-        guild_id=1, channel_id=2, message_id=3, uploader_id=999,
-        action=Action.DELETE, idempotency_key="self",
+        guild_id=1,
+        channel_id=2,
+        message_id=3,
+        uploader_id=999,
+        action=Action.DELETE,
+        idempotency_key="self",
     )
     await ex.execute(req)
     assert rest.dms == []
@@ -176,3 +239,29 @@ async def test_cooldown_window_validation() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     with pytest.raises(ValueError, match="window_seconds"):
         Cooldown(redis, window_seconds=0)
+
+
+async def _always_acquire(_key: str) -> bool:
+    return True
+
+
+async def test_default_breaker_records_transition_metric() -> None:
+    from optimus.services.moderation.actions import CIRCUIT_TRANSITIONS
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest(fail_times=99)
+    # A default-constructed executor wires the metric/log observer onto its breaker.
+    ex = ActionExecutor(
+        rest,
+        InMemoryRateLimiter(),
+        bot_user_id=999,
+        rate=RateLimit(capacity=50.0, refill_rate=0.001),
+        idempotency_acquire=_always_acquire,
+        dm_cooldown=Cooldown(redis, window_seconds=3600),
+        backoff=BackoffPolicy(base=0.001, max_delay=0.002, max_attempts=1),
+    )
+    label = CIRCUIT_TRANSITIONS.labels(from_state="closed", to_state="open")
+    before = label._value.get()
+    for i in range(5):  # default failure_threshold (5) trips the breaker open
+        await ex.execute(_req(key=f"trip{i}"))
+    assert label._value.get() == before + 1

@@ -26,6 +26,7 @@ from optimus.core.config import Settings, get_settings
 from optimus.core.guild_config import GuildConfig, GuildConfigCache
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, correlation_context, get_logger
+from optimus.core.readiness import nats_check, redis_check
 from optimus.services.gateway.extract import (
     Attachment,
     IncomingMessage,
@@ -172,6 +173,9 @@ async def _amain() -> None:
     config_cache = GuildConfigCache(redis, loader)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
+    health.add_readiness_check(nats_check(nc), name="nats")
+    if redis is not None:
+        health.add_readiness_check(redis_check(redis), name="redis")
     await health.start()
 
     bot = hikari.GatewayBot(token=settings.discord_token, intents=GATEWAY_INTENTS)

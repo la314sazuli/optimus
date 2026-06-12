@@ -94,9 +94,7 @@ def evaluate(
     effective_std = max(baseline.stddev, math.sqrt(max(0.0, baseline.mean)))
     threshold = baseline.mean + sigma * effective_std
     is_anomaly = (
-        baseline.samples >= warmup
-        and baseline.mean >= min_floor
-        and observation > threshold
+        baseline.samples >= warmup and baseline.mean >= min_floor and observation > threshold
     )
     return SafeModeDecision(
         baseline=update_baseline(baseline, observation, alpha=alpha),

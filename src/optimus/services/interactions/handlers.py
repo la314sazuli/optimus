@@ -76,6 +76,9 @@ class InteractionDeps(Protocol):
     async def opt_out_user(self, user_id: int) -> int: ...
     async def purge_guild(self, guild_id: int) -> int: ...
     async def recent_detection_for(self, guild_id: int, user_id: int) -> int | None: ...
+    async def detection_belongs_to(
+        self, guild_id: int, detection_id: int, user_id: int
+    ) -> bool: ...
     async def open_appeal(self, guild_id: int, detection_id: int, user_id: int) -> int: ...
     async def get_appeal(self, guild_id: int, appeal_id: int) -> dict[str, Any] | None: ...
     async def resolve_appeal(self, guild_id: int, appeal_id: int, *, approved: bool) -> None: ...
@@ -333,9 +336,16 @@ async def handle_component(
 ) -> InteractionResponse:
     """Handle a non-report component (appeal lifecycle, safe-mode, purge confirm)."""
     if action is ComponentAction.APPEAL_OPEN:
+        if ctx.guild_id is None:
+            raise InteractionRejected(CommandError.GUILD_ONLY)
+        # The detection id rides in the (client-echoed, forgeable) custom id, so
+        # never trust it: only the user the detection was filed against may appeal
+        # it, and only within the detection's own guild. The /appeal command path
+        # derives this server-side; here we re-verify ownership explicitly.
+        if not await deps.detection_belongs_to(ctx.guild_id, ref_id, ctx.user_id):
+            return InteractionResponse("command.appeal_none")
         if not await deps.appeal_cooldown_ok(ctx.user_id):
             return InteractionResponse("dm.appeal_cooldown")
-        assert ctx.guild_id is not None
         await deps.open_appeal(ctx.guild_id, ref_id, ctx.user_id)
         await deps.audit(ctx.guild_id, ctx.user_id, "appeal.open", target=str(ref_id))
         return InteractionResponse("dm.appeal_submitted")

@@ -28,9 +28,7 @@ def upgrade() -> None:
         "global_hashes",
         sa.Column("submitter_guild_id", sa.BigInteger(), nullable=True),
     )
-    op.create_index(
-        "ix_global_hashes_submitter_user_id", "global_hashes", ["submitter_user_id"]
-    )
+    op.create_index("ix_global_hashes_submitter_user_id", "global_hashes", ["submitter_user_id"])
 
     op.create_table(
         "global_submitters",

@@ -32,10 +32,12 @@ from optimus.contracts.events import (
     SwarmAlertEvent,
     VerdictEvent,
 )
+from optimus.core.circuit import CircuitBreaker
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import RateLimit, RedisRateLimiter
+from optimus.core.readiness import nats_check, redis_check
 from optimus.db.engine import (
     SessionScope,
     create_engine,
@@ -128,6 +130,10 @@ def build_coordinator(
     cooldown = Cooldown(redis, window_seconds=settings.mod_dm_cooldown_seconds)
     guard = _ActionIdempotency(redis)
 
+    breaker = CircuitBreaker(
+        failure_threshold=settings.mod_circuit_failure_threshold,
+        recovery_time=settings.mod_circuit_recovery_seconds,
+    )
     executor = ActionExecutor(
         rest,  # type: ignore[arg-type]
         rate_limiter,
@@ -138,6 +144,7 @@ def build_coordinator(
         ),
         idempotency_acquire=guard.acquire,
         dm_cooldown=cooldown,
+        breaker=breaker,
     )
 
     async def config(guild_id: int) -> GuildModConfig:
@@ -148,8 +155,7 @@ def build_coordinator(
                 guild_id=guild_id,
                 configured_action=action,
                 mod_queue_threshold=(
-                    guild.mod_queue_threshold if guild is not None
-                    else settings.mod_queue_threshold
+                    guild.mod_queue_threshold if guild is not None else settings.mod_queue_threshold
                 ),
                 auto_act_threshold=settings.mod_auto_act_threshold,
                 safe_mode=guild.safe_mode if guild is not None else False,
@@ -230,9 +236,7 @@ async def _resolve_target(  # pragma: no cover - requires live REST
         if int(rid) in by_id
     )
     top = max((by_id[int(rid)].position for rid in member.role_ids if int(rid) in by_id), default=0)
-    bot_top = max(
-        (by_id[int(rid)].position for rid in me.role_ids if int(rid) in by_id), default=0
-    )
+    bot_top = max((by_id[int(rid)].position for rid in me.role_ids if int(rid) in by_id), default=0)
     return TargetContext(
         user_id=user_id,
         guild_owner_id=int(guild.owner_id),
@@ -287,6 +291,8 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     service = ModerationService(settings, bus, coordinator, scope)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
+    health.add_readiness_check(nats_check(nc), name="nats")
+    health.add_readiness_check(redis_check(redis), name="redis")
     await health.start()
 
     stop = asyncio.Event()

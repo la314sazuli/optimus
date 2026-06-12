@@ -70,6 +70,49 @@ async def test_guild_index_invalidation_reloads(session: AsyncSession) -> None:
     assert reloaded is not idx
 
 
+async def test_guild_index_lru_evicts_least_recently_used(session: AsyncSession) -> None:
+    session.add(Guild(guild_id=GUILD_ID))
+    await _add_guild_hash(session, "h1", 1234)
+    await session.commit()
+
+    mgr = IndexManager(_scope_factory(session), max_guilds=2)
+    # Build for the populated guild plus two empty guilds (repo filters by id).
+    idx_main = await mgr.guild_index(GUILD_ID)
+    await mgr.guild_index(201)
+    # Touch the populated guild so it becomes most-recent; 201 is now LRU.
+    assert await mgr.guild_index(GUILD_ID) is idx_main
+    # A third distinct guild exceeds the cap and evicts the LRU (201).
+    await mgr.guild_index(202)
+
+    assert mgr.cached_guilds() == [GUILD_ID, 202]
+    # The evicted guild rebuilds on demand (a fresh, non-identical instance).
+    rebuilt = await mgr.guild_index(201)
+    assert rebuilt is not None
+    # Rebuilding 201 now evicts the next LRU (GUILD_ID).
+    assert mgr.cached_guilds() == [202, 201]
+
+
+async def test_guild_index_invalidate_respects_lru_cap(session: AsyncSession) -> None:
+    session.add(Guild(guild_id=GUILD_ID))
+    await session.commit()
+
+    mgr = IndexManager(_scope_factory(session), max_guilds=1)
+    await mgr.guild_index(GUILD_ID)
+    # Invalidating a different guild rebuilds it and evicts over-cap entries.
+    await mgr.invalidate(301)
+    assert mgr.cached_guilds() == [301]
+
+
+async def test_guild_index_unbounded_by_default(session: AsyncSession) -> None:
+    session.add(Guild(guild_id=GUILD_ID))
+    await session.commit()
+
+    mgr = IndexManager(_scope_factory(session))
+    for gid in range(400, 410):
+        await mgr.guild_index(gid)
+    assert len(mgr.cached_guilds()) == 10
+
+
 async def test_global_index_invalidation(session: AsyncSession) -> None:
     session.add(GlobalHash(hash_id="g1", phash=42, dhash=0, whash=0, status="promoted"))
     session.add(GlobalHash(hash_id="g-cand", phash=43, dhash=0, whash=0, status="candidate"))

@@ -169,3 +169,66 @@ async def test_revoke_unknown_raises(session: AsyncSession) -> None:
     svc = _service(session)
     with pytest.raises(KeyError):
         await svc.revoke("missing")
+
+
+@pytest.mark.asyncio
+async def test_approve_unknown_hash_raises(session: AsyncSession) -> None:
+    # An approval can be recorded for a hash_id that was never submitted; the
+    # service then fails to find the candidate row and raises.
+    svc = _service(session)
+    with pytest.raises(KeyError):
+        await svc.approve(hash_id="ghost", approver_user_id=11, approver_guild_id=100)
+
+
+@pytest.mark.asyncio
+async def test_promotion_without_submitter_skips_reputation_credit(
+    session: AsyncSession,
+) -> None:
+    from optimus.db.models import GlobalHash
+
+    priv, pub = generate_keypair()
+    svc = _service(session, priv=priv, pub=pub)
+    # A candidate with no recorded submitter (e.g. migrated/imported row).
+    session.add(
+        GlobalHash(
+            hash_id="orphan",
+            phash=1,
+            dhash=2,
+            whash=3,
+            status="candidate",
+            submitter_user_id=None,
+        )
+    )
+    await session.flush()
+
+    await svc.approve(hash_id="orphan", approver_user_id=11, approver_guild_id=100)
+    result = await svc.approve(hash_id="orphan", approver_user_id=22, approver_guild_id=200)
+    assert result.promoted is True
+
+    row = await GlobalHashRepository(session).get("orphan")
+    assert row is not None
+    assert row.status == "promoted"
+    assert row.signature  # signed despite having no submitter to credit
+
+
+@pytest.mark.asyncio
+async def test_revoke_without_submitter_skips_reputation_dock(session: AsyncSession) -> None:
+    from optimus.db.models import GlobalHash
+
+    svc = _service(session)
+    session.add(
+        GlobalHash(
+            hash_id="orphan2",
+            phash=1,
+            dhash=2,
+            whash=3,
+            status="promoted",
+            submitter_user_id=None,
+        )
+    )
+    await session.flush()
+
+    await svc.revoke("orphan2")
+    row = await GlobalHashRepository(session).get("orphan2")
+    assert row is not None
+    assert row.status == "revoked"

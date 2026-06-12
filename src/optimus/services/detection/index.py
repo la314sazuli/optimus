@@ -9,12 +9,23 @@ on demand when an invalidation arrives.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from prometheus_client import Counter
+
+from optimus.core.logging import get_logger
 from optimus.db.engine import SessionScope
 from optimus.db.repositories import GlobalHashRepository, GuildHashRepository
 from optimus.hashing.bktree import BKTree
+
+_log = get_logger(__name__)
+
+GUILD_INDEX_EVICTED = Counter(
+    "optimus_detection_guild_index_evicted_total",
+    "Per-guild hash indexes evicted from the LRU cache.",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,11 +79,23 @@ class IndexManager:
     ``session_scope`` is an async-context-manager factory yielding an
     :class:`AsyncSession` (e.g. :func:`optimus.db.engine.session_scope` bound to a
     factory). Indexes are cached until invalidated.
+
+    The per-guild cache is an LRU bounded by ``max_guilds`` (``None`` = unbounded):
+    once the cap is exceeded the least-recently-used guild index is dropped and
+    rebuilt on demand the next time it is queried. The cache is touched on every
+    read, so the most active guilds stay resident. Eviction runs synchronously
+    *after* a freshly built index is stored, and the just-stored guild is moved to
+    the most-recent end first, so it can never evict the index a caller is about to
+    return — the only await inside :meth:`guild_index` is the build, and within the
+    single event loop the store-and-evict sequence after it is indivisible.
     """
 
-    def __init__(self, session_scope: SessionScope) -> None:
+    def __init__(self, session_scope: SessionScope, *, max_guilds: int | None = None) -> None:
+        if max_guilds is not None and max_guilds < 1:
+            raise ValueError("max_guilds must be >= 1 or None")
         self._scope = session_scope
-        self._guilds: dict[int, HashIndex] = {}
+        self._guilds: OrderedDict[int, HashIndex] = OrderedDict()
+        self._max_guilds = max_guilds
         self._global: HashIndex | None = None
 
     async def guild_index(self, guild_id: int) -> HashIndex:
@@ -80,8 +103,25 @@ class IndexManager:
         index = self._guilds.get(guild_id)
         if index is None:
             index = await self._build_guild(guild_id)
-            self._guilds[guild_id] = index
+            self._store_guild(guild_id, index)
+        else:
+            self._guilds.move_to_end(guild_id)
         return index
+
+    def _store_guild(self, guild_id: int, index: HashIndex) -> None:
+        """Insert/refresh ``guild_id`` as most-recent, then evict over-cap LRUs."""
+        self._guilds[guild_id] = index
+        self._guilds.move_to_end(guild_id)
+        if self._max_guilds is None:
+            return
+        while len(self._guilds) > self._max_guilds:
+            evicted, _ = self._guilds.popitem(last=False)
+            GUILD_INDEX_EVICTED.inc()
+            _log.info("guild_index_evicted", guild_id=evicted, cache_size=len(self._guilds))
+
+    def cached_guilds(self) -> list[int]:
+        """Return resident guild ids in LRU order (oldest first)."""
+        return list(self._guilds)
 
     async def global_index(self) -> HashIndex:
         """Return (building if needed) the global promoted-hash index."""
@@ -94,7 +134,7 @@ class IndexManager:
         if guild_id is None:
             self._global = await self._build_global()
         else:
-            self._guilds[guild_id] = await self._build_guild(guild_id)
+            self._store_guild(guild_id, await self._build_guild(guild_id))
 
     async def _build_guild(self, guild_id: int) -> HashIndex:
         async with self._scope() as session:

@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, CollectorRegistry, generate_latest
 
+from optimus.core.logging import get_logger
+
 ReadinessCheck = Callable[[], Awaitable[bool]]
+
+_log = get_logger(__name__)
 
 
 class HealthServer:
     """Serves liveness, readiness, and Prometheus metrics endpoints.
 
     Liveness (``/healthz``) reflects process health. Readiness (``/readyz``)
-    runs registered async checks; any failure yields HTTP 503.
+    runs registered async checks; any failure yields HTTP 503. Each check is
+    bounded by ``check_timeout`` seconds and fails closed on timeout, so a
+    black-holed dependency cannot wedge the probe handler indefinitely.
     """
 
     def __init__(
@@ -23,11 +30,13 @@ class HealthServer:
         host: str = "0.0.0.0",  # noqa: S104 - intended bind for containerized service
         port: int = 8080,
         registry: CollectorRegistry = REGISTRY,
+        check_timeout: float = 3.0,
     ) -> None:
         self._host = host
         self._port = port
         self._registry = registry
-        self._readiness_checks: list[ReadinessCheck] = []
+        self._check_timeout = check_timeout
+        self._readiness_checks: list[tuple[str, ReadinessCheck]] = []
         self._live = True
         self._app = web.Application()
         self._app.add_routes(
@@ -39,9 +48,12 @@ class HealthServer:
         )
         self._runner: web.AppRunner | None = None
 
-    def add_readiness_check(self, check: ReadinessCheck) -> None:
-        """Register an async readiness check returning ``True`` when ready."""
-        self._readiness_checks.append(check)
+    def add_readiness_check(self, check: ReadinessCheck, *, name: str = "check") -> None:
+        """Register an async readiness check returning ``True`` when ready.
+
+        ``name`` labels the dependency in readiness failure logs (e.g. ``redis``).
+        """
+        self._readiness_checks.append((name, check))
 
     def set_live(self, live: bool) -> None:
         """Set process liveness (used to fail ``/healthz`` during shutdown)."""
@@ -53,12 +65,19 @@ class HealthServer:
         return web.json_response({"status": "shutting_down"}, status=503)
 
     async def _handle_readyz(self, _request: web.Request) -> web.Response:
-        for check in self._readiness_checks:
+        for name, check in self._readiness_checks:
             try:
-                ok = await check()
+                ok = await asyncio.wait_for(check(), timeout=self._check_timeout)
+            except TimeoutError:
+                # A black-holed dependency (firewall DROP) never raises promptly;
+                # fail closed so the probe returns 503 rather than hanging.
+                _log.warning("readiness_check_timeout", check=name, timeout=self._check_timeout)
+                ok = False
             except Exception:
+                _log.exception("readiness_check_errored", check=name)
                 ok = False
             if not ok:
+                _log.warning("readiness_check_failed", check=name)
                 return web.json_response({"status": "not_ready"}, status=503)
         return web.json_response({"status": "ready"})
 

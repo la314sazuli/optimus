@@ -1,5 +1,8 @@
 # optimus
 
+[![CI](https://github.com/la314sazuli/optimus/actions/workflows/ci.yml/badge.svg)](https://github.com/la314sazuli/optimus/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Open-source Discord moderation bot focused on detecting and removing scam,
 phishing, and fraud **images** (fake giveaways, fake Nitro/Steam gifts, fake
 exchange screenshots, wallet-drainer QR codes) in near-real-time, built to scale
@@ -43,7 +46,40 @@ Event schemas and NATS subjects are defined in
 [`src/optimus/contracts/events.py`](src/optimus/contracts/events.py); every
 subject is versioned (`...v1`) so schemas can evolve without breaking consumers.
 
-## Quickstart (self-hosted)
+For a deeper treatment — the full message flow, the detection pipeline, where
+state lives, and where the resilience controls sit (with diagrams) — see
+[`docs/architecture.md`](docs/architecture.md).
+
+## Quickstart (Docker Compose)
+
+The fastest way to self-host: one image runs every service, and Compose brings
+up the backing stores (PostgreSQL, Redis, JetStream-enabled NATS), applies
+migrations, and starts the six services. Requires Docker with the Compose plugin.
+
+```bash
+# 1. Configure
+cp .env.example .env
+# edit .env: set OPTIMUS_DISCORD_TOKEN (and POSTGRES_PASSWORD for non-local use)
+
+# 2. Build the image and start the whole stack
+docker compose up --build
+```
+
+Compose runs the `migrate` one-shot (`alembic upgrade head`) before the services
+start, and gates each service on the datastores reporting healthy. The services'
+`/readyz` probes drive the container healthchecks. Slash commands still need a
+one-time registration:
+
+```bash
+docker compose run --rm gateway python scripts/register_commands.py
+```
+
+The image is multi-stage (uv installs the locked, `--frozen` dependency set; the
+final stage is a slim, non-root `python:3.12-slim` with only runtime deps) and
+service-agnostic — select a service via its command, e.g.
+`python -m optimus.services.detection`.
+
+## Quickstart (self-hosted, no Docker)
 
 Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and reachable
 PostgreSQL, Redis, and NATS instances.
@@ -72,7 +108,10 @@ uv run python -m optimus.services.scheduler
 ```
 
 Each service exposes a health endpoint (`/healthz`, `/readyz`) on
-`OPTIMUS_HEALTH_PORT` and Prometheus metrics for observability.
+`OPTIMUS_HEALTH_PORT` and Prometheus metrics for observability. Readiness
+probes the service's NATS, Redis, and (for interactions) Postgres dependencies,
+so `/readyz` returns 503 while a backing store is unreachable; each probe is
+bounded by a timeout so a black-holed dependency fails closed.
 
 ## Configuration
 
@@ -103,6 +142,11 @@ current baseline is documented in [`docs/eval/baseline.md`](docs/eval/baseline.m
 precision and false-positive rate are **perfect** across all presets, with recall
 trading off per sensitivity — the right bias for an auto-moderation action.
 
+For a deeper offline evaluation — a synthetic corpus run through the real
+pipeline across a full threshold sweep, with per-perturbation recall and a
+recommended operating point — run `python -m benchmarks`. See
+[`docs/detection-eval.md`](docs/detection-eval.md) for usage and findings.
+
 ## Security model
 
 - **SSRF defense.** Untrusted image URLs are validated by
@@ -127,11 +171,26 @@ trading off per sensitivity — the right bias for an auto-moderation action.
 ## Development
 
 ```bash
-uv sync --extra dev
-uv run ruff check .
-uv run mypy
-uv run pytest
+uv sync --extra dev --frozen
+uv run ruff check .   # lint (matches CI)
+uv run mypy           # type-check, strict (matches CI)
+uv run pytest         # test suite (matches CI)
 ```
+
+Optional [pre-commit](https://pre-commit.com/) hooks run the same `ruff check`
+and `mypy` plus secret scanning:
+
+```bash
+uvx pre-commit install
+uvx pre-commit run --all-files
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full developer workflow (setup,
+running services locally, test conventions, and PR expectations) and
+[`docs/architecture.md`](docs/architecture.md) for the system design. Additional
+references: [`docs/security-audit.md`](docs/security-audit.md),
+[`docs/performance-notes.md`](docs/performance-notes.md), and
+[`docs/eval/baseline.md`](docs/eval/baseline.md).
 
 ## License
 

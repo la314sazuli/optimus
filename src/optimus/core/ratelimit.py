@@ -98,10 +98,20 @@ class _Bucket:
 
 @dataclass
 class InMemoryRateLimiter:
-    """Process-local token bucket, used when Redis is unavailable."""
+    """Process-local token bucket, used when Redis is unavailable.
+
+    When ``sweep_interval`` is set (seconds), :meth:`acquire` opportunistically
+    runs :meth:`evict_idle` at most once per interval so the bucket map stays
+    bounded even though nothing else sweeps the in-memory fallback. The gate is a
+    plain timestamp compare on the single event loop, so the sweep never races an
+    in-flight ``acquire``. ``None`` (the default) disables auto-sweeping, leaving
+    eviction entirely to explicit ``evict_idle`` callers.
+    """
 
     time_source: object = field(default=time.monotonic)
+    sweep_interval: float | None = None
     _buckets: dict[str, _Bucket] = field(default_factory=dict)
+    _last_sweep: float = field(default=0.0)
 
     def _now(self) -> float:
         return float(self.time_source())  # type: ignore[operator]
@@ -111,6 +121,7 @@ class InMemoryRateLimiter:
         if cost <= 0:
             raise ValueError("cost must be positive")
         now = self._now()
+        self._maybe_sweep(now, limit)
         bucket = self._buckets.get(key)
         if bucket is None:
             bucket = _Bucket(tokens=limit.capacity, ts=now)
@@ -140,3 +151,15 @@ class InMemoryRateLimiter:
         for key in stale:
             del self._buckets[key]
         return len(stale)
+
+    def _maybe_sweep(self, now: float, limit: RateLimit) -> None:
+        """Run a time-gated opportunistic ``evict_idle`` if ``sweep_interval`` is set."""
+        if self.sweep_interval is None:
+            return
+        if self._last_sweep == 0.0:
+            # Arm the gate on first use; don't sweep an empty/cold map.
+            self._last_sweep = now
+            return
+        if now - self._last_sweep >= self.sweep_interval:
+            self._last_sweep = now
+            self.evict_idle(limit)

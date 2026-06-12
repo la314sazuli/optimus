@@ -94,9 +94,7 @@ COMMANDS: tuple[Command, ...] = (
             SubCommand(
                 name="import",
                 description="Import scam hashes from an attached JSON file.",
-                options=(
-                    Option("file", "A JSON export file.", OPT_ATTACHMENT, required=True),
-                ),
+                options=(Option("file", "A JSON export file.", OPT_ATTACHMENT, required=True),),
             ),
             SubCommand(name="export", description="Export this server's scam hashes as JSON."),
         ),

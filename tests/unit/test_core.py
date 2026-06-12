@@ -10,7 +10,7 @@ import pytest
 from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.circuit import CircuitBreaker, CircuitOpenError, CircuitState
 from optimus.core.idempotency import IdempotencyGuard, build_key
-from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit
+from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit, RedisRateLimiter
 
 # --- backoff -------------------------------------------------------------------
 
@@ -34,6 +34,37 @@ def test_backoff_validation() -> None:
         BackoffPolicy(base=0)
     with pytest.raises(ValueError):
         BackoffPolicy(multiplier=0.5)
+    with pytest.raises(ValueError, match="max_delay must be >= base"):
+        BackoffPolicy(base=1.0, max_delay=0.5)
+    with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+        BackoffPolicy(max_attempts=0)
+
+
+def test_backoff_ceiling_rejects_negative_attempt() -> None:
+    with pytest.raises(ValueError, match="attempt must be >= 0"):
+        BackoffPolicy().ceiling(-1)
+
+
+def test_backoff_delays_yields_one_per_attempt_within_bounds() -> None:
+    policy = BackoffPolicy(base=0.1, multiplier=2.0, max_delay=10.0, max_attempts=4)
+    rng = random.Random(7)
+    delays = list(policy.delays(rng))
+    assert len(delays) == 4
+    for attempt, d in enumerate(delays):
+        assert 0.0 <= d <= policy.ceiling(attempt)
+
+
+async def test_retry_async_does_not_retry_unlisted_exception() -> None:
+    attempts = {"n": 0}
+
+    async def raises_keyerror() -> None:
+        attempts["n"] += 1
+        raise KeyError("not retryable")
+
+    policy = BackoffPolicy(base=0.001, max_delay=0.001, max_attempts=5)
+    with pytest.raises(KeyError):
+        await retry_async(raises_keyerror, policy, retry_on=(ValueError,))
+    assert attempts["n"] == 1  # raised on first attempt, never retried
 
 
 async def test_retry_async_succeeds_after_failures() -> None:
@@ -92,6 +123,57 @@ def test_circuit_half_open_reopens_on_failure() -> None:
     assert cb.state is CircuitState.HALF_OPEN
     cb.record_failure()
     assert cb.state is CircuitState.OPEN
+
+
+def test_circuit_state_change_callback_observes_transitions() -> None:
+    clock = {"t": 0.0}
+    seen: list[tuple[CircuitState, CircuitState]] = []
+    cb = CircuitBreaker(
+        failure_threshold=1,
+        recovery_time=5.0,
+        time_source=lambda: clock["t"],
+        on_state_change=lambda prev, cur: seen.append((prev, cur)),
+    )
+    cb.record_failure()  # closed -> open
+    clock["t"] = 5.0
+    assert cb.state is CircuitState.HALF_OPEN  # open -> half_open on read
+    cb.record_success()  # half_open -> closed
+    assert seen == [
+        (CircuitState.CLOSED, CircuitState.OPEN),
+        (CircuitState.OPEN, CircuitState.HALF_OPEN),
+        (CircuitState.HALF_OPEN, CircuitState.CLOSED),
+    ]
+
+
+def test_circuit_state_change_callback_skips_noop_transitions() -> None:
+    seen: list[tuple[CircuitState, CircuitState]] = []
+    cb = CircuitBreaker(
+        failure_threshold=2,
+        on_state_change=lambda prev, cur: seen.append((prev, cur)),
+    )
+    cb.record_failure()  # still closed, below threshold
+    cb.record_success()  # still closed
+    assert seen == []
+
+
+def test_circuit_add_state_listener_is_idempotent() -> None:
+    seen: list[tuple[CircuitState, CircuitState]] = []
+
+    def listener(prev: CircuitState, cur: CircuitState) -> None:
+        seen.append((prev, cur))
+
+    cb = CircuitBreaker(failure_threshold=1, on_state_change=listener)
+    cb.add_state_listener(listener)  # already wired -> no double-fire
+    cb.record_failure()  # closed -> open
+    assert seen == [(CircuitState.CLOSED, CircuitState.OPEN)]
+
+
+def test_circuit_add_state_listener_attaches_to_bare_breaker() -> None:
+    seen: list[tuple[CircuitState, CircuitState]] = []
+    cb = CircuitBreaker(failure_threshold=1)
+    cb.add_state_listener(lambda prev, cur: seen.append((prev, cur)))
+    cb.record_failure()  # closed -> open
+    assert seen == [(CircuitState.CLOSED, CircuitState.OPEN)]
 
 
 async def test_circuit_call_fast_fails_when_open() -> None:
@@ -267,6 +349,85 @@ async def test_in_memory_rate_limit_evict_idle_bounds_memory() -> None:
     assert len(limiter._buckets) == 0
 
 
+async def test_in_memory_sweep_interval_triggers_eviction_on_use() -> None:
+    clock = {"t": 0.0}
+    limiter = InMemoryRateLimiter(time_source=lambda: clock["t"], sweep_interval=5.0)
+    limit = RateLimit(capacity=2, refill_rate=1.0)
+    # First acquire arms the gate (no sweep on a cold map).
+    for i in range(50):
+        assert await limiter.acquire(f"key-{i}", limit)
+    assert len(limiter._buckets) == 50
+    # Within the interval, no opportunistic sweep happens even after refill.
+    clock["t"] = 4.0
+    assert await limiter.acquire("trigger", limit)
+    assert len(limiter._buckets) == 51
+    # Once the interval elapses, the next acquire sweeps fully-refilled buckets.
+    clock["t"] = 12.0
+    assert await limiter.acquire("trigger", limit)
+    # Only the active "trigger" bucket (just spent a token) survives the sweep.
+    assert list(limiter._buckets) == ["trigger"]
+
+
+async def test_in_memory_sweep_disabled_by_default() -> None:
+    clock = {"t": 0.0}
+    limiter = InMemoryRateLimiter(time_source=lambda: clock["t"])
+    limit = RateLimit(capacity=2, refill_rate=1.0)
+    for i in range(10):
+        assert await limiter.acquire(f"key-{i}", limit)
+    clock["t"] = 1000.0
+    # No sweep_interval: the map is never swept opportunistically.
+    assert await limiter.acquire("another", limit)
+    assert len(limiter._buckets) == 11
+
+
+def test_rate_limit_rejects_nonpositive_config() -> None:
+    with pytest.raises(ValueError, match="capacity must be positive"):
+        RateLimit(capacity=0, refill_rate=1.0)
+    with pytest.raises(ValueError, match="refill_rate must be positive"):
+        RateLimit(capacity=1.0, refill_rate=0)
+
+
+class _ScriptedRedis:
+    """Stands in for Redis ``eval``: records each call and returns a queued result.
+
+    fakeredis does not implement Lua ``EVAL``, so the token-bucket script cannot
+    run against it. This fake instead lets a test assert the exact arguments the
+    limiter passes through and control the allow/deny result the script returns.
+    """
+
+    def __init__(self, results: list[int]) -> None:
+        self._results = results
+        self.calls: list[tuple[object, ...]] = []
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        self.calls.append((script, numkeys, *args))
+        return self._results.pop(0)
+
+
+async def test_redis_limiter_passes_script_args_and_coerces_result() -> None:
+    redis = _ScriptedRedis(results=[1, 0])
+    limiter = RedisRateLimiter(redis, prefix="optimus:test")
+    limit = RateLimit(capacity=4.0, refill_rate=2.0)
+
+    assert await limiter.acquire("guild:9", limit, cost=3.0) is True
+    assert await limiter.acquire("guild:9", limit) is False  # returns 0 -> denied
+
+    _script, numkeys, key, capacity, refill, cost, now = redis.calls[0]
+    assert numkeys == 1
+    assert key == "optimus:test:guild:9"  # prefix applied
+    assert (capacity, refill, cost) == (4.0, 2.0, 3.0)
+    assert isinstance(now, float)  # wall-clock timestamp passed as ARGV[4]
+    # Default cost is 1.0 on the second call.
+    assert redis.calls[1][5] == 1.0
+
+
+async def test_redis_rate_limit_rejects_nonpositive_cost() -> None:
+    limiter = RedisRateLimiter(_ScriptedRedis(results=[]))
+    limit = RateLimit(capacity=2.0, refill_rate=1.0)
+    with pytest.raises(ValueError, match="cost must be positive"):
+        await limiter.acquire("k", limit, cost=0)
+
+
 async def test_evict_idle_keeps_actively_throttled_buckets() -> None:
     clock = {"t": 0.0}
     limiter = InMemoryRateLimiter(time_source=lambda: clock["t"])
@@ -301,6 +462,11 @@ class _FakeRedis:
 
 def test_build_key_format() -> None:
     assert build_key(11, 22) == "optimus:idem:11:22"
+
+
+def test_idempotency_guard_rejects_nonpositive_ttl() -> None:
+    with pytest.raises(ValueError, match="ttl_seconds must be >= 1"):
+        IdempotencyGuard(_FakeRedis(), ttl_seconds=0)
 
 
 async def test_idempotency_guard_acquires_once() -> None:

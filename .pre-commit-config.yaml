@@ -1,12 +1,56 @@
+# Pre-commit hooks mirror the checks CI runs (.github/workflows/ci.yml):
+# ruff lint (check-only, no autofix), ruff format (check-only), mypy strict on
+# src, plus basic hygiene. Run on the whole tree with:
+# uvx pre-commit run --all-files
+#
+# The tree is `ruff format`-clean and CI enforces it via `ruff format --check`.
+# The format hook here runs check-only (no rewrite) so local == CI: a green
+# `pre-commit run --all-files` means a green CI lint+format+type stage. Keep
+# this in sync with CI.
+default_install_hook_types: [pre-commit]
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.10
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.18.4
     hooks:
       - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=600]
+
+  # Ruff and mypy run through the project's uv environment (local hooks) rather
+  # than pinned mirror repos. This guarantees the exact same tool versions and
+  # config the CI job uses (`uv run ruff check .` / `uv run mypy`), so a green
+  # `pre-commit run --all-files` means a green CI lint+type stage. A pinned
+  # ruff-pre-commit mirror would drift from the uv-resolved ruff and flag
+  # version-specific noqa differences that CI does not see.
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check (uv)
+        # No --fix: report, don't silently rewrite, so local == CI.
+        entry: uv run ruff check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format --check (uv)
+        # --check: report, don't silently rewrite, so local == CI.
+        entry: uv run ruff format --check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: mypy
+        name: mypy (strict, uv)
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true

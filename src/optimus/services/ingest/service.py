@@ -21,6 +21,7 @@ from optimus.core.ratelimit import (
     RateLimiter,
     RedisRateLimiter,
 )
+from optimus.core.readiness import nats_check, redis_check
 from optimus.ingest.fetcher import FetchedImage, fetch_image
 from optimus.services.ingest.worker import IngestWorker, RateLimitedError
 
@@ -43,7 +44,9 @@ def build_worker(settings: Settings, redis: object | None) -> IngestWorker:
     limiter: RateLimiter = (
         RedisRateLimiter(redis, prefix=settings.ratelimit_redis_prefix)
         if redis is not None
-        else InMemoryRateLimiter()
+        # Degraded (no-Redis) fallback: opportunistically sweep idle guild
+        # buckets so the process-local map cannot grow without bound.
+        else InMemoryRateLimiter(sweep_interval=settings.ingest_inmemory_sweep_seconds)
     )
     rate = RateLimit(
         capacity=settings.ingest_fetch_rate_capacity,
@@ -72,6 +75,9 @@ async def _amain() -> None:
     worker = build_worker(settings, redis)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
+    health.add_readiness_check(nats_check(nc), name="nats")
+    if redis is not None:
+        health.add_readiness_check(redis_check(redis), name="redis")
     await health.start()
 
     stop = asyncio.Event()

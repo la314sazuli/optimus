@@ -21,6 +21,8 @@ from optimus.ingest.ssrf import PinnedTarget, SSRFError
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 GIF_BYTES = b"GIF89a" + b"\x00" * 32
+JPEG_BYTES = b"\xff\xd8\xff" + b"\x00" * 64
+BMP_BYTES = b"BM" + b"\x00" * 64
 NOT_IMAGE = b"<html>nope</html>" + b"\x00" * 32
 
 
@@ -49,8 +51,12 @@ async def _serve(app: web.Application) -> AsyncIterator[str]:
 def test_sniff_content_type() -> None:
     assert sniff_content_type(PNG_BYTES) == "image/png"
     assert sniff_content_type(GIF_BYTES) == "image/gif"
+    assert sniff_content_type(JPEG_BYTES) == "image/jpeg"
+    assert sniff_content_type(BMP_BYTES) == "image/bmp"
+    assert sniff_content_type(b"GIF87a" + b"\x00" * 32) == "image/gif"
     assert sniff_content_type(b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 8) == "image/webp"
     assert sniff_content_type(NOT_IMAGE) is None
+    assert sniff_content_type(b"short") is None  # too few bytes for any signature
 
 
 async def test_fetch_ok() -> None:
@@ -204,6 +210,38 @@ async def test_fetch_too_many_redirects() -> None:
     try:
         with pytest.raises(FetchError, match="redirect"):
             await fetch_image(f"{base}/loop", max_bytes=1_000_000, max_redirects=2)
+    finally:
+        with pytest.raises(StopAsyncIteration):
+            await anext(gen)
+
+
+async def test_fetch_redirect_without_location_header_errors() -> None:
+    async def no_location(_req: web.Request) -> web.Response:
+        return web.Response(status=302)  # redirect status, no Location
+
+    app = web.Application()
+    app.router.add_get("/start", no_location)
+    gen = _serve(app)
+    base = await anext(gen)
+    try:
+        with pytest.raises(FetchError, match="Location"):
+            await fetch_image(f"{base}/start", max_bytes=1_000_000)
+    finally:
+        with pytest.raises(StopAsyncIteration):
+            await anext(gen)
+
+
+async def test_fetch_unexpected_status_errors() -> None:
+    async def not_found(_req: web.Request) -> web.Response:
+        return web.Response(status=404, body=b"nope")
+
+    app = web.Application()
+    app.router.add_get("/missing", not_found)
+    gen = _serve(app)
+    base = await anext(gen)
+    try:
+        with pytest.raises(FetchError, match="unexpected status 404"):
+            await fetch_image(f"{base}/missing", max_bytes=1_000_000)
     finally:
         with pytest.raises(StopAsyncIteration):
             await anext(gen)

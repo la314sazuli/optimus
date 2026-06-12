@@ -1,0 +1,131 @@
+# Self-host stack for optimus: the six bot services plus their backing stores
+# (PostgreSQL, Redis, NATS/JetStream). Configuration comes from a local `.env`
+# (copy `.env.example`); at minimum set OPTIMUS_DISCORD_TOKEN before `up`.
+#
+#   cp .env.example .env   # then edit OPTIMUS_DISCORD_TOKEN
+#   docker compose up --build
+#
+# The `migrate` service applies Alembic migrations once and exits; every bot
+# service waits for it to finish and for the datastores to report healthy.
+
+x-optimus-image: &optimus-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: optimus:local
+
+x-optimus-env: &optimus-env
+  # In-cluster datastore URLs override the localhost defaults from .env.example.
+  OPTIMUS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-optimus}:${POSTGRES_PASSWORD:-optimus}@postgres:5432/${POSTGRES_DB:-optimus}
+  OPTIMUS_REDIS_URL: redis://redis:6379/0
+  OPTIMUS_NATS_URL: nats://nats:4222
+
+x-optimus-service: &optimus-service
+  <<: *optimus-image
+  restart: unless-stopped
+  env_file: .env
+  environment: *optimus-env
+  # /readyz turns 200 only once NATS/Redis/Postgres dependencies answer.
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+    interval: 15s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    nats:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  # ---- Backing stores ------------------------------------------------------
+  postgres:
+    image: postgres:16.4-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-optimus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-optimus}
+      POSTGRES_DB: ${POSTGRES_DB:-optimus}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-optimus} -d ${POSTGRES_DB:-optimus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-bookworm
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    # JetStream is required (bounded streams + pull consumers); -m exposes the
+    # monitoring port used by the healthcheck.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # The monitoring /healthz endpoint reports JetStream readiness too.
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---- One-shot schema migration ------------------------------------------
+  migrate:
+    <<: *optimus-image
+    restart: "no"
+    env_file: .env
+    environment: *optimus-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---- optimus services ----------------------------------------------------
+  gateway:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.gateway"]
+
+  ingest:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.ingest"]
+
+  detection:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.detection"]
+
+  moderation:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.moderation"]
+
+  interactions:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.interactions"]
+
+  scheduler:
+    <<: *optimus-service
+    command: ["python", "-m", "optimus.services.scheduler"]
+
+volumes:
+  postgres-data:
+  redis-data:
+  nats-data:

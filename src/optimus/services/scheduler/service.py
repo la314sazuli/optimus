@@ -26,6 +26,7 @@ from optimus.contracts.events import SUBJECT_INDEX_INVALIDATE, IndexInvalidateEv
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
+from optimus.core.readiness import nats_check
 from optimus.db.engine import (
     SessionScope,
     create_engine,
@@ -142,32 +143,47 @@ class SchedulerService:
         return [
             asyncio.create_task(
                 run_periodic(
-                    "retention", s.scheduler_retention_interval, self._retention,
-                    stop=self._stop, jitter_fraction=jf,
+                    "retention",
+                    s.scheduler_retention_interval,
+                    self._retention,
+                    stop=self._stop,
+                    jitter_fraction=jf,
                 )
             ),
             asyncio.create_task(
                 run_periodic(
-                    "evidence", s.scheduler_evidence_interval, self._evidence,
-                    stop=self._stop, jitter_fraction=jf,
+                    "evidence",
+                    s.scheduler_evidence_interval,
+                    self._evidence,
+                    stop=self._stop,
+                    jitter_fraction=jf,
                 )
             ),
             asyncio.create_task(
                 run_periodic(
-                    "rollups", s.scheduler_rollup_interval, self._rollups,
-                    stop=self._stop, jitter_fraction=jf,
+                    "rollups",
+                    s.scheduler_rollup_interval,
+                    self._rollups,
+                    stop=self._stop,
+                    jitter_fraction=jf,
                 )
             ),
             asyncio.create_task(
                 run_periodic(
-                    "index_rebuild", s.scheduler_index_rebuild_interval, self._index_rebuild,
-                    stop=self._stop, jitter_fraction=jf,
+                    "index_rebuild",
+                    s.scheduler_index_rebuild_interval,
+                    self._index_rebuild,
+                    stop=self._stop,
+                    jitter_fraction=jf,
                 )
             ),
             asyncio.create_task(
                 run_periodic(
-                    "health_sweep", s.scheduler_health_interval, self._health_sweep,
-                    stop=self._stop, jitter_fraction=jf,
+                    "health_sweep",
+                    s.scheduler_health_interval,
+                    self._health_sweep,
+                    stop=self._stop,
+                    jitter_fraction=jf,
                 )
             ),
         ]
@@ -204,6 +220,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     service = SchedulerService(settings, bus, scope, delete_object=delete_object)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
+    health.add_readiness_check(nats_check(nc), name="nats")
     await health.start()
 
     handles = service.start()

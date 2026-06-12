@@ -9,6 +9,7 @@ positive verdict one confidence band and produce a ``swarm_alert``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -111,11 +112,14 @@ class DetectionWorker:
             return None
 
         data = base64.b64decode(event.data_b64)
-        image = decode(data, self._limits)
-        if image is None:
+        # Decode (subprocess wall-wait) and perceptual hashing (numpy/Python,
+        # up to max_frames frames) are both blocking and CPU/IO-bound. Run them
+        # off the event loop so the NATS consumer loop and health server stay
+        # responsive while one image is processed.
+        frames = await asyncio.to_thread(self._decode_and_hash, data)
+        if frames is None:
             return DetectionResult(verdict=self._verdict(event, _non_decision()))
 
-        frames = all_frame_hashes(image)
         guild_idx = await self._guild_index(event.guild_id)
         global_idx = await self._global_index()
         whitelist = await self._whitelist(event.guild_id)
@@ -152,6 +156,13 @@ class DetectionWorker:
         verdict_event = self._verdict(event, outcome, hashes=primary)
         VERDICTS_EMITTED.labels(verdict=verdict_event.verdict.value).inc()
         return DetectionResult(verdict=verdict_event, swarm_alert=swarm_alert)
+
+    def _decode_and_hash(self, data: bytes) -> list[dict[str, int]] | None:
+        """Decode image bytes and hash every sampled frame (blocking; off-loop)."""
+        image = decode(data, self._limits)
+        if image is None:
+            return None
+        return all_frame_hashes(image)
 
     def _best_frame_outcome(
         self,

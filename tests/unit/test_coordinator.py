@@ -160,9 +160,12 @@ async def test_boundary_refusal_downgrades_to_report() -> None:
     audits: list[tuple[str, bool]] = []
     # Target is the guild owner -> punitive action refused.
     coord = _build(
-        rest=rest, redis=redis, cfg=_cfg(),
+        rest=rest,
+        redis=redis,
+        cfg=_cfg(),
         target=_target(user_id=42, guild_owner_id=42),
-        reports=reports, audits=audits,
+        reports=reports,
+        audits=audits,
     )
     result = await coord.handle_verdict(_event())
     assert result.action is Action.REPORT_ONLY
@@ -175,9 +178,7 @@ async def test_missing_member_downgrades_to_report() -> None:
     rest = _FakeRest()
     reports: list[ReportData] = []
     audits: list[tuple[str, bool]] = []
-    coord = _build(
-        rest=rest, redis=redis, cfg=_cfg(), target=None, reports=reports, audits=audits
-    )
+    coord = _build(rest=rest, redis=redis, cfg=_cfg(), target=None, reports=reports, audits=audits)
     result = await coord.handle_verdict(_event())
     assert result.action is Action.REPORT_ONLY
 
@@ -203,8 +204,12 @@ async def test_safe_mode_blocks_auto_act() -> None:
     reports: list[ReportData] = []
     audits: list[tuple[str, bool]] = []
     coord = _build(
-        rest=rest, redis=redis, cfg=_cfg(safe_mode=True),
-        target=_target(), reports=reports, audits=audits,
+        rest=rest,
+        redis=redis,
+        cfg=_cfg(safe_mode=True),
+        target=_target(),
+        reports=reports,
+        audits=audits,
     )
     result = await coord.handle_verdict(_event())
     assert result.action is Action.REPORT_ONLY
