@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import aiohttp
 
 from optimus.core.config import Sensitivity, Settings, Tenancy
@@ -65,6 +68,26 @@ async def test_readyz_returns_503_when_check_raises() -> None:
             http.get("http://127.0.0.1:8138/readyz") as resp,
         ):
             assert resp.status == 503
+    finally:
+        await server.stop()
+
+
+async def test_readyz_returns_503_when_check_hangs() -> None:
+    server = HealthServer(host="127.0.0.1", port=8139, check_timeout=0.2)
+
+    async def _hang() -> bool:
+        await asyncio.sleep(60)
+        return True
+
+    server.add_readiness_check(_hang, name="blackholed")
+    await server.start()
+    try:
+        async with aiohttp.ClientSession() as http:
+            started = time.monotonic()
+            async with http.get("http://127.0.0.1:8139/readyz") as resp:
+                assert resp.status == 503
+            elapsed = time.monotonic() - started
+            assert elapsed < 5.0, f"probe hung for {elapsed:.1f}s instead of failing closed"
     finally:
         await server.stop()
 

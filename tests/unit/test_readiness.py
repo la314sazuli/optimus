@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from optimus.core.readiness import nats_check, redis_check
+from contextlib import asynccontextmanager
+from typing import Any
+
+from optimus.core.readiness import db_check, nats_check, redis_check
 
 
 class _FakeRedis:
@@ -51,3 +54,42 @@ async def test_nats_check_reflects_connection_state() -> None:
 
 async def test_nats_check_not_ready_when_attribute_absent() -> None:
     assert await nats_check(object())() is False
+
+
+class _FakeSession:
+    def __init__(self, *, fail: bool = False) -> None:
+        self._fail = fail
+        self.executed: list[str] = []
+
+    async def execute(self, statement: Any) -> Any:
+        self.executed.append(str(statement))
+        if self._fail:
+            raise ConnectionError("db down")
+        return None
+
+
+def _scope_factory(session: _FakeSession, *, acquire_fails: bool = False):  # type: ignore[no-untyped-def]
+    @asynccontextmanager
+    async def scope():  # type: ignore[no-untyped-def]
+        if acquire_fails:
+            raise ConnectionError("cannot connect")
+        yield session
+
+    return scope
+
+
+async def test_db_check_ready_when_select_succeeds() -> None:
+    session = _FakeSession()
+    check = db_check(_scope_factory(session))
+    assert await check() is True
+    assert session.executed == ["SELECT 1"]
+
+
+async def test_db_check_not_ready_when_execute_raises() -> None:
+    check = db_check(_scope_factory(_FakeSession(fail=True)))
+    assert await check() is False
+
+
+async def test_db_check_not_ready_when_scope_unavailable() -> None:
+    check = db_check(_scope_factory(_FakeSession(), acquire_fails=True))
+    assert await check() is False

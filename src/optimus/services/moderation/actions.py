@@ -127,8 +127,14 @@ class ActionExecutor:
         self._rate = rate
         self._acquire = idempotency_acquire
         self._dm_cooldown = dm_cooldown
-        self._breaker = breaker or CircuitBreaker(on_state_change=_observe_circuit_transition)
+        self._breaker = breaker or CircuitBreaker()
+        # Attach metrics/logging to whichever breaker is used, including a
+        # caller-injected one; add_state_listener is idempotent so this never
+        # double-fires if the breaker was already wired with the observer.
+        self._breaker.add_state_listener(_observe_circuit_transition)
         self._backoff = backoff or BackoffPolicy(max_attempts=3)
+        # CIRCUIT_STATE is a process-global gauge; this assumes one executor per
+        # process (the standard single-service-per-process deployment).
         CIRCUIT_STATE.set(_CIRCUIT_STATE_CODE[self._breaker.state])
 
     async def execute(self, req: ActionRequest) -> ActionResult:

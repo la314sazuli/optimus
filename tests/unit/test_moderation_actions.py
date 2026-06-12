@@ -150,6 +150,23 @@ async def test_open_circuit_fails_fast() -> None:
     assert second.detail == "circuit_open"
 
 
+async def test_injected_breaker_emits_transition_metrics() -> None:
+    # A caller-supplied breaker must still drive the circuit-state metric, not
+    # only the executor's default breaker.
+    from optimus.services.moderation.actions import CIRCUIT_TRANSITIONS
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest(fail_times=100)
+    breaker = CircuitBreaker(failure_threshold=1, recovery_time=999.0)
+    before = CIRCUIT_TRANSITIONS.labels(from_state="closed", to_state="open")._value.get()
+
+    ex = _executor(rest, redis=redis, breaker=breaker)
+    await ex.execute(_req(key="trip"))  # one failure trips closed -> open
+
+    after = CIRCUIT_TRANSITIONS.labels(from_state="closed", to_state="open")._value.get()
+    assert after == before + 1
+
+
 async def test_dm_cooldown_suppresses_second_warning() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()

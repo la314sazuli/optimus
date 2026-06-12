@@ -125,6 +125,26 @@ def test_circuit_state_change_callback_skips_noop_transitions() -> None:
     assert seen == []
 
 
+def test_circuit_add_state_listener_is_idempotent() -> None:
+    seen: list[tuple[CircuitState, CircuitState]] = []
+
+    def listener(prev: CircuitState, cur: CircuitState) -> None:
+        seen.append((prev, cur))
+
+    cb = CircuitBreaker(failure_threshold=1, on_state_change=listener)
+    cb.add_state_listener(listener)  # already wired -> no double-fire
+    cb.record_failure()  # closed -> open
+    assert seen == [(CircuitState.CLOSED, CircuitState.OPEN)]
+
+
+def test_circuit_add_state_listener_attaches_to_bare_breaker() -> None:
+    seen: list[tuple[CircuitState, CircuitState]] = []
+    cb = CircuitBreaker(failure_threshold=1)
+    cb.add_state_listener(lambda prev, cur: seen.append((prev, cur)))
+    cb.record_failure()  # closed -> open
+    assert seen == [(CircuitState.CLOSED, CircuitState.OPEN)]
+
+
 async def test_circuit_call_fast_fails_when_open() -> None:
     cb = CircuitBreaker(failure_threshold=1, recovery_time=100.0)
     cb.record_failure()

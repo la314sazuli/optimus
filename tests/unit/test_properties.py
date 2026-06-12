@@ -61,7 +61,7 @@ def test_rate_limiter_allow_deny_consistency(capacity: float, rate: float, cost:
     clock = {"t": 0.0}
     limiter = InMemoryRateLimiter(time_source=lambda: clock["t"])
     limit = RateLimit(capacity=capacity, refill_rate=rate)
-    asyncio.run(limiter.acquire("k", limit))  # bucket starts full
+    asyncio.run(limiter.acquire("k", limit))  # materialise the bucket (consumes default cost=1.0)
     before = limiter._buckets["k"].tokens
 
     allowed = asyncio.run(limiter.acquire("k", limit, cost=cost))

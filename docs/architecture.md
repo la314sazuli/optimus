@@ -135,8 +135,10 @@ flowchart LR
 
 Each service runs an aiohttp [`HealthServer`](../src/optimus/core/health.py) on
 `OPTIMUS_HEALTH_PORT` exposing `/healthz` (liveness), `/readyz` (readiness — runs
-registered async checks against the service's NATS and Redis dependencies and
-returns 503 while any is unreachable, see
+registered async checks against the service's NATS, Redis, and (for the
+DB-centric interactions service) Postgres dependencies and returns 503 while any
+is unreachable; each check is bounded by a per-check timeout so a black-holed
+dependency fails closed rather than hanging the probe, see
 [`core/readiness.py`](../src/optimus/core/readiness.py)), and `/metrics`
 (Prometheus).
 

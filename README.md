@@ -80,8 +80,9 @@ uv run python -m optimus.services.scheduler
 
 Each service exposes a health endpoint (`/healthz`, `/readyz`) on
 `OPTIMUS_HEALTH_PORT` and Prometheus metrics for observability. Readiness
-probes the service's NATS and Redis dependencies, so `/readyz` returns 503
-while a backing store is unreachable.
+probes the service's NATS, Redis, and (for interactions) Postgres dependencies,
+so `/readyz` returns 503 while a backing store is unreachable; each probe is
+bounded by a timeout so a black-holed dependency fails closed.
 
 ## Configuration
 

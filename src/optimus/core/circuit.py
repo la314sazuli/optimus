@@ -49,21 +49,35 @@ class CircuitBreaker:
         self._recovery_time = recovery_time
         self._success_threshold = success_threshold
         self._now = time_source
-        self._on_state_change = on_state_change
+        self._listeners: list[Callable[[CircuitState, CircuitState], None]] = []
+        if on_state_change is not None:
+            self._listeners.append(on_state_change)
         self._state = CircuitState.CLOSED
         self._failures = 0
         self._successes = 0
         self._opened_at = 0.0
         self._trials_in_flight = 0
 
+    def add_state_listener(
+        self, listener: Callable[[CircuitState, CircuitState], None]
+    ) -> None:
+        """Register ``listener`` to fire on every real state transition.
+
+        Idempotent: re-registering an already-attached listener is a no-op, so a
+        caller can attach a shared observer to an injected breaker without risking
+        a double-fire if the breaker was already wired with it.
+        """
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
     def _set_state(self, new_state: CircuitState) -> None:
-        """Transition to ``new_state``, notifying the observer on real changes."""
+        """Transition to ``new_state``, notifying listeners on real changes."""
         previous = self._state
         if previous is new_state:
             return
         self._state = new_state
-        if self._on_state_change is not None:
-            self._on_state_change(previous, new_state)
+        for listener in self._listeners:
+            listener(previous, new_state)
 
     @property
     def state(self) -> CircuitState:
