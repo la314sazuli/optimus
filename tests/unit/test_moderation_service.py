@@ -50,9 +50,11 @@ async def scope() -> AsyncIterator[SessionScope]:
 class _FakeBus:
     def __init__(self) -> None:
         self.published: list[tuple[str, object]] = []
+        self.msg_ids: list[str | None] = []
 
-    async def publish(self, subject: str, event: object) -> None:
+    async def publish(self, subject: str, event: object, *, msg_id: str | None = None) -> None:
         self.published.append((subject, event))
+        self.msg_ids.append(msg_id)
 
 
 class _FakeCoordinator:

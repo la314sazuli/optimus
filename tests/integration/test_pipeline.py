@@ -20,6 +20,7 @@ token-bucket semantics under test are identical.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import fakeredis.aioredis
 import pytest_asyncio
@@ -625,6 +626,121 @@ async def test_rate_limited_action_fails_without_discord_call(
     assert second.detail == "rate_limited"
     # The starved action makes no Discord call at all.
     assert len(rest.calls) == calls_after_first
+
+
+# --- idempotency under JetStream redelivery ---------------------------------
+
+
+async def test_redelivered_image_does_not_double_act(
+    db_session: _Session, redis: fakeredis.aioredis.FakeRedis
+) -> None:
+    # A redelivered image_fetched (same idempotency key, e.g. detection acked
+    # slowly past ack_wait) must be a full no-op: one verdict, one ban, one
+    # detection row, one audit row — no second Discord enforcement.
+    scam = make_scam_png()
+    await _seed_guild(db_session, action_policy="delete_ban")
+    await _register_scam_hash(db_session, scam)
+
+    rest = RecordingRest()
+    bus = await _wire_pipeline(db_session, redis, rest=rest)
+
+    event = image_fetched_event(
+        scam, guild_id=GUILD_ID, uploader_id=SCAM_UPLOADER, idempotency_key="redeliver-1"
+    )
+    # First delivery drives the whole pipeline.
+    await bus.publish(SUBJECT_IMAGE_FETCHED, event)
+    bans_after_first = [c for c in rest.calls if c[0] == "ban_member"]
+    assert len(bans_after_first) == 1
+
+    # JetStream redelivers the identical message.
+    await bus.publish(SUBJECT_IMAGE_FETCHED, event)
+
+    # The detection worker's idempotency guard short-circuits the redelivery, so
+    # no second verdict is emitted and no second action is applied.
+    assert len(bus.events(SUBJECT_VERDICT)) == 1
+    assert len([c for c in rest.calls if c[0] == "ban_member"]) == 1
+    assert len(bus.events(SUBJECT_ACTION_RESULT)) == 1
+
+    # Exactly one detection row and one audit row persisted.
+    recents = await DetectionRepository(db_session, GUILD_ID).list_recent()
+    assert len([d for d in recents if d.idempotency_key == "redeliver-1"]) == 1
+    audits = await ModActionRepository(db_session, GUILD_ID).list_recent()
+    assert sum(1 for a in audits if a.action == "delete_ban") == 1
+
+
+async def test_redelivered_verdict_dedups_on_msg_id(
+    db_session: _Session, redis: fakeredis.aioredis.FakeRedis
+) -> None:
+    # Defense in depth: even if a verdict were published twice with the same
+    # Nats-Msg-Id (the detection idempotency key), JetStream publish-dedup (the
+    # InMemoryBus mirrors it) collapses it so moderation only ever sees it once.
+    scam = make_scam_png()
+    await _seed_guild(db_session, action_policy="delete_ban")
+    await _register_scam_hash(db_session, scam)
+
+    rest = RecordingRest()
+    bus = await _wire_pipeline(db_session, redis, rest=rest)
+
+    verdict = VerdictEvent(
+        correlation_id="c",
+        occurred_at=datetime.now(UTC),
+        guild_id=GUILD_ID,
+        channel_id=222,
+        message_id=555,
+        attachment_id=444,
+        uploader_id=SCAM_UPLOADER,
+        idempotency_key="verdict-dedup-1",
+        verdict=Verdict.SCAM,
+        confidence=1.0,
+    )
+    await bus.publish(SUBJECT_VERDICT, verdict, msg_id=verdict.idempotency_key)
+    await bus.publish(SUBJECT_VERDICT, verdict, msg_id=verdict.idempotency_key)
+
+    # The duplicate publish was dropped by msg-id dedup: moderation ran once.
+    assert len(bus.events(SUBJECT_VERDICT)) == 1
+    assert len([c for c in rest.calls if c[0] == "ban_member"]) == 1
+
+
+async def test_persist_swallows_unique_race(
+    db_session: _Session, redis: fakeredis.aioredis.FakeRedis, monkeypatch
+) -> None:
+    # Two replicas can both pass the read-check then race to INSERT the same
+    # idempotency key; the loser hits the unique constraint. _persist must treat
+    # that IntegrityError as a benign no-op (the constraint is the authority),
+    # not crash the consumer (which would nak -> redeliver -> loop).
+    from optimus.db.repositories import DetectionRepository as _Repo
+    from optimus.services.detection.service import DetectionResult
+
+    await _seed_guild(db_session, action_policy="report_only")
+    bus = await _wire_pipeline(db_session, redis, rest=RecordingRest())
+    service = _build_detection_service(bus, db_session, redis)
+
+    verdict = VerdictEvent(
+        correlation_id="c",
+        occurred_at=datetime.now(UTC),
+        guild_id=GUILD_ID,
+        channel_id=2,
+        message_id=3,
+        attachment_id=4,
+        uploader_id=5,
+        idempotency_key="race-1",
+        verdict=Verdict.SCAM,
+        confidence=1.0,
+    )
+    # First persist writes the row.
+    await service._persist(DetectionResult(verdict=verdict))
+
+    # Force the read-check to miss so the second persist attempts a duplicate
+    # INSERT and exercises the IntegrityError branch.
+    monkeypatch.setattr(_Repo, "get_by_idempotency_key", lambda self, key: _none())
+    await service._persist(DetectionResult(verdict=verdict))  # must not raise
+
+    rows = await DetectionRepository(db_session, GUILD_ID).list_recent()
+    assert len([d for d in rows if d.idempotency_key == "race-1"]) == 1
+
+
+async def _none() -> None:
+    return None
 
 
 class _FakeClock:

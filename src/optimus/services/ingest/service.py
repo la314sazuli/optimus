@@ -35,7 +35,7 @@ async def _handle(worker: IngestWorker, bus: EventBus, event: MessageImageEvent)
         # Re-raise so the bus naks and redelivers later under back-pressure.
         raise
     if fetched is not None:
-        await bus.publish(SUBJECT_IMAGE_FETCHED, fetched)
+        await bus.publish(SUBJECT_IMAGE_FETCHED, fetched, msg_id=fetched.idempotency_key)
 
 
 def build_worker(settings: Settings, redis: object | None) -> IngestWorker:

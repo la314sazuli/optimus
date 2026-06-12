@@ -150,6 +150,26 @@ class Settings(BaseSettings):
     #: evicted and rebuilt on demand. Sized for very large fleets.
     detection_guild_index_cap: int = Field(default=1024, ge=1)
 
+    # Bus back-pressure / redelivery
+    #: Max messages a single detection replica processes concurrently. Also set
+    #: as the JetStream consumer's ``max_ack_pending`` so the server stops
+    #: handing out more until acks catch up; under an image flood the surplus
+    #: buffers in JetStream rather than ballooning replica memory. Default 10 is
+    #: informed by the load harness: a 2 vCPU replica saturates near ~10 img/s,
+    #: so deeper in-flight only adds latency and redelivery risk, not throughput.
+    detection_max_inflight: int = Field(default=10, ge=1)
+    #: Pull-fetch batch size for the detection consumer (clamped to the spare
+    #: in-flight budget each loop).
+    detection_fetch_batch: int = Field(default=16, ge=1)
+    #: Seconds JetStream waits for an ack before redelivering. Must exceed the
+    #: slowest expected handler (decode + hash of ``max_frames``) so slow
+    #: processing buffers instead of triggering a spurious redelivery storm.
+    detection_ack_wait_seconds: float = Field(default=60.0, gt=0.0)
+    #: Max delivery attempts before JetStream gives up on a message.
+    detection_max_deliver: int = Field(default=5, ge=1)
+    #: JetStream publish-dedup window (seconds) applied to the events stream.
+    bus_duplicate_window_seconds: float = Field(default=2 * 60 * 60, gt=0.0)
+
     # Rate limiting
     #: Limiter backend. ``memory`` (default) is per-process and correct for a
     #: single replica; ``redis`` shares one bucket across replicas so effective

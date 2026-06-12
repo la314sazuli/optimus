@@ -138,6 +138,68 @@ latency for nothing.
   the error is re-raised (`test_redis_limiter_reraises_when_no_fallback`), so the
   policy is always explicit at the call site.
 
+### Idempotency & back-pressure under JetStream redelivery (`scale/idempotency-backpressure`)
+- **Location:** `src/optimus/bus/nats.py` (`EventBus.publish`, `EventBus.consume`,
+  `ensure_stream`); `src/optimus/services/detection/service.py` (`_persist`,
+  consumer wiring); `src/optimus/services/{ingest,moderation}/service.py` (publish
+  msg-ids, consumer wiring); `src/optimus/core/config.py` (bus settings).
+- **Problem (raid / image-flood on a huge server):** JetStream is at-least-once.
+  If a detection replica acks slowly (CPU-bound decode under a flood) past
+  `ack_wait`, or naks on a transient error, the same `image_fetched` message is
+  **redelivered**. Two failure modes follow: (1) the redelivery could re-run the
+  pipeline and double-act (a second ban, a duplicate detection row, a duplicate
+  `verdict`/`action_result` on the stream); (2) the consumer fetched a fixed
+  batch and processed it with no explicit in-flight ceiling, and `ack_wait` was
+  hardcoded at 30s — under a flood, queued messages in a batch could exceed
+  `ack_wait` and trigger a **spurious redelivery storm**, compounding load.
+
+- **Idempotency — three layers, so redelivery is a no-op:**
+  1. *Consumer-side guard (primary).* `DetectionWorker.handle` already claims a
+     Redis `SET NX` on the deterministic `idempotency_key`
+     (`optimus:idem:{message_id}:{attachment_id}`) before doing any work; a
+     redelivered image finds the key claimed and returns `None`, so **no second
+     verdict is emitted and no second action runs**. The moderation
+     `ActionExecutor` has its own independent `SET NX` keyed per
+     `(idempotency_key, action)` as a backstop on the action path.
+  2. *Publisher dedup (defense in depth).* `EventBus.publish` now accepts a
+     `msg_id` sent as the JetStream `Nats-Msg-Id` header; `ensure_stream` sets a
+     `duplicate_window` (default 2h) so a republish of the same id is collapsed
+     **server-side** before it reaches any consumer. Wired on the three events
+     that carry a business key: `image_fetched` (ingest), `verdict` (detection),
+     `action_result` (moderation). The id is namespaced by subject so the same
+     key on two subjects never cross-dedups.
+  3. *DB unique constraint (authority).* `detections.idempotency_key` is `UNIQUE`.
+     `DetectionService._persist` does a read-check first, but two replicas can
+     race past it; the loser's INSERT now runs inside a **savepoint**
+     (`begin_nested`) and a raised `IntegrityError` is swallowed as a no-op. The
+     savepoint scopes the rollback to just the failed row, so the surrounding
+     transaction (and the row the winner committed) is untouched — and critically
+     the consumer does **not** nak a message whose row already exists (which would
+     redeliver forever).
+
+- **Back-pressure — bounded in-flight, JetStream buffers the surplus:**
+  `EventBus.consume` takes a `max_inflight` (settings-driven
+  `detection_max_inflight`, default **10**, informed by the load-harness ceiling
+  above: a 2 vCPU replica saturates near ~10 img/s, so deeper in-flight only adds
+  latency and redelivery risk, not throughput). It is enforced two ways: an
+  `asyncio.Semaphore` caps concurrently-processing handlers per replica, and the
+  same value is set as the consumer's `max_ack_pending` so the **server** stops
+  delivering once a replica holds that many unacked. The pull `fetch` is clamped
+  to the spare in-flight budget each loop, so a slow replica leaves messages
+  **buffered in JetStream rather than ballooning its own memory**. `ack_wait` is
+  now configurable (`detection_ack_wait_seconds`, default **60s** — comfortably
+  above the worst-case decode+hash of `max_frames` frames) so slow processing
+  buffers instead of tripping redelivery; `max_deliver` is configurable too.
+  `optimus_bus_messages_inflight` (gauge) makes the live in-flight depth
+  observable per subject.
+
+- **Tested by:** `tests/unit/test_bus.py` (msg-id header wiring + namespacing,
+  ack/nak/term dispatch, `max_inflight` bounds concurrent handlers under a 50-msg
+  burst, `max_ack_pending`/`ack_wait` reach the consumer config) and
+  `tests/integration/test_pipeline.py`
+  (`test_redelivered_image_does_not_double_act`,
+  `test_redelivered_verdict_dedups_on_msg_id`, `test_persist_swallows_unique_race`).
+
 ## Documented (real, deferred — too invasive for a single-fix pass)
 
 ### Unused `_use_embedding` flag on the detection worker
