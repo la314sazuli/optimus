@@ -52,16 +52,19 @@ OPTIMUS_DISCORD_TOKEN=your-token-here uvx optimus
 ```bash
 docker build -t optimus .
 docker run --rm -e OPTIMUS_DISCORD_TOKEN=your-token-here \
-  -v optimus-data:/app optimus
+  -v optimus-data:/data optimus
 ```
 
 The image defaults to simple mode, so a single `docker run` is the whole bot.
-The volume keeps the SQLite database (registered scam hashes, per-server config)
-across restarts; drop it for an ephemeral run.
+The `optimus-data` volume is mounted at `/data`, where the image keeps the SQLite
+database (registered scam hashes, per-server config) across restarts; drop the
+`-v` flag for an ephemeral run.
 
 On startup you'll see a line like `optimus_online bot=YourBot#1234` once it has
-connected and registered its slash commands. If the token is missing or
-malformed, Optimus prints a single clear line telling you exactly what to fix.
+connected and registered its slash commands. If anything is wrong before that —
+a missing or malformed token, a token Discord rejects, an unwritable database
+path — Optimus prints a single clear line telling you exactly what to fix,
+instead of a traceback.
 
 ### 3. Teach it which images are scams
 

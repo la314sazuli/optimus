@@ -263,11 +263,33 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
 
     import hikari
 
+    from optimus.app.startup import StartupError
+
     rest_app = hikari.RESTApp()
     await rest_app.start()
     rest = rest_app.acquire(settings.discord_token, token_type=hikari.TokenType.BOT)
     rest.start()
-    me = await rest.fetch_my_user()
+    # First network use of the token. A rejected token surfaces here as a hikari
+    # 401; translate it (and a connectivity failure) into the same one-line
+    # StartupError the local checks raise, so the first thing a new user sees is
+    # "Discord rejected the token", not a traceback. Tear down what we opened
+    # before re-raising, since we have not yet reached the run try/finally.
+    try:
+        me = await rest.fetch_my_user()
+    except hikari.UnauthorizedError as exc:
+        await _close_rest(rest, rest_app)
+        raise StartupError(
+            "Discord rejected the token (401 Unauthorized). Check that "
+            "OPTIMUS_DISCORD_TOKEN is the bot token from the Developer Portal's "
+            "Bot tab (use Reset Token to get a fresh one) and that it has not been "
+            "revoked or regenerated."
+        ) from exc
+    except hikari.HTTPError as exc:
+        await _close_rest(rest, rest_app)
+        raise StartupError(
+            f"Could not reach Discord to verify the token ({exc}). Check your "
+            "network connection and try again."
+        ) from exc
     bot_user_id = int(me.id)
 
     await _register_commands(rest, bot_user_id)
@@ -291,10 +313,19 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
     finally:
         await app.aclose()
         await app.health.stop()
-        with contextlib.suppress(Exception):
-            await rest.close()
-        with contextlib.suppress(Exception):
-            await rest_app.close()
+        await _close_rest(rest, rest_app)
+
+
+async def _close_rest(rest: object, rest_app: object) -> None:  # pragma: no cover - net
+    """Close the REST client and its app, ignoring teardown errors.
+
+    Used both on the auth-failure path (before the run try/finally exists) and at
+    normal shutdown, so a half-open token check does not leak an aiohttp session.
+    """
+    with contextlib.suppress(Exception):
+        await rest.close()  # type: ignore[attr-defined]
+    with contextlib.suppress(Exception):
+        await rest_app.close()  # type: ignore[attr-defined]
 
 
 async def _register_commands(rest: object, bot_user_id: int) -> None:  # pragma: no cover - net

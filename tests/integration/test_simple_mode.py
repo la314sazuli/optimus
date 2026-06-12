@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
+import pytest
 import pytest_asyncio
 
 from optimus.app.simple import SimpleApp
@@ -175,21 +176,36 @@ async def test_synthetic_image_flows_end_to_end_then_clean_shutdown(
     application.ingest_worker = _fake_ingest_worker(application.settings, scam)
     await _seed(application, scam)
 
+    # Signal completion off the *end* of the moderation handler rather than the
+    # ban REST call: handle_verdict runs execute -> audit (the DB write the
+    # assertions below read) -> report, so waiting on on_verdict returning is the
+    # one point where both the ban and its persisted detection row are guaranteed
+    # to exist. (Hooking ban_member would race the audit write.)
+    pipeline_done = asyncio.Event()
+    real_on_verdict = application.moderation.on_verdict
+
+    async def on_verdict_then_signal(event: object) -> None:
+        try:
+            await real_on_verdict(event)  # type: ignore[arg-type]
+        finally:
+            pipeline_done.set()
+
+    application.moderation.on_verdict = on_verdict_then_signal  # type: ignore[method-assign]
+
     application.start_pipeline()
 
     # One gateway-style event drives ingest -> detection -> moderation.
     await application.bus.publish(SUBJECT_MESSAGE_IMAGE, _message_image_event())
 
-    # The pipeline runs across several bus hops; wait for the ban to land.
-    async def banned() -> bool:
-        return any(verb == "ban_member" for verb in rest.verbs)
-
-    deadline = asyncio.get_running_loop().time() + 5.0
-    while asyncio.get_running_loop().time() < deadline:
-        if await banned():
-            break
-        await asyncio.sleep(0.02)
-    assert await banned(), f"expected a ban; saw calls={rest.calls}"
+    # The pipeline runs across several async bus hops (ingest -> detection ->
+    # moderation), each on its own task. Await the terminal completion signal
+    # rather than polling a wall-clock deadline, so a slow CI host just waits
+    # longer instead of failing. The generous outer timeout only guards against a
+    # genuine hang (a step that never completes), not against being slow.
+    try:
+        await asyncio.wait_for(pipeline_done.wait(), timeout=30.0)
+    except TimeoutError:
+        pytest.fail(f"pipeline did not complete within 30s; saw calls={rest.calls}")
 
     # The enforcement order is delete-then-ban, against the right guild/uploader.
     assert rest.verbs[:2] == ["delete_message", "ban_member"]

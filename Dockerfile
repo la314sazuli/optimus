@@ -58,7 +58,8 @@ RUN groupadd --gid 10001 optimus \
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    OPTIMUS_SIMPLE_DATABASE_URL="sqlite+aiosqlite:////data/optimus.db"
 
 WORKDIR /app
 
@@ -71,6 +72,15 @@ COPY --from=builder --chown=optimus:optimus /app/migrations /app/migrations
 COPY --from=builder --chown=optimus:optimus /app/alembic.ini /app/alembic.ini
 COPY --from=builder --chown=optimus:optimus /app/scripts /app/scripts
 COPY --from=builder --chown=optimus:optimus /app/pyproject.toml /app/pyproject.toml
+
+# Simple mode persists its SQLite database under /data, a directory kept separate
+# from the read-only app install at /app. The README's one-liner mounts a named
+# volume here (`-v optimus-data:/data`), so it never shadows the venv or source,
+# and /data is owned by the unprivileged runtime user so the first boot can
+# create the database file (a volume mounted over /app would be root-owned and
+# unwritable). OPTIMUS_SIMPLE_DATABASE_URL above points the engine at /data.
+RUN mkdir -p /data && chown optimus:optimus /data
+VOLUME ["/data"]
 
 USER optimus
 
