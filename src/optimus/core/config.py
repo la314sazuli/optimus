@@ -98,6 +98,21 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     nats_url: str = "nats://localhost:4222"
 
+    # Database connection pool (SQLAlchemy async engine, QueuePool).
+    #: Persistent connections kept open per engine (i.e. per process/replica).
+    #: At large fleets the real cap is ``replicas * (pool_size + max_overflow)``
+    #: against one Postgres ``max_connections``; size accordingly or front the
+    #: DB with an external pooler (see docs/operations.md).
+    db_pool_size: int = Field(default=5, ge=1)
+    #: Extra connections opened past ``pool_size`` under burst, closed when idle.
+    db_max_overflow: int = Field(default=10, ge=0)
+    #: Recycle (reconnect) a pooled connection after this many seconds. Guards
+    #: against server-side/idle-proxy timeouts severing long-lived connections.
+    db_pool_recycle: int = Field(default=1800, ge=1)
+    #: Check a connection's liveness with a lightweight ping before handing it
+    #: out, transparently replacing one the server has dropped.
+    db_pool_pre_ping: bool = True
+
     # Logging / observability
     log_level: str = "INFO"
     service_name: str = "optimus"
@@ -201,12 +216,29 @@ class Settings(BaseSettings):
     evidence_sse: str = "AES256"
     evidence_presign_seconds: int = Field(default=300, ge=1, le=3600)
 
+    # Data retention (deployment-wide cleanup job).
+    #: Age in days past which detection/appeal rows are purged by the scheduler's
+    #: ``retention_purge`` job. ``None`` (the default) disables the job entirely
+    #: so self-hosters keep everything; set a positive value to enable bounded
+    #: cleanup. This is the operator-level floor and is independent of the
+    #: per-guild ``retention_days`` config consumed by the legacy
+    #: :func:`enforce_retention` job.
+    detection_retention_days: int | None = Field(default=None, ge=1)
+    #: Rows deleted per DELETE statement, looping until a batch comes back
+    #: short. Bounded batches keep locks/transactions short on huge tables.
+    retention_batch_size: int = Field(default=1000, ge=1)
+    #: Seconds to sleep between batches, yielding to foreground traffic and
+    #: giving autovacuum room. Zero disables the pause (useful in tests).
+    retention_batch_pause_seconds: float = Field(default=0.5, ge=0.0)
+
     # Scheduler intervals (seconds)
     scheduler_retention_interval: int = Field(default=3600, ge=1)
     scheduler_evidence_interval: int = Field(default=600, ge=1)
     scheduler_rollup_interval: int = Field(default=900, ge=1)
     scheduler_index_rebuild_interval: int = Field(default=1800, ge=1)
     scheduler_health_interval: int = Field(default=300, ge=1)
+    #: Cadence of the deployment-wide batched retention purge (seconds).
+    scheduler_retention_purge_interval: int = Field(default=86400, ge=1)
     scheduler_jitter_fraction: float = Field(default=0.1, ge=0.0, le=1.0)
 
     # Global hash DB signing (Ed25519, base64-encoded)

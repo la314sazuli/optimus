@@ -16,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     Dialect,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -218,6 +219,9 @@ class Detection(Base):
     """A recorded detection event."""
 
     __tablename__ = "detections"
+    # Drives the deployment-wide retention purge's ``created_at < cutoff`` range
+    # scan (no guild filter, so a leading-guild_id composite would not apply).
+    __table_args__ = (Index("ix_detections_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
@@ -236,6 +240,8 @@ class Appeal(Base):
     """A user appeal against a detection."""
 
     __tablename__ = "appeals"
+    # Drives the deployment-wide retention purge's ``created_at < cutoff`` scan.
+    __table_args__ = (Index("ix_appeals_created_at", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)

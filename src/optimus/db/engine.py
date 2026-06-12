@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Any
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -12,15 +13,32 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from optimus.core.config import get_settings
+from optimus.core.config import Settings, get_settings
 
 #: A zero-arg factory yielding a transactional :class:`AsyncSession` scope.
 SessionScope = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
-def create_engine(url: str | None = None, *, echo: bool = False) -> AsyncEngine:
-    """Create an async engine for ``url`` (defaults to configured database URL)."""
-    return create_async_engine(url or get_settings().database_url, echo=echo, future=True)
+def create_engine(
+    url: str | None = None, *, echo: bool = False, settings: Settings | None = None
+) -> AsyncEngine:
+    """Create an async engine for ``url`` (defaults to configured database URL).
+
+    For pooled backends (Postgres) the QueuePool is sized from settings so the
+    connection footprint is tunable per replica; SQLite (used in tests) has no
+    server-side pool and is left on SQLAlchemy's defaults.
+    """
+    settings = settings or get_settings()
+    target = url or settings.database_url
+    kwargs: dict[str, Any] = {"echo": echo, "future": True}
+    if not target.startswith("sqlite"):
+        kwargs.update(
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_recycle=settings.db_pool_recycle,
+            pool_pre_ping=settings.db_pool_pre_ping,
+        )
+    return create_async_engine(target, **kwargs)
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

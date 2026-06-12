@@ -18,6 +18,29 @@ def test_settings_defaults() -> None:
     assert settings.sensitivity_default is Sensitivity.BALANCED
 
 
+def test_retention_and_pool_defaults() -> None:
+    settings = Settings(_env_file=None)
+    # Retention is off by default so self-hosters keep everything.
+    assert settings.detection_retention_days is None
+    assert settings.retention_batch_size == 1000
+    assert settings.retention_batch_pause_seconds == 0.5
+    # Pool defaults are conservative per-replica values.
+    assert settings.db_pool_size == 5
+    assert settings.db_max_overflow == 10
+    assert settings.db_pool_recycle == 1800
+    assert settings.db_pool_pre_ping is True
+
+
+def test_retention_settings_from_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("OPTIMUS_DETECTION_RETENTION_DAYS", "90")
+    monkeypatch.setenv("OPTIMUS_RETENTION_BATCH_SIZE", "250")
+    monkeypatch.setenv("OPTIMUS_DB_POOL_SIZE", "20")
+    settings = Settings(_env_file=None)
+    assert settings.detection_retention_days == 90
+    assert settings.retention_batch_size == 250
+    assert settings.db_pool_size == 20
+
+
 def test_settings_env_prefix(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("OPTIMUS_TENANCY", "multi")
     monkeypatch.setenv("OPTIMUS_HEALTH_PORT", "9999")

@@ -7,6 +7,8 @@ periodic loop machinery and jitter live in :mod:`service`.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from optimus.db.engine import SessionScope
@@ -17,6 +19,8 @@ from optimus.db.repositories import (
     GuildListRepository,
     ModActionRepository,
     StatsRollupRepository,
+    delete_appeals_before,
+    delete_detections_before,
 )
 
 
@@ -46,6 +50,43 @@ async def enforce_retention(
             deleted += await DetectionRepository(session, gid).delete_older_than(cutoff)
             deleted += await AppealRepository(session, gid).delete_older_than(cutoff)
             deleted += await ModActionRepository(session, gid).delete_older_than(cutoff)
+    return deleted
+
+
+async def purge_old_data(
+    scope: SessionScope,
+    *,
+    retention_days: int | None,
+    batch_size: int,
+    pause_seconds: float = 0.0,
+    now: datetime | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> int:
+    """Deployment-wide batched purge of detections/appeals past ``retention_days``.
+
+    Disabled (returns 0 without touching the DB) when ``retention_days`` is
+    ``None`` so self-hosters keep everything by default. Otherwise rows older
+    than the cutoff are deleted in ``batch_size`` chunks, each in its own
+    transaction, sleeping ``pause_seconds`` between batches to avoid long locks
+    and yield to foreground traffic. FK order is respected: appeals are purged
+    before detections (and appeals under purged detections cascade away).
+
+    Returns the total number of rows deleted across both tables.
+    """
+    if retention_days is None:
+        return 0
+    moment = now or datetime.now(UTC)
+    cutoff = moment - timedelta(days=retention_days)
+    deleted = 0
+    for delete_batch in (delete_appeals_before, delete_detections_before):
+        while True:
+            async with scope() as session:
+                removed = await delete_batch(session, cutoff, limit=batch_size)
+            deleted += removed
+            if removed < batch_size:
+                break
+            if pause_seconds > 0:
+                await sleep(pause_seconds)
     return deleted
 
 

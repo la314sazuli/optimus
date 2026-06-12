@@ -97,6 +97,123 @@ async def test_retention_also_clears_mod_actions(scope: SessionScope) -> None:
     assert deleted == 1
 
 
+async def _add_appeal(
+    scope: SessionScope, guild_id: int, detection_id: int, *, created: datetime
+) -> None:
+    from optimus.db.models import Appeal
+
+    async with scope() as s:
+        s.add(
+            Appeal(
+                guild_id=guild_id,
+                detection_id=detection_id,
+                user_id=7,
+                created_at=created,
+            )
+        )
+
+
+async def _count(scope: SessionScope, model: object) -> int:
+    async with scope() as s:
+        rows = (await s.execute(model.__table__.select())).fetchall()  # type: ignore[attr-defined]
+    return len(rows)
+
+
+async def test_purge_disabled_by_default_keeps_everything(scope: SessionScope) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    await _add_detection(scope, 1, key="ancient", created=now - timedelta(days=999))
+    deleted = await tasks.purge_old_data(
+        scope, retention_days=None, batch_size=100, pause_seconds=0.0, now=now
+    )
+    assert deleted == 0
+    assert await _count(scope, Detection) == 1
+
+
+async def test_purge_deletes_only_old_rows(scope: SessionScope) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    await _add_detection(scope, 1, key="old", created=now - timedelta(days=40))
+    await _add_detection(scope, 1, key="new", created=now - timedelta(days=5))
+    deleted = await tasks.purge_old_data(
+        scope, retention_days=30, batch_size=100, pause_seconds=0.0, now=now
+    )
+    assert deleted == 1
+    assert await _count(scope, Detection) == 1
+
+
+async def test_purge_respects_batch_size_and_loops_until_done(scope: SessionScope) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    for i in range(5):
+        await _add_detection(scope, 1, key=f"old-{i}", created=now - timedelta(days=40))
+
+    pauses: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        pauses.append(seconds)
+
+    deleted = await tasks.purge_old_data(
+        scope,
+        retention_days=30,
+        batch_size=2,
+        pause_seconds=0.5,
+        now=now,
+        sleep=fake_sleep,
+    )
+    assert deleted == 5
+    assert await _count(scope, Detection) == 0
+    # 5 rows / batch 2 -> batches of 2, 2, 1; a pause follows each full batch
+    # (the two of size 2), none after the short final batch. Appeals table is
+    # empty so it contributes one immediate short batch (no pause).
+    assert pauses == [0.5, 0.5]
+
+
+async def test_purge_clears_appeals_before_detections(scope: SessionScope) -> None:
+    from optimus.db.models import Appeal
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    det_id = await _add_detection(scope, 1, key="d", created=now - timedelta(days=40))
+    await _add_appeal(scope, 1, det_id, created=now - timedelta(days=40))
+    deleted = await tasks.purge_old_data(
+        scope, retention_days=30, batch_size=100, pause_seconds=0.0, now=now
+    )
+    # One appeal + one detection.
+    assert deleted == 2
+    assert await _count(scope, Appeal) == 0
+    assert await _count(scope, Detection) == 0
+
+
+async def test_service_retention_purge_disabled_returns_zero(scope: SessionScope) -> None:
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    await _add_detection(scope, 1, key="ancient", created=now - timedelta(days=999))
+    svc = _service(scope, _FakeBus())
+    # Default settings leave detection_retention_days unset, so the job is a no-op.
+    assert await svc._retention_purge() == 0  # type: ignore[attr-defined]
+    assert await _count(scope, Detection) == 1
+
+
+async def test_service_retention_purge_enabled_via_settings(scope: SessionScope) -> None:
+    from optimus.services.scheduler.service import SchedulerService
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    await _add_detection(scope, 1, key="old", created=now - timedelta(days=40))
+    settings = get_settings().model_copy(
+        update={
+            "detection_retention_days": 30,
+            "retention_batch_size": 100,
+            "retention_batch_pause_seconds": 0.0,
+        }
+    )
+    svc = SchedulerService(settings, _FakeBus(), scope)  # type: ignore[arg-type]
+    purged = await svc._retention_purge()  # type: ignore[attr-defined]
+    assert purged == 1
+    assert await _count(scope, Detection) == 0
+
+
 async def test_rollup_counts_previous_hour(scope: SessionScope) -> None:
     # "now" is 10:30; the rolled-up bucket is 09:00-10:00.
     now = datetime(2026, 6, 1, 10, 30, tzinfo=UTC)
@@ -219,7 +336,7 @@ async def test_service_start_launches_loops_and_request_stop_unwinds(
 
     svc = _service(scope, _FakeBus())
     handles = svc.start()  # type: ignore[attr-defined]
-    assert len(handles) == 5
+    assert len(handles) == 6
     # Intervals default to minutes, so loops are parked in their first sleep;
     # request_stop wakes them and they exit cooperatively.
     svc.request_stop()  # type: ignore[attr-defined]

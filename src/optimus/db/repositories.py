@@ -308,6 +308,42 @@ class DetectionRepository:
         return cast("CursorResult[Any]", result).rowcount or 0
 
 
+async def delete_detections_before(session: AsyncSession, cutoff: datetime, *, limit: int) -> int:
+    """Delete up to ``limit`` detections (all guilds) created before ``cutoff``.
+
+    A bounded single-batch delete for the deployment-wide retention purge: it
+    targets a ``LIMIT``-ed set of ids so each transaction stays short on huge
+    tables. Cascading FKs remove the matching appeals/evidence. Returns the
+    number of rows deleted.
+    """
+    return await _delete_before(session, Detection, cutoff, limit=limit)
+
+
+async def delete_appeals_before(session: AsyncSession, cutoff: datetime, *, limit: int) -> int:
+    """Delete up to ``limit`` appeals (all guilds) created before ``cutoff``.
+
+    Run before :func:`delete_detections_before` so appeals attached to
+    still-retained detections are purged on their own ``created_at`` schedule;
+    appeals under purged detections cascade away regardless. Returns rows deleted.
+    """
+    return await _delete_before(session, Appeal, cutoff, limit=limit)
+
+
+async def _delete_before(session: AsyncSession, model: Any, cutoff: datetime, *, limit: int) -> int:
+    """Delete up to ``limit`` rows of ``model`` with ``created_at < cutoff``.
+
+    Uses an id subquery because ``DELETE ... LIMIT`` is not portable across
+    Postgres and SQLite.
+    """
+    ids_stmt = select(model.id).where(model.created_at < cutoff).limit(limit)
+    ids = list((await session.execute(ids_stmt)).scalars().all())
+    if not ids:
+        return 0
+    result = await session.execute(delete(model).where(model.id.in_(ids)))
+    await session.flush()
+    return cast("CursorResult[Any]", result).rowcount or 0
+
+
 class ModActionRepository:
     """Append-only audit log of administrative actions, scoped per guild."""
 

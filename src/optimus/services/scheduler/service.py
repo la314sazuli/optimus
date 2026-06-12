@@ -116,6 +116,21 @@ class SchedulerService:
     async def _retention(self) -> int:
         return await tasks.enforce_retention(self._scope, default_days=30)
 
+    async def _retention_purge(self) -> int:
+        s = self._settings
+        purged = await tasks.purge_old_data(
+            self._scope,
+            retention_days=s.detection_retention_days,
+            batch_size=s.retention_batch_size,
+            pause_seconds=s.retention_batch_pause_seconds,
+        )
+        _log.info(
+            "retention_purge_complete",
+            retention_days=s.detection_retention_days,
+            rows_purged=purged,
+        )
+        return purged
+
     async def _evidence(self) -> int:
         return await tasks.cleanup_evidence(self._scope, delete_object=self._delete_object)
 
@@ -146,6 +161,15 @@ class SchedulerService:
                     "retention",
                     s.scheduler_retention_interval,
                     self._retention,
+                    stop=self._stop,
+                    jitter_fraction=jf,
+                )
+            ),
+            asyncio.create_task(
+                run_periodic(
+                    "retention_purge",
+                    s.scheduler_retention_purge_interval,
+                    self._retention_purge,
                     stop=self._stop,
                     jitter_fraction=jf,
                 )
