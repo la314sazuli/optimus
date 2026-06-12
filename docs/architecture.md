@@ -114,7 +114,10 @@ flowchart LR
   to Discord, and via [`extract.py`](../src/optimus/services/gateway/extract.py)
   pulls image attachments and `http(s)` URLs / embed images out of each message,
   emitting one `message_image.v1` per candidate. It also emits `guild_joined.v1`
-  for one-time provisioning.
+  for one-time provisioning. It is the only Discord gateway connection and the
+  one component whose load tracks guild count; it supports
+  [gateway sharding](sharding.md) (one process per shard subset) for fleets past
+  Discord's single-connection guild ceiling.
 - **ingest** ([`services/ingest/`](../src/optimus/services/ingest/)) fetches each
   candidate through the SSRF-hardened fetcher (below), enforces a per-guild fetch
   rate limit, and emits `image_fetched.v1` with the validated bytes inline as

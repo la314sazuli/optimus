@@ -31,6 +31,21 @@ class _Pingable(Protocol):
     def ping(self) -> Awaitable[Any]: ...
 
 
+@runtime_checkable
+class _Shard(Protocol):
+    @property
+    def is_alive(self) -> bool: ...
+
+    @property
+    def is_connected(self) -> bool: ...
+
+
+@runtime_checkable
+class _Sharded(Protocol):
+    @property
+    def shards(self) -> Any: ...
+
+
 def redis_check(redis: object | None) -> ReadinessCheck:
     """Return a probe that is ready when ``redis`` answers ``PING``.
 
@@ -54,6 +69,33 @@ def nats_check(nc: object) -> ReadinessCheck:
 
     async def _check() -> bool:
         return bool(getattr(nc, "is_connected", False))
+
+    return _check
+
+
+def shards_check(bot: object) -> ReadinessCheck:
+    """Return a probe that is ready when every shard this replica runs is connected.
+
+    Reads ``bot.shards`` (hikari exposes a mapping of shard id to shard) and
+    requires every shard to be both alive and connected. Fail-closed: a bot with
+    no shards yet (still starting), an unexpected shape, or any access error
+    resolves to ``False`` so ``/readyz`` reports 503 until the gateway is up.
+    This matches the existing readiness design where an unready dependency keeps
+    the replica out of rotation rather than crashing the probe.
+    """
+
+    async def _check() -> bool:
+        if not isinstance(bot, _Sharded):
+            return False
+        try:
+            shards = bot.shards
+            if not shards:
+                return False
+            return all(
+                isinstance(s, _Shard) and s.is_alive and s.is_connected for s in shards.values()
+            )
+        except Exception:
+            return False
 
     return _check
 

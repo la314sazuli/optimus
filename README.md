@@ -189,7 +189,8 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full developer workflow (setup,
 running services locally, test conventions, and PR expectations) and
 [`docs/architecture.md`](docs/architecture.md) for the system design. Additional
 references: [`docs/security-audit.md`](docs/security-audit.md),
-[`docs/performance-notes.md`](docs/performance-notes.md), and
+[`docs/performance-notes.md`](docs/performance-notes.md),
+[`docs/sharding.md`](docs/sharding.md) (gateway sharding for large fleets), and
 [`docs/eval/baseline.md`](docs/eval/baseline.md).
 
 ## License

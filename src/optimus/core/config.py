@@ -4,9 +4,34 @@ from __future__ import annotations
 
 from enum import StrEnum
 from functools import lru_cache
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_shard_ids(raw: str) -> tuple[int, ...]:
+    """Parse a shard-id spec into a sorted, de-duplicated tuple.
+
+    Accepts comma-separated ids and inclusive ranges, e.g. ``"0,1,2"`` or
+    ``"0-3"`` or ``"0-1,4,6-7"``. Whitespace is ignored. Ids are non-negative
+    (a leading ``-`` is read as a range separator); an inverted range
+    (``"3-1"``) raises :class:`ValueError`.
+    """
+    ids: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            lo_str, _, hi_str = token.partition("-")
+            lo, hi = int(lo_str.strip()), int(hi_str.strip())
+            if lo > hi:
+                raise ValueError(f"inverted shard-id range: {token!r}")
+            ids.update(range(lo, hi + 1))
+        else:
+            ids.add(int(token))
+    return tuple(sorted(ids))
 
 
 class Tenancy(StrEnum):
@@ -55,6 +80,18 @@ class Settings(BaseSettings):
     discord_token: str = ""
     discord_client_id: str = ""
     discord_client_secret: str = ""
+
+    # Gateway sharding
+    #: Total number of gateway shards across the whole deployment. Unset (None)
+    #: defers to hikari's automatic sharding (recommended for small fleets);
+    #: Discord mandates sharding past ~2,500 guilds. When set, every replica
+    #: must agree on the same value.
+    shard_count: int | None = Field(default=None, ge=1)
+    #: Which shard ids THIS replica should run, as a spec string parsed into a
+    #: sorted tuple of ids (e.g. ``"0,1"`` or ``"0-3"``). Unset (None) means
+    #: this replica runs all shards (the single-process default). When set,
+    #: ``shard_count`` must also be set and every id must be ``< shard_count``.
+    shard_ids: tuple[int, ...] | None = None
 
     # Datastores
     database_url: str = "postgresql+asyncpg://optimus:optimus@localhost:5432/optimus"
@@ -175,6 +212,52 @@ class Settings(BaseSettings):
     # Global hash DB signing (Ed25519, base64-encoded)
     global_signing_public_key: str = ""
     global_signing_private_key: str = ""
+
+    @field_validator("shard_count", mode="before")
+    @classmethod
+    def _empty_shard_count_is_none(cls, value: object) -> object:
+        """Treat a blank ``OPTIMUS_SHARD_COUNT`` env var as unset.
+
+        ``.env.example`` ships the key present-but-empty; without this an empty
+        string would fail int coercion instead of meaning "use hikari defaults".
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("shard_ids", mode="before")
+    @classmethod
+    def _coerce_shard_ids(cls, value: object) -> object:
+        """Parse the ``OPTIMUS_SHARD_IDS`` spec string into a tuple of ids.
+
+        Non-string values (e.g. a tuple supplied directly in tests, or ``None``)
+        pass through unchanged for the normal field machinery to validate.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            parsed = _parse_shard_ids(stripped)
+            if not parsed:
+                raise ValueError("shard_ids resolved to an empty set")
+            return parsed
+        return value
+
+    @model_validator(mode="after")
+    def _validate_sharding(self) -> Self:
+        """Enforce that the per-replica shard subset is consistent with the fleet."""
+        if self.shard_ids is None:
+            return self
+        if not self.shard_ids:
+            raise ValueError("shard_ids must be non-empty when set")
+        if self.shard_count is None:
+            raise ValueError("shard_count is required when shard_ids is set")
+        if any(i >= self.shard_count for i in self.shard_ids):
+            raise ValueError(
+                f"every shard id must be < shard_count ({self.shard_count}); "
+                f"got {list(self.shard_ids)}"
+            )
+        return self
 
     @property
     def is_multi_tenant(self) -> bool:

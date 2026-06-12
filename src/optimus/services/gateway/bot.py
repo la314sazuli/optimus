@@ -26,7 +26,7 @@ from optimus.core.config import Settings, get_settings
 from optimus.core.guild_config import GuildConfig, GuildConfigCache
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, correlation_context, get_logger
-from optimus.core.readiness import nats_check, redis_check
+from optimus.core.readiness import nats_check, redis_check, shards_check
 from optimus.services.gateway.extract import (
     Attachment,
     IncomingMessage,
@@ -52,6 +52,24 @@ def _embed_image_urls(embeds: Iterable[hikari.Embed]) -> tuple[str, ...]:
         if embed.thumbnail is not None and embed.thumbnail.url:
             urls.append(embed.thumbnail.url)
     return tuple(urls)
+
+
+def shard_start_kwargs(settings: Settings) -> dict[str, object]:
+    """Build the sharding kwargs for :meth:`hikari.GatewayBot.start`.
+
+    Returns an empty dict when neither setting is configured so hikari keeps its
+    automatic single-process behavior (zero change for small deployments). When
+    ``shard_count`` is set the whole fleet agrees on the total; when
+    ``shard_ids`` is also set this replica runs only that subset, enabling one
+    process per shard subset. Validation of the relationship between the two
+    lives in :class:`~optimus.core.config.Settings`.
+    """
+    kwargs: dict[str, object] = {}
+    if settings.shard_count is not None:
+        kwargs["shard_count"] = settings.shard_count
+    if settings.shard_ids is not None:
+        kwargs["shard_ids"] = list(settings.shard_ids)
+    return kwargs
 
 
 def to_incoming(event: hikari.GuildMessageCreateEvent) -> IncomingMessage:
@@ -179,6 +197,7 @@ async def _amain() -> None:
     await health.start()
 
     bot = hikari.GatewayBot(token=settings.discord_token, intents=GATEWAY_INTENTS)
+    health.add_readiness_check(shards_check(bot), name="shards")
     service = GatewayService(settings, bus, config_cache, health)
 
     @bot.listen(hikari.GuildMessageCreateEvent)
@@ -190,7 +209,7 @@ async def _amain() -> None:
         await service.on_guild_join(event)
 
     try:
-        await bot.start()
+        await bot.start(**shard_start_kwargs(settings))  # type: ignore[arg-type]
         await bot.join()
     finally:
         health.set_live(False)
