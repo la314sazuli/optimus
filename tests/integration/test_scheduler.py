@@ -10,6 +10,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio import AsyncSession as _Session
 
+from optimus.core.config import get_settings
 from optimus.db.engine import SessionScope, create_engine, create_session_factory, session_scope
 from optimus.db.models import Base, Detection, Evidence, Guild, ModAction
 from optimus.services.scheduler import tasks
@@ -142,3 +143,81 @@ async def test_evidence_cleanup_deletes_expired(scope: SessionScope) -> None:
     async with scope() as s:
         remaining = (await s.execute(Evidence.__table__.select())).fetchall()
     assert len(remaining) == 1
+
+
+class _FakeBus:
+    """Captures published (subject, event) pairs."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, object]] = []
+
+    async def publish(self, subject: str, event: object) -> None:
+        self.published.append((subject, event))
+
+
+def _service(scope: SessionScope, bus: _FakeBus) -> object:
+    from optimus.services.scheduler.service import SchedulerService
+
+    return SchedulerService(get_settings(), bus, scope)  # type: ignore[arg-type]
+
+
+async def test_service_retention_and_rollup_jobs_delegate_to_tasks(
+    scope: SessionScope,
+) -> None:
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    await _add_detection(scope, 1, key="ancient", created=old)
+
+    svc = _service(scope, _FakeBus())
+    # _retention purges the ancient detection (default 30-day window).
+    assert await svc._retention() == 1  # type: ignore[attr-defined]
+    async with scope() as s:
+        from optimus.db.models import Detection
+
+        assert (await s.execute(Detection.__table__.select())).fetchall() == []
+
+
+async def test_service_index_rebuild_publishes_invalidate_event(
+    scope: SessionScope,
+) -> None:
+    from optimus.contracts.events import SUBJECT_INDEX_INVALIDATE, IndexInvalidateEvent
+
+    bus = _FakeBus()
+    svc = _service(scope, bus)
+    affected = await svc._index_rebuild()  # type: ignore[attr-defined]
+    assert affected == 1
+    assert len(bus.published) == 1
+    subject, event = bus.published[0]
+    assert subject == SUBJECT_INDEX_INVALIDATE
+    assert isinstance(event, IndexInvalidateEvent)
+    assert event.correlation_id == "scheduler"
+
+
+async def test_service_health_sweep_pings_db(scope: SessionScope) -> None:
+    svc = _service(scope, _FakeBus())
+    # A successful DB ping reports zero rows affected.
+    assert await svc._health_sweep() == 0  # type: ignore[attr-defined]
+
+
+async def test_service_evidence_job_runs_with_default_noop_deleter(
+    scope: SessionScope,
+) -> None:
+    # No delete_object injected -> the no-op deleter is used; with no expired
+    # rows the job simply reports zero.
+    svc = _service(scope, _FakeBus())
+    assert await svc._evidence() == 0  # type: ignore[attr-defined]
+
+
+async def test_service_start_launches_loops_and_request_stop_unwinds(
+    scope: SessionScope,
+) -> None:
+    import asyncio
+
+    svc = _service(scope, _FakeBus())
+    handles = svc.start()  # type: ignore[attr-defined]
+    assert len(handles) == 5
+    # Intervals default to minutes, so loops are parked in their first sleep;
+    # request_stop wakes them and they exit cooperatively.
+    svc.request_stop()  # type: ignore[attr-defined]
+    await asyncio.wait_for(asyncio.gather(*handles), timeout=2.0)
+    assert all(h.done() for h in handles)

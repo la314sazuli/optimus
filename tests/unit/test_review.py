@@ -10,6 +10,7 @@ from optimus.services.moderation.review import (
     ReportData,
     ReviewAction,
     build_action_rows,
+    build_embed,
     decode_custom_id,
     encode_custom_id,
     report_fields,
@@ -90,3 +91,27 @@ def test_report_fields_omit_optional_when_absent() -> None:
     assert "Matched hash" not in names
     assert "Swarm" not in names
     assert "Evidence" not in names
+
+
+def test_build_embed_renders_title_and_one_field_per_report_field() -> None:
+    import hikari
+
+    data = ReportData(
+        detection_id=9,
+        guild_id=1,
+        channel_id=2,
+        message_id=3,
+        uploader_id=42,
+        verdict="scam",
+        confidence=0.91,
+        action_taken="delete_ban",
+        matched_hash_id="camp-7",
+    )
+    embed = build_embed(data)
+    assert isinstance(embed, hikari.Embed)
+    assert embed.title is not None and "#9" in embed.title
+    expected = report_fields(data)
+    assert len(embed.fields) == len(expected)
+    rendered = {(f.name, f.value) for f in embed.fields}
+    assert rendered == set(expected)
+    assert all(f.is_inline for f in embed.fields)

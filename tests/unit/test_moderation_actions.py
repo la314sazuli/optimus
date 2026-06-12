@@ -108,6 +108,48 @@ async def test_ban_deletes_and_bans_and_dms() -> None:
     assert rest.dms == [(42, rest.dms[0][1])]
 
 
+async def test_timeout_deletes_and_times_out_with_configured_seconds() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    req = ActionRequest(
+        guild_id=1,
+        channel_id=2,
+        message_id=3,
+        uploader_id=42,
+        action=Action.DELETE_TIMEOUT,
+        idempotency_key="t1",
+        timeout_seconds=600,
+    )
+    result = await _executor(rest, redis=redis).execute(req)
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message", "timeout_member"]
+    # The configured timeout is forwarded as the third positional arg.
+    assert rest.calls[1] == ("timeout_member", (1, 42, 600))
+
+
+async def test_kick_deletes_and_kicks() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    result = await _executor(rest, redis=redis).execute(_req(Action.DELETE_KICK, key="k"))
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message", "kick_member"]
+
+
+async def test_dm_failure_is_swallowed_and_action_still_succeeds() -> None:
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+    class _DmFailingRest(_FakeRest):
+        async def send_dm(self, user_id: int, content: str) -> None:
+            raise RuntimeError("recipient has DMs closed")
+
+    rest = _DmFailingRest()
+    # A closed-DM failure must not fail the enforcement action.
+    result = await _executor(rest, redis=redis).execute(_req(Action.DELETE, key="dmfail"))
+    assert result.success
+    assert [c[0] for c in rest.calls] == ["delete_message"]
+    assert rest.dms == []  # nothing recorded because send_dm raised
+
+
 async def test_idempotency_blocks_duplicate() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()
