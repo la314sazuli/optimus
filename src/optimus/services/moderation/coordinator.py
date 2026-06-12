@@ -17,6 +17,11 @@ from optimus.contracts.events import Action, VerdictEvent
 from optimus.services.moderation.actions import ActionExecutor, ActionRequest, ActionResult
 from optimus.services.moderation.boundaries import TargetContext, check_target
 from optimus.services.moderation.policy import Decision, PolicyInput, decide
+from optimus.services.moderation.priority import (
+    PriorityDispatcher,
+    QueueFullError,
+    classify_action,
+)
 from optimus.services.moderation.review import ReportData
 
 ACTIONS_TAKEN = Counter(
@@ -72,12 +77,17 @@ class ModerationCoordinator:
         executor: ActionExecutor,
         report: ReportPoster,
         audit: AuditRecorder,
+        dispatcher: PriorityDispatcher[ActionResult] | None = None,
     ) -> None:
         self._config = config
         self._target = target
         self._executor = executor
         self._report = report
         self._audit = audit
+        # When set, enforcement runs through the priority dispatcher so PROTECT
+        # actions are dispatched ahead of courtesy work under rate-limit
+        # pressure. None preserves the direct, synchronous execution path.
+        self._dispatcher = dispatcher
 
     async def handle_verdict(self, event: VerdictEvent) -> ActionResult:
         """Process one verdict end-to-end and return the action outcome."""
@@ -132,21 +142,39 @@ class ModerationCoordinator:
         if decision is Decision.MOD_QUEUE or action in (Action.NONE, Action.REPORT_ONLY):
             ACTIONS_TAKEN.labels(action=Action.REPORT_ONLY.value, success="true").inc()
             return ActionResult(Action.REPORT_ONLY, success=True, detail="queued")
-        result = await self._executor.execute(
-            ActionRequest(
-                guild_id=event.guild_id,
-                channel_id=event.channel_id,
-                message_id=event.message_id,
-                uploader_id=event.uploader_id,
-                action=action,
-                idempotency_key=f"modact:{event.idempotency_key}:{action.value}",
-                guild_name=cfg.guild_name,
-                locale=cfg.locale,
-                timeout_seconds=cfg.timeout_seconds,
-            )
+        request = ActionRequest(
+            guild_id=event.guild_id,
+            channel_id=event.channel_id,
+            message_id=event.message_id,
+            uploader_id=event.uploader_id,
+            action=action,
+            idempotency_key=f"modact:{event.idempotency_key}:{action.value}",
+            guild_name=cfg.guild_name,
+            locale=cfg.locale,
+            timeout_seconds=cfg.timeout_seconds,
         )
+        result = await self._dispatch(action, request)
         ACTIONS_TAKEN.labels(action=action.value, success=str(result.success).lower()).inc()
         return result
+
+    async def _dispatch(self, action: Action, request: ActionRequest) -> ActionResult:
+        """Run enforcement, through the priority dispatcher when one is wired.
+
+        Without a dispatcher this is the original direct call. With one, the
+        executor call is submitted at the action's priority and awaited; a
+        full-queue rejection (only possible for droppable classes — PROTECT is
+        always admitted) surfaces as a ``dropped`` failure so the caller still
+        records an audit row.
+        """
+        if self._dispatcher is None:
+            return await self._executor.execute(request)
+        try:
+            future = await self._dispatcher.submit(
+                classify_action(action), lambda: self._executor.execute(request)
+            )
+        except QueueFullError:
+            return ActionResult(action, success=False, detail="dropped")
+        return await future
 
     async def _post_report(
         self,

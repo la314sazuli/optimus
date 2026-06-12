@@ -54,6 +54,7 @@ from optimus.services.moderation.actions import ActionExecutor, ActionResult
 from optimus.services.moderation.boundaries import TargetContext
 from optimus.services.moderation.cooldown import Cooldown
 from optimus.services.moderation.coordinator import GuildModConfig, ModerationCoordinator
+from optimus.services.moderation.priority import PriorityDispatcher
 from optimus.services.moderation.review import ReportData
 
 _log = get_logger(__name__)
@@ -125,8 +126,12 @@ def build_coordinator(
     rest: object,
     redis: object,
     bot_user_id: int,
-) -> ModerationCoordinator:
-    """Wire a :class:`ModerationCoordinator` from settings and shared clients."""
+) -> tuple[ModerationCoordinator, PriorityDispatcher[ActionResult]]:
+    """Wire a :class:`ModerationCoordinator` from settings and shared clients.
+
+    Returns the coordinator and its :class:`PriorityDispatcher`; the caller owns
+    the dispatcher lifecycle (``start``/``stop``).
+    """
     # A runtime Redis outage degrades to a per-process per-guild bucket rather
     # than crashing the action path; the bucket count is bounded by guild count.
     rate_limiter = RedisRateLimiter(
@@ -152,6 +157,12 @@ def build_coordinator(
         idempotency_acquire=guard.acquire,
         dm_cooldown=cooldown,
         breaker=breaker,
+    )
+
+    dispatcher: PriorityDispatcher[ActionResult] = PriorityDispatcher(
+        concurrency=settings.mod_dispatch_concurrency,
+        max_queue=settings.mod_dispatch_max_queue,
+        aging_seconds=settings.mod_dispatch_aging_seconds,
     )
 
     async def config(guild_id: int) -> GuildModConfig:
@@ -203,13 +214,15 @@ def build_coordinator(
             )
             return detection.id
 
-    return ModerationCoordinator(
+    coordinator = ModerationCoordinator(
         config=config,
         target=target,
         executor=executor,
         report=report,
         audit=audit,
+        dispatcher=dispatcher,
     )
+    return coordinator, dispatcher
 
 
 class _ActionIdempotency:
@@ -293,9 +306,10 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     def scope() -> AbstractAsyncContextManager[AsyncSession]:
         return session_scope(factory)
 
-    coordinator = build_coordinator(
+    coordinator, dispatcher = build_coordinator(
         settings, scope, rest=rest, redis=redis, bot_user_id=bot_user_id
     )
+    await dispatcher.start()
     service = ModerationService(settings, bus, coordinator, scope)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
@@ -342,6 +356,8 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     finally:
         health.set_live(False)
         stop.set()
+        with contextlib.suppress(Exception):
+            await dispatcher.stop()
         with contextlib.suppress(Exception):
             await rest.close()
         with contextlib.suppress(Exception):

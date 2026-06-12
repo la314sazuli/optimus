@@ -207,6 +207,19 @@ class Settings(BaseSettings):
     mod_circuit_failure_threshold: int = Field(default=5, ge=1)
     mod_circuit_recovery_seconds: float = 30.0
 
+    # Priority-aware action dispatch (single-replica scheduler in front of the
+    # action executor). Protective work (delete scam / timeout / ban) is
+    # dispatched ahead of courtesy work (appeal DMs, notifications) under load.
+    #: Concurrent in-flight dispatch slots per replica. The Redis token bucket
+    #: still bounds the actual REST call rate; this caps local concurrency.
+    mod_dispatch_concurrency: int = Field(default=4, ge=1)
+    #: Pending-queue cap per replica. COURTESY/NOTIFY submissions are rejected
+    #: (reason-labeled metric) once full; PROTECT is always admitted.
+    mod_dispatch_max_queue: int = Field(default=1000, ge=1)
+    #: Wait time (seconds) that ages a queued item up one priority class — the
+    #: starvation guard so low-priority work always drains under sustained load.
+    mod_dispatch_aging_seconds: float = Field(default=5.0, gt=0.0)
+
     # Safe mode (anomaly-driven auto report-only)
     #: Multiplier of standard deviations above baseline that trips safe mode.
     safemode_sigma: float = Field(default=4.0, gt=0.0)

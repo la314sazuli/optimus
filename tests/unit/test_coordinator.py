@@ -14,6 +14,7 @@ from optimus.services.moderation.actions import ActionExecutor
 from optimus.services.moderation.boundaries import TargetContext
 from optimus.services.moderation.cooldown import Cooldown
 from optimus.services.moderation.coordinator import GuildModConfig, ModerationCoordinator
+from optimus.services.moderation.priority import PriorityDispatcher
 from optimus.services.moderation.review import ReportData
 
 
@@ -64,6 +65,7 @@ def _build(
     target: TargetContext | None,
     reports: list[ReportData],
     audits: list[tuple[str, bool]],
+    dispatcher: PriorityDispatcher | None = None,
 ) -> ModerationCoordinator:
     from optimus.services.moderation.service import _ActionIdempotency
 
@@ -93,7 +95,12 @@ def _build(
         return 7
 
     return ModerationCoordinator(
-        config=config, target=resolve_target, executor=executor, report=post, audit=audit
+        config=config,
+        target=resolve_target,
+        executor=executor,
+        report=post,
+        audit=audit,
+        dispatcher=dispatcher,
     )
 
 
@@ -196,6 +203,69 @@ async def test_queued_verdict_reports_without_action() -> None:
     assert rest.calls == []
     assert audits == [("report_only", True)]
     assert len(reports) == 1
+
+
+async def test_enforcement_runs_through_priority_dispatcher() -> None:
+    # With a dispatcher wired, a protective auto-act still executes and audits
+    # exactly as the direct path does — the dispatcher is transparent on success.
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    reports: list[ReportData] = []
+    audits: list[tuple[str, bool]] = []
+    dispatcher: PriorityDispatcher = PriorityDispatcher(concurrency=2)
+    await dispatcher.start()
+    coord = _build(
+        rest=rest,
+        redis=redis,
+        cfg=_cfg(),
+        target=_target(),
+        reports=reports,
+        audits=audits,
+        dispatcher=dispatcher,
+    )
+    result = await coord.handle_verdict(_event())
+    await dispatcher.stop()
+
+    assert result.success
+    assert "ban_member" in rest.calls
+    assert audits == [("delete_ban", True)]
+
+
+async def test_dropped_dispatch_records_failure_audit() -> None:
+    # When the dispatcher rejects a submission (full queue), enforcement returns
+    # a success=False "dropped" result and the audit row is still recorded.
+    from collections.abc import Awaitable, Callable
+
+    from optimus.services.moderation.actions import ActionResult
+    from optimus.services.moderation.priority import Priority, QueueFullError
+
+    class _RejectingDispatcher(PriorityDispatcher[ActionResult]):
+        async def submit(  # type: ignore[override]
+            self,
+            priority: Priority,
+            factory: Callable[[], Awaitable[ActionResult]],
+        ) -> object:
+            raise QueueFullError(priority)
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    reports: list[ReportData] = []
+    audits: list[tuple[str, bool]] = []
+    coord = _build(
+        rest=rest,
+        redis=redis,
+        cfg=_cfg(),
+        target=_target(),
+        reports=reports,
+        audits=audits,
+        dispatcher=_RejectingDispatcher(),
+    )
+    result = await coord.handle_verdict(_event())
+
+    assert not result.success
+    assert result.detail == "dropped"
+    assert rest.calls == []  # never reached the executor
+    assert audits == [("delete_ban", False)]
 
 
 async def test_safe_mode_blocks_auto_act() -> None:

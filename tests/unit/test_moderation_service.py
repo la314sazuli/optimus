@@ -146,7 +146,7 @@ async def test_build_coordinator_config_and_audit_persist_detection(
         s.add(Guild(guild_id=7, action_policy="delete_ban", mod_queue_threshold=0.5))
 
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    coordinator = build_coordinator(
+    coordinator, _dispatcher = build_coordinator(
         get_settings(), scope, rest=object(), redis=redis, bot_user_id=999
     )
 
@@ -173,7 +173,7 @@ async def test_build_coordinator_config_defaults_for_unconfigured_guild(
     # No guild row -> config falls back to report_only / default thresholds, so a
     # high-confidence scam is still only queued, and the detection is recorded.
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    coordinator = build_coordinator(
+    coordinator, _dispatcher = build_coordinator(
         get_settings(), scope, rest=object(), redis=redis, bot_user_id=999
     )
     event = VerdictEvent(
@@ -202,7 +202,7 @@ async def test_build_coordinator_wires_circuit_settings(scope: SessionScope) -> 
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
 
     default_settings = get_settings()
-    coordinator = build_coordinator(
+    coordinator, _dispatcher = build_coordinator(
         default_settings, scope, rest=object(), redis=redis, bot_user_id=1
     )
     breaker = coordinator._executor._breaker  # type: ignore[attr-defined]
@@ -215,7 +215,9 @@ async def test_build_coordinator_wires_circuit_settings(scope: SessionScope) -> 
     custom = default_settings.model_copy(
         update={"mod_circuit_failure_threshold": 2, "mod_circuit_recovery_seconds": 7.5}
     )
-    coordinator2 = build_coordinator(custom, scope, rest=object(), redis=redis, bot_user_id=1)
+    coordinator2, _dispatcher2 = build_coordinator(
+        custom, scope, rest=object(), redis=redis, bot_user_id=1
+    )
     breaker2 = coordinator2._executor._breaker  # type: ignore[attr-defined]
     assert breaker2._failure_threshold == 2
     assert breaker2._recovery_time == 7.5
