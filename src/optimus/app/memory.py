@@ -6,9 +6,12 @@ the moderation :class:`Cooldown`, and :class:`GuildConfigCache` — so their ded
 and cooldown semantics are exercised exactly as in production, just against this
 process-local store instead of a Redis server. Only the handful of commands those
 helpers issue are implemented: ``set`` (with ``nx``/``ex``), ``get``, ``exists``,
-``delete``, and ``ping``. TTLs are honoured lazily (a key past its expiry reads as
-absent), which is sufficient for a single-process bot and keeps the store
-dependency-free.
+``delete``, and ``ping``. TTLs are honoured lazily on access (a key past its expiry
+reads as absent) *and* swept actively: the idempotency keys this store mostly holds
+are written once and never read again, so lazy expiry alone never reclaims them and
+the map would grow without bound under sustained unique traffic. An amortised sweep
+every :data:`_SWEEP_EVERY` writes drops expired entries so the footprint tracks the
+live keyspace, not the lifetime key count.
 
 This is not a Redis emulator: it is single-process, unsynchronised across
 processes, and intentionally minimal. The accepted trade-off for zero external
@@ -19,6 +22,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+
+#: Run an expiry sweep once every this many writes. Amortises the O(n) scan to
+#: O(1) per write while keeping the map bounded to roughly the live keyspace.
+_SWEEP_EVERY = 1000
 
 
 @dataclass
@@ -33,6 +40,7 @@ class MemoryStore:
     def __init__(self, *, time_source: object = time.monotonic) -> None:
         self._data: dict[str, _Entry] = {}
         self._now = time_source
+        self._writes_since_sweep = 0
 
     def _clock(self) -> float:
         return float(self._now())  # type: ignore[operator]
@@ -45,6 +53,17 @@ class MemoryStore:
             del self._data[key]
             return None
         return entry
+
+    def _sweep_expired(self) -> None:
+        """Drop every entry whose TTL has passed (active reclaim, not lazy)."""
+        now = self._clock()
+        expired = [
+            key
+            for key, entry in self._data.items()
+            if entry.expires_at is not None and entry.expires_at <= now
+        ]
+        for key in expired:
+            del self._data[key]
 
     async def set(
         self,
@@ -59,6 +78,10 @@ class MemoryStore:
             return None
         expires_at = self._clock() + ex if ex is not None else None
         self._data[key] = _Entry(value=value, expires_at=expires_at)
+        self._writes_since_sweep += 1
+        if self._writes_since_sweep >= _SWEEP_EVERY:
+            self._writes_since_sweep = 0
+            self._sweep_expired()
         return True
 
     async def get(self, key: str) -> str | None:

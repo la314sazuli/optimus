@@ -119,6 +119,16 @@ class Settings(BaseSettings):
     #: driver (aiosqlite) is already a dependency; nothing else is required.
     #: Override with ``OPTIMUS_SIMPLE_DATABASE_URL`` to point at a different path.
     simple_database_url: str = "sqlite+aiosqlite:///optimus.db"
+    #: How long a SQLite writer waits for a competing lock before raising
+    #: ``database is locked``. Simple mode runs the whole pipeline (ingest,
+    #: detection, moderation) plus interaction handlers as concurrent writers
+    #: against one file; SQLite serialises writers, so without a generous busy
+    #: timeout a writer that collides with another in-flight write fails
+    #: immediately. WAL (set alongside this) lets readers proceed during a write;
+    #: the timeout absorbs writer-vs-writer overlaps under sustained load. 30s is
+    #: well above the longest observed write burst while still bounding a genuine
+    #: deadlock.
+    sqlite_busy_timeout_ms: int = Field(default=30_000, ge=0)
 
     # Database connection pool (SQLAlchemy async engine, QueuePool).
     #: Persistent connections kept open per engine (i.e. per process/replica).
