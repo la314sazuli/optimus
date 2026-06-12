@@ -1,10 +1,12 @@
 # Pre-commit hooks mirror the checks CI runs (.github/workflows/ci.yml):
-# ruff lint (check-only, no autofix), mypy strict on src, plus basic hygiene.
-# Run on the whole tree with: uvx pre-commit run --all-files
+# ruff lint (check-only, no autofix), ruff format (check-only), mypy strict on
+# src, plus basic hygiene. Run on the whole tree with:
+# uvx pre-commit run --all-files
 #
-# Note: `ruff format` is intentionally NOT enabled. CI only runs `ruff check`,
-# and the tree is not ruff-format-clean, so a formatting hook would rewrite
-# files the project does not currently format. Keep this in sync with CI.
+# The tree is `ruff format`-clean and CI enforces it via `ruff format --check`.
+# The format hook here runs check-only (no rewrite) so local == CI: a green
+# `pre-commit run --all-files` means a green CI lint+format+type stage. Keep
+# this in sync with CI.
 default_install_hook_types: [pre-commit]
 repos:
   - repo: https://github.com/gitleaks/gitleaks
@@ -35,6 +37,13 @@ repos:
         name: ruff check (uv)
         # No --fix: report, don't silently rewrite, so local == CI.
         entry: uv run ruff check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format --check (uv)
+        # --check: report, don't silently rewrite, so local == CI.
+        entry: uv run ruff format --check
         language: system
         types_or: [python, pyi]
         require_serial: true

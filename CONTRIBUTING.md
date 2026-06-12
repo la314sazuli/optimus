@@ -43,22 +43,26 @@ uv sync --extra dev --extra embedding --extra evidence --frozen
 
 ## The checks CI runs
 
-CI runs three gates, in this order. All three must be green to merge:
+CI runs four gates, in this order. All four must be green to merge:
 
 ```bash
-uv run ruff check .     # lint
-uv run mypy             # type-check (strict; checks src/optimus only)
+uv run ruff check .         # lint
+uv run ruff format --check . # formatting (no rewrite; fails on drift)
+uv run mypy                 # type-check (strict; checks src/optimus only)
 uv run pytest --cov=src/optimus --cov-report=term-missing
 ```
+
+Apply formatting locally with `uv run ruff format .` before committing.
 
 Notes that bite people:
 
 - **`uv run mypy` takes no path argument.** The target is fixed in
   `pyproject.toml` (`[tool.mypy] files = ["src/optimus"]`), and `strict = true`
   is on. Type the `src/` tree; tests are not type-checked.
-- **Ruff is lint-only in CI.** `ruff check` runs, `ruff format` does **not**.
-  The tree is intentionally *not* `ruff format`-clean, so do not run
-  `ruff format` and commit the churn. Selected rule families (see
+- **Ruff runs both lint and format checks in CI.** `ruff check` lints and
+  `ruff format --check` enforces formatting (it only reports; it never rewrites
+  in CI). The tree is `ruff format`-clean, so run `uv run ruff format .` and
+  commit the result before pushing. Selected lint rule families (see
   `[tool.ruff.lint]`): `E F I N UP B C4 SIM RUF ASYNC S` (security `S` is on for
   `src/`, relaxed for `tests/`). If a `# noqa` is genuinely needed, scope it to
   the specific rule and add a one-line reason.
@@ -69,10 +73,10 @@ Notes that bite people:
 ## Pre-commit hooks
 
 A [`.pre-commit-config.yaml`](.pre-commit-config.yaml) is provided. It runs the
-**same** `ruff check` and `mypy` as CI (via local hooks that shell out to
-`uv run`, so versions and config match exactly — no pinned-mirror drift), plus
-gitleaks secret scanning and basic file hygiene (EOF/whitespace/YAML/TOML/merge
--conflict/large-file checks).
+**same** `ruff check`, `ruff format --check`, and `mypy` as CI (via local hooks
+that shell out to `uv run`, so versions and config match exactly — no
+pinned-mirror drift), plus gitleaks secret scanning and basic file hygiene
+(EOF/whitespace/YAML/TOML/merge-conflict/large-file checks).
 
 Install and run it with [uv's tool runner](https://docs.astral.sh/uv/) (no global
 install needed):
@@ -187,8 +191,9 @@ run without an explicit marker.
 
 ## Pull request expectations
 
-- **All three CI gates green:** `ruff check .`, `mypy` (strict), and the full
-  `pytest` suite. PRs that don't pass these will not be merged.
+- **All four CI gates green:** `ruff check .`, `ruff format --check .`, `mypy`
+  (strict), and the full `pytest` suite. PRs that don't pass these will not be
+  merged.
 - **Don't regress coverage** (~80% baseline). New code paths need tests; new
   algorithmic invariants warrant a property test.
 - **Keep `uv sync --frozen` working** — no accidental lockfile drift, no
