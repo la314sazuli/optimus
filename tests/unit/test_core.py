@@ -563,3 +563,55 @@ async def test_idempotency_guard_acquires_once() -> None:
     assert await guard.seen(key) is True
     await guard.release(key)
     assert await guard.seen(key) is False
+
+
+class _ExplodingSetRedis:
+    """``set`` always raises, simulating a Redis outage during acquire."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def set(self, *_args: object, **_kwargs: object) -> bool | None:
+        self.calls += 1
+        raise ConnectionError("redis down")
+
+
+async def test_idempotency_guard_fails_open_on_redis_error() -> None:
+    from optimus.core.idempotency import REDIS_IDEMPOTENCY_FALLBACK
+
+    redis = _ExplodingSetRedis()
+    guard = IdempotencyGuard(redis, ttl_seconds=60)
+    before = REDIS_IDEMPOTENCY_FALLBACK._value.get()
+
+    # Fails open (permits processing) rather than propagating the error, so a
+    # Redis outage degrades dedup instead of nak-storming the consumer. Each
+    # fail-open is counted so the degradation is observable.
+    assert await guard.acquire(build_key(1, 2)) is True
+    assert await guard.acquire(build_key(3, 4)) is True
+    assert redis.calls == 2
+    assert REDIS_IDEMPOTENCY_FALLBACK._value.get() == before + 2
+
+
+class _HangingRedis:
+    """``set`` blocks forever, simulating a Redis client wedged on reconnect."""
+
+    async def set(self, *_args: object, **_kwargs: object) -> bool | None:
+        await asyncio.sleep(3600)
+        return True
+
+
+async def test_idempotency_guard_fails_open_on_timeout() -> None:
+    from optimus.core.idempotency import REDIS_IDEMPOTENCY_FALLBACK
+
+    guard = IdempotencyGuard(_HangingRedis(), ttl_seconds=60, op_timeout=0.05)
+    before = REDIS_IDEMPOTENCY_FALLBACK._value.get()
+
+    # A hung Redis call must not pin the caller: op_timeout bounds it and the
+    # guard fails open instead of stalling the consumer's in-flight slot.
+    assert await guard.acquire(build_key(5, 6)) is True
+    assert REDIS_IDEMPOTENCY_FALLBACK._value.get() == before + 1
+
+
+def test_idempotency_guard_rejects_nonpositive_op_timeout() -> None:
+    with pytest.raises(ValueError, match="op_timeout must be > 0"):
+        IdempotencyGuard(_FakeRedis(), op_timeout=0)

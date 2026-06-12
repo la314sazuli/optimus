@@ -112,7 +112,12 @@ def _open_redis(settings: Settings) -> object | None:
     try:
         import redis.asyncio as aioredis
 
-        return aioredis.from_url(settings.redis_url, decode_responses=True)
+        return aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_timeout=settings.redis_socket_timeout,
+            socket_connect_timeout=settings.redis_socket_timeout,
+        )
     except Exception:  # pragma: no cover - redis optional at boot
         _log.warning("redis_unavailable_ingest")
         return None

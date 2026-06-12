@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     # Datastores
     database_url: str = "postgresql+asyncpg://optimus:optimus@localhost:5432/optimus"
     redis_url: str = "redis://localhost:6379/0"
+    #: Per-operation socket timeout (seconds) for the async Redis client. Bounds
+    #: how long a single command blocks when Redis is unreachable so a dead Redis
+    #: surfaces as a fast error the caller can degrade on (rate-limit/idempotency
+    #: fallbacks) instead of stalling the event loop on the default unbounded
+    #: wait. Also used as the connect timeout.
+    redis_socket_timeout: float = Field(default=2.0, gt=0.0)
     nats_url: str = "nats://localhost:4222"
     #: SQLite file used in ``simple`` mode (zero external services). The async
     #: driver (aiosqlite) is already a dependency; nothing else is required.
@@ -308,6 +314,19 @@ class Settings(BaseSettings):
 
         ``.env.example`` ships the key present-but-empty; without this an empty
         string would fail int coercion instead of meaning "use hikari defaults".
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("detection_retention_days", mode="before")
+    @classmethod
+    def _empty_retention_days_is_none(cls, value: object) -> object:
+        """Treat a blank ``OPTIMUS_DETECTION_RETENTION_DAYS`` env var as unset.
+
+        ``.env.example`` ships the key present-but-empty; without this an empty
+        string would fail int coercion at startup instead of meaning "retain
+        everything" (the ``None`` default).
         """
         if isinstance(value, str) and not value.strip():
             return None

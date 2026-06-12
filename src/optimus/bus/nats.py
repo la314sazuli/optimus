@@ -120,10 +120,18 @@ class EventBus:
         The caller owns the returned client and is responsible for draining it.
         The server-negotiated ``max_payload`` (from the connection INFO) is
         captured so the publish-size budget can be validated up front.
+
+        ``max_reconnect_attempts=-1`` makes reconnection retry forever. The
+        nats-py default (60 attempts x 2s) gives up permanently after ~2 minutes
+        of downtime: a NATS outage or restart longer than that would leave a
+        consumer disconnected for good — readiness stuck at 503, no processing,
+        no recovery without a process restart. A long-lived service must ride out
+        an arbitrarily long broker outage and resume on its own, so we retry
+        indefinitely (paced by the 2s default ``reconnect_time_wait``).
         """
         import nats as _nats
 
-        nc = await _nats.connect(url)
+        nc = await _nats.connect(url, max_reconnect_attempts=-1)
         js = nc.jetstream()
         return cls(js, max_payload=nc.max_payload), nc
 

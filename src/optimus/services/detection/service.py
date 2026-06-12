@@ -29,7 +29,7 @@ from optimus.core.config import Sensitivity, Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.idempotency import IdempotencyGuard
 from optimus.core.logging import configure_logging, get_logger
-from optimus.core.readiness import nats_check, redis_check
+from optimus.core.readiness import db_check, nats_check, redis_check
 from optimus.db.engine import (
     SessionScope,
     create_engine,
@@ -63,6 +63,11 @@ class DetectionService:
         self._worker = worker
         self._indexes = index_manager
         self._scope = session_scope_factory
+
+    @property
+    def scope(self) -> SessionScope:
+        """The DB session-scope factory backing persistence (for readiness)."""
+        return self._scope
 
     async def on_image(self, event: ImageFetchedEvent) -> None:
         """Process a fetched image and publish its verdict (+ swarm alert)."""
@@ -209,6 +214,11 @@ async def _amain() -> None:
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
     health.add_readiness_check(nats_check(nc), name="nats")
+    # Detection's whole job is decode -> match -> *persist*; with Postgres down it
+    # can only nak-and-redeliver, never make progress. Gate readiness on the DB so
+    # the probe tells the truth (503) during a DB outage instead of reporting ready
+    # while every message bounces — matching how interactions already gates on its DB.
+    health.add_readiness_check(db_check(service.scope), name="postgres")
     if redis is not None:
         health.add_readiness_check(redis_check(redis), name="redis")
     await health.start()
@@ -249,7 +259,12 @@ def _open_redis(settings: Settings) -> object | None:
     try:
         import redis.asyncio as aioredis
 
-        return aioredis.from_url(settings.redis_url, decode_responses=True)
+        return aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_timeout=settings.redis_socket_timeout,
+            socket_connect_timeout=settings.redis_socket_timeout,
+        )
     except Exception:  # pragma: no cover - redis optional at boot
         _log.warning("redis_unavailable_detection")
         return None

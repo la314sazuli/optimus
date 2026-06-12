@@ -289,7 +289,7 @@ async def test_connect_captures_server_max_payload(monkeypatch: pytest.MonkeyPat
         def jetstream(self) -> _FakeJetStream:
             return _FakeJetStream()
 
-    async def _fake_connect(url: str) -> _FakeClient:
+    async def _fake_connect(url: str, **kwargs: object) -> _FakeClient:
         return _FakeClient()
 
     class _FakeNatsModule:
@@ -298,3 +298,29 @@ async def test_connect_captures_server_max_payload(monkeypatch: pytest.MonkeyPat
     monkeypatch.setitem(sys.modules, "nats", _FakeNatsModule)
     bus, _nc = await EventBus.connect("nats://x")
     assert bus.max_payload == 9_999_999
+
+
+async def test_connect_retries_reconnect_forever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A NATS outage longer than nats-py's default 60x2s must not permanently
+    disconnect a long-lived consumer: connect with unbounded reconnects so the
+    service rides out the outage and resumes on its own."""
+    import sys
+
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        max_payload = 1
+
+        def jetstream(self) -> _FakeJetStream:
+            return _FakeJetStream()
+
+    async def _fake_connect(url: str, **kwargs: object) -> _FakeClient:
+        captured.update(kwargs)
+        return _FakeClient()
+
+    class _FakeNatsModule:
+        connect = staticmethod(_fake_connect)
+
+    monkeypatch.setitem(sys.modules, "nats", _FakeNatsModule)
+    await EventBus.connect("nats://x")
+    assert captured["max_reconnect_attempts"] == -1
