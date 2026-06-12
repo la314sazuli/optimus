@@ -14,15 +14,46 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Dialect,
     ForeignKey,
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
+
+_UINT64_SPAN = 1 << 64
+_INT64_MAX = (1 << 63) - 1
+
+
+class Uint64(TypeDecorator[int]):
+    """Store an unsigned 64-bit hash in a signed ``int8`` column.
+
+    Perceptual hashes span the full ``[0, 2**64)`` range, but the underlying
+    storage (Postgres ``bigint`` / SQLite ``INTEGER``) is *signed* int8, capped
+    at ``2**63 - 1``. Any hash with the high bit set therefore overflows on
+    insert. This decorator maps the value through its two's-complement
+    representation on the way in and back on the way out, so the column stays a
+    plain ``BIGINT`` (no schema change, indexes/joins unaffected) while callers
+    only ever see the unsigned value the rest of the pipeline expects.
+    """
+
+    impl = BigInteger
+    cache_ok = True
+
+    def process_bind_param(self, value: int | None, dialect: Dialect) -> int | None:
+        if value is None:
+            return None
+        return value - _UINT64_SPAN if value > _INT64_MAX else value
+
+    def process_result_value(self, value: int | None, dialect: Dialect) -> int | None:
+        if value is None:
+            return None
+        return value + _UINT64_SPAN if value < 0 else value
 
 
 class Base(DeclarativeBase):
@@ -97,10 +128,10 @@ class GuildHash(Base):
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False, index=True
     )
     hash_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    phash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    dhash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    whash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    ahash: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    phash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    dhash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    whash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    ahash: Mapped[int] = mapped_column(Uint64, nullable=False, default=0)
     embedding: Mapped[bytes | None] = mapped_column(nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="local", nullable=False)
     added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -117,9 +148,9 @@ class GuildWhitelist(Base):
     guild_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("guilds.guild_id", ondelete="CASCADE"), nullable=False, index=True
     )
-    phash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    dhash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    whash: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    phash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    dhash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    whash: Mapped[int] = mapped_column(Uint64, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = _ts()
@@ -131,9 +162,9 @@ class GlobalHash(Base):
     __tablename__ = "global_hashes"
 
     hash_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    phash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    dhash: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    whash: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    phash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    dhash: Mapped[int] = mapped_column(Uint64, nullable=False)
+    whash: Mapped[int] = mapped_column(Uint64, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="candidate", nullable=False, index=True)
     campaign_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     signature: Mapped[str | None] = mapped_column(Text, nullable=True)

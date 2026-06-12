@@ -69,6 +69,26 @@ async def test_guild_hash_repo_scopes_to_guild(session: AsyncSession) -> None:
     assert [h.hash_id for h in active1] == ["h1"]
 
 
+async def test_guild_hash_stores_full_range_uint64(session: AsyncSession) -> None:
+    # Regression: real perceptual hashes are unsigned 64-bit and routinely have
+    # the high bit set (>= 2**63), but the storage column is a *signed* int8.
+    # The Uint64 type maps them through two's complement so they round-trip
+    # losslessly instead of overflowing on insert.
+    await _make_guild(session, 1)
+    repo = GuildHashRepository(session, guild_id=1)
+    big = (1 << 64) - 1  # max uint64, high bit set
+    mid = 1 << 63  # exactly the signed int8 overflow boundary
+    await repo.add(GuildHash(hash_id="hi", phash=big, dhash=mid, whash=0, ahash=big))
+
+    session.expire_all()  # force a fresh read through process_result_value
+    stored = await repo.get("hi")
+    assert stored is not None
+    assert stored.phash == big
+    assert stored.dhash == mid
+    assert stored.whash == 0
+    assert stored.ahash == big
+
+
 async def test_guild_hash_remove_is_scoped(session: AsyncSession) -> None:
     await _make_guild(session, 1)
     await _make_guild(session, 2)
