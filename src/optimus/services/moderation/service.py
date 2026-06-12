@@ -38,7 +38,7 @@ from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit, RateLimiter, RedisRateLimiter
-from optimus.core.readiness import nats_check, redis_check
+from optimus.core.readiness import db_check, nats_check, redis_check
 from optimus.db.engine import (
     SessionScope,
     create_engine,
@@ -296,7 +296,12 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
 
     import redis.asyncio as aioredis
 
-    redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+    redis = aioredis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_timeout=settings.redis_socket_timeout,
+        socket_connect_timeout=settings.redis_socket_timeout,
+    )
 
     import hikari
 
@@ -321,6 +326,10 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
     health.add_readiness_check(nats_check(nc), name="nats")
+    # Moderation persists case/action rows; with Postgres down it can only
+    # nak-and-redeliver. Gate readiness on the DB so the probe is honest during a
+    # DB outage, consistent with detection and interactions.
+    health.add_readiness_check(db_check(scope), name="postgres")
     health.add_readiness_check(redis_check(redis), name="redis")
     await health.start()
 

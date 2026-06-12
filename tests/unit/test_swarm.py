@@ -75,3 +75,31 @@ def test_min_guilds_must_be_positive() -> None:
 def test_window_seconds_property() -> None:
     correlator = SwarmCorrelator(_FakeRedis(), window_seconds=120)
     assert correlator.window_seconds == 120
+
+
+class _ExplodingRedis:
+    """``eval`` always raises, simulating a Redis outage during observation."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def eval(self, *_args: object) -> int:
+        self.calls += 1
+        raise ConnectionError("redis down")
+
+
+async def test_observe_fails_safe_on_redis_error() -> None:
+    from optimus.services.detection.swarm import REDIS_SWARM_FALLBACK
+
+    redis = _ExplodingRedis()
+    correlator = SwarmCorrelator(redis, min_guilds=3, window_seconds=300)
+    before = REDIS_SWARM_FALLBACK._value.get()
+
+    obs = await correlator.observe(phash=0xABC, guild_id=1)
+
+    # Degrades to non-swarming rather than propagating the Redis error, so the
+    # caller (detection worker) keeps the per-image verdict and never naks.
+    assert obs.distinct_guilds == 0
+    assert not obs.is_swarming
+    assert redis.calls == 1
+    assert REDIS_SWARM_FALLBACK._value.get() == before + 1

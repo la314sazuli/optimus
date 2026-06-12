@@ -76,16 +76,20 @@ services:
   nats:
     image: nats:2.10-alpine
     restart: unless-stopped
-    # JetStream is required (bounded streams + pull consumers); -m exposes the
-    # monitoring port used by the healthcheck. --max_payload is raised well
-    # above the NATS 1 MiB default because images ride inline as base64 in
-    # image_fetched events: a raw image up to OPTIMUS_INGEST_MAX_INLINE_BYTES
-    # (default 8 MiB) inflates ~4/3 plus a JSON envelope, so the server must
-    # accept ~11 MiB. 12 MiB leaves headroom. The ingest service validates the
-    # configured inline cap against this negotiated limit at startup and fails
-    # fast if it is too small, so a mismatch can never silently drop images.
-    command: ["-js", "-sd", "/data", "-m", "8222", "--max_payload", "12582912"]
+    # JetStream, the monitoring port (8222, used by the healthcheck), and the
+    # raised max_payload all come from a mounted config file. max_payload must
+    # be set in configuration: nats-server does NOT accept it as a CLI flag
+    # (passing `--max_payload` crashes the server with "flag provided but not
+    # defined"). It is raised well above the NATS 1 MiB default because images
+    # ride inline as base64 in image_fetched events: a raw image up to
+    # OPTIMUS_INGEST_MAX_INLINE_BYTES (default 8 MiB) inflates ~4/3 plus a JSON
+    # envelope, so the server must accept ~11 MiB. 12 MiB leaves headroom. The
+    # ingest service validates the configured inline cap against this negotiated
+    # limit at startup and fails fast if it is too small, so a mismatch can
+    # never silently drop images.
+    command: ["-c", "/etc/nats/nats.conf"]
     volumes:
+      - ./monitoring/nats.conf:/etc/nats/nats.conf:ro
       - nats-data:/data
     healthcheck:
       # The monitoring /healthz endpoint reports JetStream readiness too.
