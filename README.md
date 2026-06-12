@@ -50,7 +50,36 @@ For a deeper treatment — the full message flow, the detection pipeline, where
 state lives, and where the resilience controls sit (with diagrams) — see
 [`docs/architecture.md`](docs/architecture.md).
 
-## Quickstart (self-hosted)
+## Quickstart (Docker Compose)
+
+The fastest way to self-host: one image runs every service, and Compose brings
+up the backing stores (PostgreSQL, Redis, JetStream-enabled NATS), applies
+migrations, and starts the six services. Requires Docker with the Compose plugin.
+
+```bash
+# 1. Configure
+cp .env.example .env
+# edit .env: set OPTIMUS_DISCORD_TOKEN (and POSTGRES_PASSWORD for non-local use)
+
+# 2. Build the image and start the whole stack
+docker compose up --build
+```
+
+Compose runs the `migrate` one-shot (`alembic upgrade head`) before the services
+start, and gates each service on the datastores reporting healthy. The services'
+`/readyz` probes drive the container healthchecks. Slash commands still need a
+one-time registration:
+
+```bash
+docker compose run --rm gateway python scripts/register_commands.py
+```
+
+The image is multi-stage (uv installs the locked, `--frozen` dependency set; the
+final stage is a slim, non-root `python:3.12-slim` with only runtime deps) and
+service-agnostic — select a service via its command, e.g.
+`python -m optimus.services.detection`.
+
+## Quickstart (self-hosted, no Docker)
 
 Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), and reachable
 PostgreSQL, Redis, and NATS instances.

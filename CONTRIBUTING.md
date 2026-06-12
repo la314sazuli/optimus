@@ -93,6 +93,26 @@ event bus. Each is a module entrypoint and runs in its own process. They need
 PostgreSQL, Redis, and JetStream-enabled NATS reachable via the `OPTIMUS_*`
 settings.
 
+### Docker Compose (full stack)
+
+The quickest way to get every service plus its datastores running:
+
+```bash
+cp .env.example .env          # set OPTIMUS_DISCORD_TOKEN
+docker compose up --build     # postgres + redis + nats + migrate + 6 services
+```
+
+Compose starts PostgreSQL, Redis, and NATS (with JetStream), runs the `migrate`
+one-shot (`alembic upgrade head`) once they are healthy, then starts the six
+services — each gated on the datastores' healthchecks and the migration
+completing. Container healthchecks hit each service's `/readyz`. Register slash
+commands once with `docker compose run --rm gateway python
+scripts/register_commands.py`. The image (see [`Dockerfile`](Dockerfile)) is a
+single multi-stage build shared by all services; the service is chosen by the
+container `command`.
+
+### Manual (uv, separate processes)
+
 ```bash
 # 1. Configure
 cp .env.example .env

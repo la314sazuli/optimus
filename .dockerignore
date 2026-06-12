@@ -1,0 +1,56 @@
+# Keep the build context small and deterministic. Only the lockfile, project
+# metadata, and the directories the image actually needs are copied in the
+# Dockerfile; everything below is excluded so it can never invalidate caches or
+# leak into an image.
+
+# Version control
+.git
+.gitignore
+.github
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Local environment / secrets (never bake real secrets into an image)
+.env
+.env.*
+!.env.example
+
+# Testing / coverage / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+*.log
+*.sqlite
+*.db
+
+# Not needed at runtime
+tests/
+docs/
+benchmarks/
+*.md
+!README.md
+.pre-commit-config.yaml
+
+# Container/compose files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.yaml
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
