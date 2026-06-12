@@ -276,6 +276,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     rest_app = hikari.RESTApp()
     await rest_app.start()
     rest = rest_app.acquire(settings.discord_token, token_type=hikari.TokenType.BOT)
+    rest.start()
     me = await rest.fetch_my_user()
     bot_user_id = int(me.id)
 
@@ -330,6 +331,8 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     finally:
         health.set_live(False)
         stop.set()
+        with contextlib.suppress(Exception):
+            await rest.close()
         with contextlib.suppress(Exception):
             await rest_app.close()
         with contextlib.suppress(Exception):

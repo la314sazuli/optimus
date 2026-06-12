@@ -8,10 +8,13 @@
 # (3.12); dependencies are installed from the committed `uv.lock` with
 # `--frozen` so the image is fully reproducible.
 
+# Runtime uses the full patch tag (published on Docker Hub); the uv builder
+# image only publishes minor-version python tags, so it is pinned separately.
 ARG PYTHON_VERSION=3.12.8
+ARG UV_PYTHON_TAG=python3.12
 
 # ---- Builder: resolve and install the locked dependency set -----------------
-FROM ghcr.io/astral-sh/uv:0.11.21-python${PYTHON_VERSION}-bookworm-slim AS builder
+FROM ghcr.io/astral-sh/uv:0.9.9-${UV_PYTHON_TAG}-bookworm-slim AS builder
 
 # Bytecode-compile on install and copy (not link) packages into the venv so the
 # result is self-contained and relocatable into the runtime stage.
