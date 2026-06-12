@@ -426,6 +426,92 @@ async def test_redis_rate_limit_rejects_nonpositive_cost() -> None:
     limit = RateLimit(capacity=2.0, refill_rate=1.0)
     with pytest.raises(ValueError, match="cost must be positive"):
         await limiter.acquire("k", limit, cost=0)
+    with pytest.raises(ValueError, match="cost must be positive"):
+        await limiter.acquire("k", limit, cost=-1)
+
+
+class _LuaBucketRedis:
+    """A fake ``eval`` that executes the token-bucket *semantics* in Python.
+
+    fakeredis ships no Lua interpreter, so to exercise refill/burst/atomicity we
+    reimplement the script's read-modify-write here against an in-process hash.
+    The single ``eval`` coroutine performs the whole bucket update with no await
+    between the read and the write, mirroring the server-side atomicity of a real
+    Redis ``EVAL`` — that is what lets the concurrency test assert no overspend.
+    """
+
+    def __init__(self) -> None:
+        self._buckets: dict[str, tuple[float, float]] = {}
+        self.calls = 0
+
+    async def eval(self, _script: str, _numkeys: int, *args: object) -> int:
+        self.calls += 1
+        key = str(args[0])
+        capacity, refill, cost, now = (float(a) for a in args[1:5])  # type: ignore[arg-type]
+        tokens, ts = self._buckets.get(key, (capacity, now))
+        elapsed = max(0.0, now - ts)
+        tokens = min(capacity, tokens + elapsed * refill)
+        allowed = 0
+        if tokens >= cost:
+            allowed = 1
+            tokens -= cost
+        self._buckets[key] = (tokens, now)
+        return allowed
+
+
+async def test_redis_limiter_burst_then_refill(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis = _LuaBucketRedis()
+    limiter = RedisRateLimiter(redis)
+    limit = RateLimit(capacity=2.0, refill_rate=1.0)
+    # Pin the wall clock the limiter passes as ARGV[4] so refill is deterministic.
+    t = {"now": 1000.0}
+    monkeypatch.setattr("optimus.core.ratelimit.time.time", lambda: t["now"])
+
+    assert await limiter.acquire("g", limit) is True  # burst 1/2
+    assert await limiter.acquire("g", limit) is True  # burst 2/2
+    assert await limiter.acquire("g", limit) is False  # drained
+    t["now"] += 1.0  # one token refilled
+    assert await limiter.acquire("g", limit) is True
+    assert await limiter.acquire("g", limit) is False
+
+
+async def test_redis_limiter_concurrent_acquire_is_atomic() -> None:
+    # capacity 5, fired concurrently 20x: exactly 5 must be allowed, no overspend.
+    redis = _LuaBucketRedis()
+    limiter = RedisRateLimiter(redis)
+    limit = RateLimit(capacity=5.0, refill_rate=0.001)  # negligible refill in-test
+    results = await asyncio.gather(*(limiter.acquire("g", limit) for _ in range(20)))
+    assert sum(results) == 5
+    assert redis.calls == 20
+
+
+class _ExplodingRedis:
+    """``eval`` always raises, simulating a runtime Redis outage."""
+
+    async def eval(self, *_args: object) -> int:
+        raise ConnectionError("redis down")
+
+
+async def test_redis_limiter_falls_back_to_in_memory_on_error() -> None:
+    from optimus.core.ratelimit import REDIS_RATELIMIT_FALLBACK
+
+    fallback = InMemoryRateLimiter()
+    limiter = RedisRateLimiter(_ExplodingRedis(), fallback=fallback)
+    limit = RateLimit(capacity=1.0, refill_rate=0.0001)
+
+    before = REDIS_RATELIMIT_FALLBACK._value.get()
+    assert await limiter.acquire("k", limit) is True  # served by fallback
+    assert await limiter.acquire("k", limit) is False  # fallback now drained
+    assert REDIS_RATELIMIT_FALLBACK._value.get() == before + 2
+    # The fallback owns the bucket state, proving the request path was served.
+    assert "k" in fallback._buckets
+
+
+async def test_redis_limiter_reraises_when_no_fallback() -> None:
+    limiter = RedisRateLimiter(_ExplodingRedis())
+    limit = RateLimit(capacity=1.0, refill_rate=1.0)
+    with pytest.raises(ConnectionError):
+        await limiter.acquire("k", limit)
 
 
 async def test_evict_idle_keeps_actively_throttled_buckets() -> None:

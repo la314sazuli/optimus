@@ -36,7 +36,7 @@ from optimus.core.circuit import CircuitBreaker
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
-from optimus.core.ratelimit import RateLimit, RedisRateLimiter
+from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit, RedisRateLimiter
 from optimus.core.readiness import nats_check, redis_check
 from optimus.db.engine import (
     SessionScope,
@@ -126,7 +126,13 @@ def build_coordinator(
     bot_user_id: int,
 ) -> ModerationCoordinator:
     """Wire a :class:`ModerationCoordinator` from settings and shared clients."""
-    rate_limiter = RedisRateLimiter(redis, prefix=settings.ratelimit_redis_prefix)
+    # A runtime Redis outage degrades to a per-process per-guild bucket rather
+    # than crashing the action path; the bucket count is bounded by guild count.
+    rate_limiter = RedisRateLimiter(
+        redis,
+        prefix=settings.ratelimit_redis_prefix,
+        fallback=InMemoryRateLimiter(),
+    )
     cooldown = Cooldown(redis, window_seconds=settings.mod_dm_cooldown_seconds)
     guard = _ActionIdempotency(redis)
 

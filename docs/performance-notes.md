@@ -67,6 +67,37 @@ Findings from the Cycle 6 performance/async pass. Each entry is either **fixed**
   injects it. Defaults are preserved exactly (5 / 30.0). Covered by
   `test_build_coordinator_wires_circuit_settings`.
 
+## Scaling
+
+### Distributed rate limiting for multi-replica deployments (`scale/redis-ratelimit`)
+- **Location:** `src/optimus/core/ratelimit.py` (`RedisRateLimiter`,
+  `build_rate_limiter`); `src/optimus/core/config.py` (`RateLimitBackend`,
+  `ratelimit_backend`); service wiring in `ingest`, `interactions`, `moderation`.
+- **Problem:** the in-memory token buckets are per-process, so running N replicas
+  of a service multiplies the effective limit by N — a "20 fetches/guild/s" cap
+  becomes 20·N once you scale out.
+- **Fix:** `RedisRateLimiter` evaluates a token bucket inside a single Redis Lua
+  `EVAL`. The read-modify-write is atomic on the server, so concurrent
+  acquisitions from any number of replicas share one bucket with no read/write
+  race (`test_redis_limiter_concurrent_acquire_is_atomic` asserts exactly
+  `capacity` allows out of a concurrent burst). The bucket key carries a TTL of
+  `ceil(capacity/refill)+1`s so idle keys expire server-side.
+- **Backend selection:** `Settings.ratelimit_backend` is `memory` (default) or
+  `redis`, wired through the shared `build_rate_limiter`. **Defaulting to
+  `memory` means single-node self-hosters see zero behavioural change**; only
+  multi-replica operators opt into `redis`.
+- **Graceful degradation:** the Redis backend is built with an in-memory
+  `fallback`. If Redis errors at runtime (connection loss, timeout, script
+  error) `acquire` **falls back to a process-local bucket rather than failing
+  open** (which would allow unlimited traffic) **or crashing the request path.**
+  This bounds load per replica during the outage; the only cost is that the
+  shared limit is temporarily multiplied by replica count — strictly safer than
+  fail-open. Each fallback increments `optimus_ratelimit_redis_fallback_total`
+  and logs `ratelimit_redis_fallback`, so an outage is observable. Covered by
+  `test_redis_limiter_falls_back_to_in_memory_on_error`. With no fallback wired
+  the error is re-raised (`test_redis_limiter_reraises_when_no_fallback`), so the
+  policy is always explicit at the call site.
+
 ## Documented (real, deferred — too invasive for a single-fix pass)
 
 ### Unused `_use_embedding` flag on the detection worker

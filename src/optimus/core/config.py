@@ -24,6 +24,18 @@ class Sensitivity(StrEnum):
     PERMISSIVE = "permissive"
 
 
+class RateLimitBackend(StrEnum):
+    """Rate-limiter backend selection.
+
+    ``MEMORY`` keeps the legacy per-process token bucket (correct for a single
+    replica). ``REDIS`` shares one bucket across replicas via Redis so effective
+    limits do not multiply with replica count.
+    """
+
+    MEMORY = "memory"
+    REDIS = "redis"
+
+
 class Settings(BaseSettings):
     """Runtime settings.
 
@@ -87,6 +99,11 @@ class Settings(BaseSettings):
     detection_guild_index_cap: int = Field(default=1024, ge=1)
 
     # Rate limiting
+    #: Limiter backend. ``memory`` (default) is per-process and correct for a
+    #: single replica; ``redis`` shares one bucket across replicas so effective
+    #: limits do not multiply with replica count. Defaulting to ``memory`` means
+    #: single-node self-hosters see zero behavioural change.
+    ratelimit_backend: RateLimitBackend = RateLimitBackend.MEMORY
     ratelimit_redis_prefix: str = "optimus:rl"
     #: Opportunistic idle-bucket sweep cadence for the interactions in-memory
     #: rate-limiter fallback (seconds), used only when Redis is unavailable.

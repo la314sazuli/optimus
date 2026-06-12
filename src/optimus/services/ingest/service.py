@@ -16,10 +16,9 @@ from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import (
-    InMemoryRateLimiter,
     RateLimit,
     RateLimiter,
-    RedisRateLimiter,
+    build_rate_limiter,
 )
 from optimus.core.readiness import nats_check, redis_check
 from optimus.ingest.fetcher import FetchedImage, fetch_image
@@ -41,12 +40,13 @@ async def _handle(worker: IngestWorker, bus: EventBus, event: MessageImageEvent)
 
 def build_worker(settings: Settings, redis: object | None) -> IngestWorker:
     """Construct an :class:`IngestWorker` with the configured fetch + limiter."""
-    limiter: RateLimiter = (
-        RedisRateLimiter(redis, prefix=settings.ratelimit_redis_prefix)
-        if redis is not None
-        # Degraded (no-Redis) fallback: opportunistically sweep idle guild
-        # buckets so the process-local map cannot grow without bound.
-        else InMemoryRateLimiter(sweep_interval=settings.ingest_inmemory_sweep_seconds)
+    limiter: RateLimiter = build_rate_limiter(
+        settings,
+        redis,
+        # Degraded fallback (no Redis, or a runtime Redis outage):
+        # opportunistically sweep idle guild buckets so the process-local map
+        # cannot grow without bound.
+        sweep_interval=settings.ingest_inmemory_sweep_seconds,
     )
     rate = RateLimit(
         capacity=settings.ingest_fetch_rate_capacity,

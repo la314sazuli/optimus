@@ -13,8 +13,8 @@ from __future__ import annotations
 from typing import cast
 
 from optimus.bus.nats import EventBus
-from optimus.core.config import get_settings
-from optimus.core.ratelimit import InMemoryRateLimiter
+from optimus.core.config import RateLimitBackend, get_settings
+from optimus.core.ratelimit import InMemoryRateLimiter, RedisRateLimiter
 from optimus.services.detection.service import build_service
 from optimus.services.ingest.service import build_worker
 from optimus.services.interactions.service import build_rate_limiter
@@ -61,3 +61,39 @@ def test_build_rate_limiter_wires_interactions_inmemory_sweep() -> None:
     limiter2 = build_rate_limiter(custom, redis=None)
     assert isinstance(limiter2, InMemoryRateLimiter)
     assert limiter2.sweep_interval == 99.0
+
+
+def test_backend_defaults_to_memory_even_with_redis_present() -> None:
+    # Default backend is ``memory`` so single-node self-hosters see no change;
+    # a Redis client being available must not flip the backend on its own.
+    settings = get_settings()
+    assert settings.ratelimit_backend is RateLimitBackend.MEMORY
+
+    limiter = build_rate_limiter(settings, redis=cast(object, object()))
+    assert isinstance(limiter, InMemoryRateLimiter)
+
+    worker = build_worker(settings, redis=cast(object, object()))
+    assert isinstance(worker._limiter, InMemoryRateLimiter)
+
+
+def test_redis_backend_builds_redis_limiter_with_inmemory_fallback() -> None:
+    settings = get_settings().model_copy(update={"ratelimit_backend": RateLimitBackend.REDIS})
+    redis = cast(object, object())
+
+    limiter = build_rate_limiter(settings, redis)
+    assert isinstance(limiter, RedisRateLimiter)
+    # The Redis backend must carry an in-memory fallback for graceful degradation.
+    assert isinstance(limiter._fallback, InMemoryRateLimiter)
+    assert limiter._prefix == settings.ratelimit_redis_prefix
+
+    # Same wiring through the ingest builder.
+    worker = build_worker(settings, redis)
+    assert isinstance(worker._limiter, RedisRateLimiter)
+    assert isinstance(worker._limiter._fallback, InMemoryRateLimiter)
+
+
+def test_redis_backend_without_client_uses_in_memory() -> None:
+    # Backend requested as redis but no client opened => safe in-memory limiter.
+    settings = get_settings().model_copy(update={"ratelimit_backend": RateLimitBackend.REDIS})
+    limiter = build_rate_limiter(settings, redis=None)
+    assert isinstance(limiter, InMemoryRateLimiter)

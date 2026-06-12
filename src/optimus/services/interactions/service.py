@@ -330,16 +330,20 @@ def _component_context(interaction: Any) -> InteractionContext:  # pragma: no co
 
 
 def build_rate_limiter(settings: Settings, redis: object | None) -> RateLimiter:
-    """Construct the interactions limiter: Redis-backed, or an in-memory fallback.
+    """Construct the interactions limiter per ``settings.ratelimit_backend``.
 
-    The fallback opportunistically sweeps idle per-user buckets so the
-    process-local map cannot grow without bound while Redis is unavailable.
+    The Redis backend carries an in-memory fallback that opportunistically
+    sweeps idle per-user buckets, so a runtime Redis outage degrades to
+    per-process limiting (never crashing the request path) without the
+    process-local map growing without bound.
     """
-    from optimus.core.ratelimit import InMemoryRateLimiter, RedisRateLimiter
+    from optimus.core.ratelimit import build_rate_limiter as _build
 
-    if redis is not None:
-        return RedisRateLimiter(redis)
-    return InMemoryRateLimiter(sweep_interval=settings.interactions_inmemory_sweep_seconds)
+    return _build(
+        settings,
+        redis,
+        sweep_interval=settings.interactions_inmemory_sweep_seconds,
+    )
 
 
 def _open_redis(settings: Settings) -> object | None:  # pragma: no cover - boot glue
