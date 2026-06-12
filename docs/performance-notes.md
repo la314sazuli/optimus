@@ -3,6 +3,46 @@
 Findings from the Cycle 6 performance/async pass. Each entry is either **fixed**,
 **documented** (real but deferred), or **ruled out** (investigated, no change).
 
+## Throughput baseline
+
+Measured by `python -m benchmarks.load`, a throughput load-test harness that
+pushes N synthetic images (the same deterministic corpus the accuracy benchmark
+uses) through the real `DetectionWorker.handle` with a configurable number
+concurrently in flight. It exercises the full production path — the sandboxed
+decode *subprocess*, perceptual hashing (both offloaded via `asyncio.to_thread`),
+BK-tree candidate gather, and the ensemble vote — over in-process fakes for the
+index/whitelist/sensitivity/idempotency hooks (no NATS/Redis/Postgres). Queue
+arrival is simulated with a saturated asyncio job pool, so each row is a
+sustained, always-busy worst case. See `benchmarks/load/`.
+
+**Machine caveat:** numbers below were captured in the CI-class sandbox this repo
+develops on — **2 vCPU, 8 GB RAM**, Linux. They characterize *one* detection
+replica on that hardware; absolute images/sec scales with core count (the decode
+subprocess is CPU-bound), so production replicas on larger instances will differ.
+Use these for relative reasoning and onboarding sizing, not as an SLO.
+
+Command: `python -m benchmarks.load --concurrency 1 2 4 8 --images 200`
+(corpus: 66 distinct images, cycled to 200 per level).
+
+| Concurrency | Images | Wall (s) | Images/s | p50 (ms) | p95 (ms) | p99 (ms) | mean (ms) | max (ms) | Peak RSS (MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 200 | 28.77 | 7.0 | 141.8 | 161.2 | 176.2 | 143.8 | 181.1 | 116.8 |
+| 2 | 200 | 21.40 | 9.3 | 212.2 | 252.8 | 266.0 | 213.7 | 285.9 | 127.2 |
+| 4 | 200 | 21.46 | 9.3 | 434.8 | 495.6 | 509.2 | 427.4 | 538.7 | 127.2 |
+| 8 | 200 | 20.67 | 9.7 | 781.7 | 1191.5 | 1300.0 | 818.8 | 1311.3 | 127.2 |
+
+**Reading the table.** Sustained throughput is **~7 images/sec single-flight and
+saturates at ~9–10 images/sec by concurrency 2** — exactly the 2-vCPU ceiling,
+since each image's dominant cost is the CPU-bound decode subprocess (~140 ms
+single-flight, the p50 at concurrency 1). Pushing concurrency past the core count
+does **not** raise throughput; it only deepens the in-flight queue, so per-image
+end-to-end latency climbs ~linearly (p50 141 ms → 782 ms from c=1 to c=8) while
+images/sec stays flat. Peak RSS is modest and stable (~117–127 MB) and does not
+grow with concurrency, so a replica is CPU- not memory-bound. **Sizing rule of
+thumb:** budget roughly `~3.5 images/sec per vCPU` per detection replica and set
+the in-flight concurrency near the replica's core count — higher only trades
+latency for nothing.
+
 ## Fixed
 
 ### Blocking decode + hashing on the detection event loop
