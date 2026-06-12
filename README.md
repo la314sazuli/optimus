@@ -113,6 +113,11 @@ current baseline is documented in [`docs/eval/baseline.md`](docs/eval/baseline.m
 precision and false-positive rate are **perfect** across all presets, with recall
 trading off per sensitivity — the right bias for an auto-moderation action.
 
+For a deeper offline evaluation — a synthetic corpus run through the real
+pipeline across a full threshold sweep, with per-perturbation recall and a
+recommended operating point — run `python -m benchmarks`. See
+[`docs/detection-eval.md`](docs/detection-eval.md) for usage and findings.
+
 ## Security model
 
 - **SSRF defense.** Untrusted image URLs are validated by

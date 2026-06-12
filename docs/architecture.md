@@ -374,6 +374,7 @@ The two places untrusted input enters the system are hardened in depth; the
 - Event contracts and subjects: [`contracts/events.py`](../src/optimus/contracts/events.py)
 - Runtime configuration and bounds: [`core/config.py`](../src/optimus/core/config.py) / [`.env.example`](../.env.example)
 - Detection-quality baseline: [`docs/eval/baseline.md`](eval/baseline.md)
+- Detection-quality eval harness: [`docs/detection-eval.md`](detection-eval.md)
 - Security model verification: [`docs/security-audit.md`](security-audit.md)
 - Performance / async-correctness notes: [`docs/performance-notes.md`](performance-notes.md)
 - Contributor workflow: [`CONTRIBUTING.md`](../CONTRIBUTING.md)
