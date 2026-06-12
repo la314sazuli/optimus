@@ -18,9 +18,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 
+import pytest
 from pydantic import BaseModel
 
-from optimus.bus.nats import NATS_MSG_ID_HEADER, EventBus
+from optimus.bus.nats import (
+    NATS_MSG_ID_HEADER,
+    EventBus,
+    PayloadLimitError,
+    inline_wire_size,
+)
 
 
 class _Evt(BaseModel):
@@ -242,3 +248,53 @@ async def test_consume_sets_max_ack_pending_to_inflight() -> None:
     cfg = js.consumer_configs[0]
     assert cfg.max_ack_pending == 7  # type: ignore[attr-defined]
     assert cfg.ack_wait == 42.0  # type: ignore[attr-defined]
+
+
+# --- inline-payload capacity validation -------------------------------------
+
+
+def test_inline_wire_size_accounts_for_base64_and_envelope() -> None:
+    # Base64 inflates raw bytes ~4/3; a fixed envelope allowance is added on top.
+    raw = 3_000_000
+    size = inline_wire_size(raw)
+    assert size > raw * 4 // 3
+    assert size >= raw  # monotonic, never undercounts
+
+
+def test_validate_inline_capacity_passes_when_server_fits() -> None:
+    # 8 MiB inline -> ~11 MiB wire; a 12 MiB server max_payload accommodates it.
+    bus = EventBus(_FakeJetStream(), max_payload=12 * 1024 * 1024)  # type: ignore[arg-type]
+    bus.validate_inline_capacity(8 * 1024 * 1024)  # no raise
+
+
+def test_validate_inline_capacity_rejects_when_server_too_small() -> None:
+    # The shipped-default mismatch: 8 MiB inline cap vs the NATS 1 MiB default.
+    bus = EventBus(_FakeJetStream(), max_payload=1 * 1024 * 1024)  # type: ignore[arg-type]
+    with pytest.raises(PayloadLimitError):
+        bus.validate_inline_capacity(8 * 1024 * 1024)
+
+
+def test_validate_inline_capacity_skips_when_max_payload_unknown() -> None:
+    # No server INFO observed: skip rather than guess (cannot validate).
+    bus = EventBus(_FakeJetStream(), max_payload=None)  # type: ignore[arg-type]
+    bus.validate_inline_capacity(64 * 1024 * 1024)  # no raise
+
+
+async def test_connect_captures_server_max_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    class _FakeClient:
+        max_payload = 9_999_999
+
+        def jetstream(self) -> _FakeJetStream:
+            return _FakeJetStream()
+
+    async def _fake_connect(url: str) -> _FakeClient:
+        return _FakeClient()
+
+    class _FakeNatsModule:
+        connect = staticmethod(_fake_connect)
+
+    monkeypatch.setitem(sys.modules, "nats", _FakeNatsModule)
+    bus, _nc = await EventBus.connect("nats://x")
+    assert bus.max_payload == 9_999_999

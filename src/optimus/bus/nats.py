@@ -73,23 +73,86 @@ DEFAULT_ACK_WAIT_SECONDS = 60
 DEFAULT_MAX_ACK_PENDING = 16
 
 
+# A base64-encoded image inflates to ceil(n/3)*4 ~= 4/3 the raw bytes; the
+# surrounding JSON envelope (ids, sha256, content-type, timestamps) and the
+# ``Nats-Msg-Id`` header add a small fixed overhead. This factor + slack is the
+# worst-case wire size a raw inline image of ``n`` bytes occupies on NATS, used
+# to validate the configured inline cap against the server's ``max_payload``.
+_BASE64_INFLATION = 4 / 3
+#: Fixed bytes reserved for the JSON envelope and NATS headers around the
+#: base64 image field. Generous: the real envelope is a few hundred bytes.
+_ENVELOPE_OVERHEAD_BYTES = 4096
+
+
+def inline_wire_size(raw_bytes: int) -> int:
+    """Worst-case NATS wire size for an inline image of ``raw_bytes`` raw bytes.
+
+    Accounts for base64 inflation of the image field plus a fixed allowance for
+    the surrounding JSON envelope and the ``Nats-Msg-Id`` header. Used to check
+    that ``ingest_max_inline_bytes`` actually fits the server's ``max_payload``
+    before publishing, rather than discovering it as a runtime publish failure.
+    """
+    return int(raw_bytes * _BASE64_INFLATION) + _ENVELOPE_OVERHEAD_BYTES
+
+
+class PayloadLimitError(RuntimeError):
+    """Raised when the configured inline image cap exceeds the NATS max_payload.
+
+    Failing fast at startup is far better than the silent alternative: an
+    in-bounds image whose base64 wire form exceeds ``max_payload`` raises
+    ``MaxPayloadError`` deep in the publish path, is nak'd and redelivered until
+    ``max_deliver`` is exhausted, then dropped — so the image is never scanned
+    and nothing surfaces beyond a redelivery/drop metric.
+    """
+
+
 class EventBus:
     """Thin wrapper over a JetStream context for publishing and consuming events."""
 
-    def __init__(self, js: JetStreamContext) -> None:
+    def __init__(self, js: JetStreamContext, *, max_payload: int | None = None) -> None:
         self._js = js
+        self._max_payload = max_payload
 
     @classmethod
     async def connect(cls, url: str) -> tuple[EventBus, Any]:
         """Connect to NATS and return an :class:`EventBus` plus the raw client.
 
         The caller owns the returned client and is responsible for draining it.
+        The server-negotiated ``max_payload`` (from the connection INFO) is
+        captured so the publish-size budget can be validated up front.
         """
         import nats as _nats
 
         nc = await _nats.connect(url)
         js = nc.jetstream()
-        return cls(js), nc
+        return cls(js, max_payload=nc.max_payload), nc
+
+    @property
+    def max_payload(self) -> int | None:
+        """Server-negotiated max publish size in bytes (``None`` if unknown)."""
+        return self._max_payload
+
+    def validate_inline_capacity(self, max_inline_bytes: int) -> None:
+        """Ensure an inline image at the configured cap fits the server max_payload.
+
+        Raises :class:`PayloadLimitError` if the worst-case wire size of an image
+        at ``max_inline_bytes`` would exceed the connected server's
+        ``max_payload``. Self-hosters must either raise the NATS ``max_payload``
+        (see ``docker-compose.yml``) or lower ``OPTIMUS_INGEST_MAX_INLINE_BYTES``.
+        A ``None`` ``max_payload`` (server INFO not seen) skips the check.
+        """
+        if self._max_payload is None:
+            return
+        needed = inline_wire_size(max_inline_bytes)
+        if needed > self._max_payload:
+            raise PayloadLimitError(
+                "ingest_max_inline_bytes is too large for the NATS server's "
+                f"max_payload: an image of {max_inline_bytes:,} raw bytes needs "
+                f"~{needed:,} wire bytes (base64 + envelope) but the server "
+                f"accepts only {self._max_payload:,}. Raise the NATS server "
+                "max_payload (docker-compose.yml passes --max_payload) to at "
+                f"least {needed:,}, or lower OPTIMUS_INGEST_MAX_INLINE_BYTES."
+            )
 
     async def ensure_stream(
         self,

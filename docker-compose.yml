@@ -77,8 +77,14 @@ services:
     image: nats:2.10-alpine
     restart: unless-stopped
     # JetStream is required (bounded streams + pull consumers); -m exposes the
-    # monitoring port used by the healthcheck.
-    command: ["-js", "-sd", "/data", "-m", "8222"]
+    # monitoring port used by the healthcheck. --max_payload is raised well
+    # above the NATS 1 MiB default because images ride inline as base64 in
+    # image_fetched events: a raw image up to OPTIMUS_INGEST_MAX_INLINE_BYTES
+    # (default 8 MiB) inflates ~4/3 plus a JSON envelope, so the server must
+    # accept ~11 MiB. 12 MiB leaves headroom. The ingest service validates the
+    # configured inline cap against this negotiated limit at startup and fails
+    # fast if it is too small, so a mismatch can never silently drop images.
+    command: ["-js", "-sd", "/data", "-m", "8222", "--max_payload", "12582912"]
     volumes:
       - nats-data:/data
     healthcheck:

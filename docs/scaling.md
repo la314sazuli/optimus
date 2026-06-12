@@ -12,6 +12,11 @@ is to find the bottleneck, scale only that, and confirm with metrics before
 moving on. Almost nothing here is required for a small self-host — the defaults
 are correct for a single replica.
 
+For a worked, measured capacity study of one very large server (can optimus run a
+single 800,000-member Discord guild?), including index-scaling, burst-absorption,
+REST-budget and Postgres-growth numbers and a tuned deployment recipe, see
+[capacity.md](capacity.md).
+
 ## At a glance
 
 | Pressure | Symptom | Lever | Section |

@@ -71,6 +71,11 @@ async def _amain() -> None:
     configure_logging(level=settings.log_level, service_name="optimus-ingest")
 
     bus, nc = await EventBus.connect(settings.nats_url)
+    # Fail fast if the inline-image cap cannot actually ride through NATS: an
+    # oversized publish would otherwise nak/redeliver/drop silently, so the
+    # image is never scanned. Better a loud startup error the operator can fix
+    # (raise the server max_payload or lower the inline cap) than silent loss.
+    bus.validate_inline_capacity(settings.ingest_max_inline_bytes)
     await bus.ensure_stream()
 
     redis = _open_redis(settings)
