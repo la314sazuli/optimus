@@ -68,10 +68,6 @@ from optimus.services.scheduler.service import SchedulerService
 _log = get_logger(__name__)
 
 
-class MissingTokenError(RuntimeError):
-    """Raised when simple mode is started without a Discord bot token."""
-
-
 @dataclass
 class SimpleApp:
     """A fully wired single-process Optimus, minus the live Discord connection.
@@ -251,17 +247,19 @@ class _NoopRest:
 async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
     """Entrypoint for ``OPTIMUS_MODE=simple``: compose and run everything.
 
-    Requires only ``OPTIMUS_DISCORD_TOKEN``. Brings up the SQLite schema, wires
-    every service over the in-process bus, starts the health/metrics server, and
-    connects the Discord gateway + interactions. Blocks until interrupted.
+    Requires only ``OPTIMUS_DISCORD_TOKEN``. Validates the few first-run mistakes
+    up front (see :func:`optimus.app.startup.validate_simple_startup`), brings up
+    the SQLite schema, wires every service over the in-process bus, starts the
+    health/metrics server, registers slash commands, and connects the Discord
+    gateway + interactions. Blocks until interrupted.
     """
     settings = get_settings()
     configure_logging(level=settings.log_level, service_name="optimus")
-    if not settings.discord_token:
-        raise MissingTokenError(
-            "OPTIMUS_DISCORD_TOKEN is required to run simple mode. Set it to your "
-            "bot token (see docs/simple-mode.md)."
-        )
+    _quiet_dependency_logs(settings.log_level)
+
+    from optimus.app.startup import validate_simple_startup
+
+    validate_simple_startup(settings)
 
     import hikari
 
@@ -272,10 +270,19 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
     me = await rest.fetch_my_user()
     bot_user_id = int(me.id)
 
+    await _register_commands(rest, bot_user_id)
+
     app = await SimpleApp.build(settings, rest=rest, bot_user_id=bot_user_id)
     await app.dispatcher.start()
     await app.health.start()
     app.start_pipeline()
+
+    _log.info(
+        "optimus_online",
+        bot=f"{me.username}#{me.discriminator}",
+        bot_id=bot_user_id,
+        health_url=f"http://{settings.health_host}:{settings.health_port}/healthz",
+    )
 
     from optimus.app.discord import run_discord_edges
 
@@ -288,3 +295,43 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
             await rest.close()
         with contextlib.suppress(Exception):
             await rest_app.close()
+
+
+async def _register_commands(rest: object, bot_user_id: int) -> None:  # pragma: no cover - net
+    """Register slash commands globally using the bot's own application id.
+
+    Simple mode owns one bot, so we register against the application that the
+    token already authenticates as — no separate ``OPTIMUS_DISCORD_CLIENT_ID`` or
+    manual ``scripts/register_commands.py`` run. Failure here (e.g. a transient
+    Discord 5xx) is logged and tolerated: the bot still runs, and commands can be
+    registered later with the script.
+    """
+    import hikari
+
+    from optimus.services.interactions.commands import build_command_builders
+
+    try:
+        await rest.set_application_commands(  # type: ignore[attr-defined]
+            hikari.Snowflake(bot_user_id),
+            build_command_builders(),
+        )
+    except Exception:
+        _log.warning("command_registration_failed", exc_info=True)
+        return
+    _log.info("commands_registered", scope="global")
+
+
+def _quiet_dependency_logs(level: str) -> None:
+    """Tone down third-party INFO chatter so simple-mode output stays readable.
+
+    hikari logs a wall of gateway/REST INFO lines on every connect. When the
+    operator is running at the default INFO level we lift those dependencies to
+    WARNING so Optimus's own ``optimus_online`` / detection logs are not buried;
+    an explicit ``OPTIMUS_LOG_LEVEL=DEBUG`` opts back into the full firehose.
+    """
+    import logging
+
+    if level.upper() == "DEBUG":
+        return
+    for name in ("hikari", "hikari.gateway", "hikari.rest"):
+        logging.getLogger(name).setLevel(logging.WARNING)

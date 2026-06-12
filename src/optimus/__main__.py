@@ -35,8 +35,17 @@ def main() -> None:
         raise SystemExit(2)
 
     from optimus.app.simple import run_simple
+    from optimus.app.startup import StartupError
 
-    asyncio.run(run_simple())
+    try:
+        asyncio.run(run_simple())
+    except StartupError as exc:
+        # A misconfiguration we caught on purpose: show the one-line fix, not a
+        # traceback that buries it.
+        print(f"Optimus could not start: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        raise SystemExit(0) from None
 
 
 if __name__ == "__main__":

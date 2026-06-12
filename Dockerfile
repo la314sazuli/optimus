@@ -77,5 +77,8 @@ USER optimus
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--"]
-# Default to the gateway; override per service in compose or `docker run`.
-CMD ["python", "-m", "optimus.services.gateway"]
+# Default to simple mode: the whole bot in one process (OPTIMUS_MODE=simple).
+# A single `docker run -e OPTIMUS_DISCORD_TOKEN=... optimus` runs the bot with no
+# external services. Distributed deployments override the command per service
+# (e.g. `python -m optimus.services.gateway`), as docker-compose.yml does.
+CMD ["python", "-m", "optimus"]

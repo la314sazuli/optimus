@@ -187,7 +187,6 @@ def build_service(
         idempotency_acquire=guard.acquire,
         swarm=swarm,
         limits=limits,
-        use_embedding=settings.embedding_enabled,
     )
     return DetectionService(settings, bus, worker, index_manager, scope)
 

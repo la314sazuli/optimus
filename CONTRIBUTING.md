@@ -67,7 +67,7 @@ Notes that bite people:
   `src/`, relaxed for `tests/`). If a `# noqa` is genuinely needed, scope it to
   the specific rule and add a one-line reason.
 - **Coverage** is reported but there is no hard `--cov-fail-under` gate; the
-  established baseline is ~80% line coverage across ~420 tests. Don't regress it —
+  established baseline is ~91% line coverage across ~630 tests. Don't regress it —
   add tests for new code paths.
 
 ## Pre-commit hooks
@@ -90,11 +90,27 @@ If you `uv sync --extra dev`, `pre-commit` is also on your path under
 `uv run pre-commit ...`. A clean `pre-commit run --all-files` means the CI
 lint+type stage will pass.
 
-## Running the services locally
+## Running the bot locally
 
-optimus is six small, single-purpose services that talk over a versioned NATS
-event bus. Each is a module entrypoint and runs in its own process. They need
-PostgreSQL, Redis, and JetStream-enabled NATS reachable via the `OPTIMUS_*`
+### Simple mode (recommended for development)
+
+The fastest way to run the whole bot while developing is simple mode — one
+process, zero external services (SQLite + in-memory bus/stores), exactly what a
+self-hoster runs:
+
+```bash
+OPTIMUS_DISCORD_TOKEN=your-token uv run optimus
+```
+
+It brings up the SQLite schema, registers slash commands, and connects the
+gateway and interactions edges. See [`docs/simple-mode.md`](docs/simple-mode.md)
+for how it composes the same service code the distributed topology runs.
+
+### Distributed mode (the six-service topology)
+
+optimus is also six small, single-purpose services that talk over a versioned
+NATS event bus. Each is a module entrypoint and runs in its own process. They
+need PostgreSQL, Redis, and JetStream-enabled NATS reachable via the `OPTIMUS_*`
 settings.
 
 ### Docker Compose (full stack)

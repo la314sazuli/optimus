@@ -71,16 +71,6 @@ SensitivityFn = Callable[[int], Awaitable[Sensitivity]]
 IdempotencyAcquire = Callable[[str], Awaitable[bool]]
 
 
-def best_frame_hashes(image: DecodedImage) -> dict[str, int]:
-    """Compute hashes for the most distinctive frame (max phash variance proxy).
-
-    For a single-frame image this is just that frame. For animations we hash the
-    first sampled frame; callers that need true best-frame matching iterate via
-    :func:`all_frame_hashes`.
-    """
-    return perceptual.compute_all(image.frames[0])
-
-
 def all_frame_hashes(image: DecodedImage) -> list[dict[str, int]]:
     """Compute the hash set for every sampled frame."""
     return [perceptual.compute_all(frame) for frame in image.frames]
@@ -99,7 +89,6 @@ class DetectionWorker:
         idempotency_acquire: IdempotencyAcquire,
         swarm: SwarmCorrelator | None = None,
         limits: DecodeLimits | None = None,
-        use_embedding: bool = False,
     ) -> None:
         self._guild_index = guild_index
         self._global_index = global_index
@@ -108,7 +97,6 @@ class DetectionWorker:
         self._acquire = idempotency_acquire
         self._swarm = swarm
         self._limits = limits
-        self._use_embedding = use_embedding
 
     async def handle(self, event: ImageFetchedEvent) -> DetectionResult | None:
         """Process one fetched image; return a verdict, or ``None`` if a duplicate."""
