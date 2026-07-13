@@ -34,7 +34,7 @@ async def test_on_guild_join_publishes_event() -> None:
     service = GatewayService(
         settings=object(),  # type: ignore[arg-type]
         bus=bus,  # type: ignore[arg-type]
-        config_cache=GuildConfigCache(None, lambda: None),
+        config_cache=GuildConfigCache(None, lambda guild_id=None: None),
         health=object(),  # type: ignore[arg-type]
     )
     event = _JoinEvent(guild_id=123, guild=_Guild(name="My Server", owner_id=7))
@@ -54,7 +54,7 @@ async def test_on_guild_join_handles_missing_guild() -> None:
     service = GatewayService(
         settings=object(),  # type: ignore[arg-type]
         bus=bus,  # type: ignore[arg-type]
-        config_cache=GuildConfigCache(None, lambda: None),
+        config_cache=GuildConfigCache(None, lambda guild_id=None: None),
         health=object(),  # type: ignore[arg-type]
     )
     await service.on_guild_join(_JoinEvent(guild_id=99, guild=None))  # type: ignore[arg-type]

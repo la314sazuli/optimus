@@ -76,7 +76,7 @@ async def test_cache_populates_on_miss_and_serves_on_hit(session: AsyncSession) 
     await session.flush()
 
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    cache = GuildConfigCache(redis, lambda: _loader(session), ttl_seconds=120)
+    cache = GuildConfigCache(redis, lambda guild_id=None: _loader(session), ttl_seconds=120)
 
     # Miss: loads from DB and writes through to Redis with the TTL.
     first = await cache.get(5)
@@ -99,7 +99,7 @@ async def test_cache_invalidate_forces_reload(session: AsyncSession) -> None:
     await session.flush()
 
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-    cache = GuildConfigCache(redis, lambda: _loader(session))
+    cache = GuildConfigCache(redis, lambda guild_id=None: _loader(session))
 
     await cache.get(8)
     guild = await session.get(Guild, 8)
@@ -117,7 +117,7 @@ async def test_cache_invalidate_forces_reload(session: AsyncSession) -> None:
 async def test_cache_without_redis_always_hits_db(session: AsyncSession) -> None:
     session.add(Guild(guild_id=9, sensitivity="permissive"))
     await session.flush()
-    cache = GuildConfigCache(None, lambda: _loader(session))
+    cache = GuildConfigCache(None, lambda guild_id=None: _loader(session))
     config = await cache.get(9)
     assert config.sensitivity is Sensitivity.PERMISSIVE
     # invalidate is a no-op when there is no cache backend.

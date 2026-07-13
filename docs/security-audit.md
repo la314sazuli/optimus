@@ -93,9 +93,16 @@ tests in `tests/unit/test_interactions_handlers.py` and
 - **Evidence** (`evidence/store.py`): off by default and opt-in; TTL clamped to
   `[1, 24h]`; SSE on write; short-lived presigned GET URLs; keys derived from
   numeric ids.
-- **DB scoping** (`db/repositories.py`): per-guild repositories filter every
-  query by `guild_id`; no raw SQL / `text()` interpolation; multi-tenant builds
-  add PostgreSQL row-level security as defense in depth.
+- **DB scoping** (`db/repositories.py`, `db/engine.py`): per-guild repositories
+  filter every query by `guild_id`; no raw SQL / `text()` interpolation. In
+  multi-tenant builds the session scope sets the transaction-local
+  `optimus.guild_id` GUC (`SELECT set_config(..., true)`) for guild-scoped work,
+  so migration `0002`'s PostgreSQL row-level security actually enforces tenant
+  isolation at the database (not merely defence in depth). An unset GUC evaluates
+  to NULL, so an RLS-subject role with no GUC sees zero rows. Single-tenant/simple
+  mode never sets the GUC and does not depend on RLS. Verified by
+  `tests/integration/test_rls_isolation.py` (skipped unless
+  `OPTIMUS_TEST_POSTGRES_URL` points at a real Postgres).
 - **Secrets** (`core/config.py`, `core/logging.py`): all secrets come from
   `OPTIMUS_`-prefixed env via pydantic-settings; `.env`/`.env.*` are gitignored
   (with `.env.example` whitelisted and containing only empty placeholders); no

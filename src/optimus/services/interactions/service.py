@@ -238,22 +238,25 @@ class InteractionService:
 
     async def dispatch_command(self, ctx: InteractionContext) -> InteractionResponse:
         """Run a slash command within a fresh transactional session scope."""
-        return await self._run(lambda deps: handle_command(ctx, deps))
+        return await self._run(ctx.guild_id, lambda deps: handle_command(ctx, deps))
 
     async def dispatch_button(self, ctx: InteractionContext, custom_id: str) -> InteractionResponse:
         """Route a component press to the correct handler (report vs. other)."""
         review = decode_custom_id(custom_id)
         if review is not None:
-            return await self._run(lambda deps: handle_review_button(ctx, review, deps))
+            return await self._run(
+                ctx.guild_id, lambda deps: handle_review_button(ctx, review, deps)
+            )
         component = decode_component_id(custom_id)
         if component is not None:
             return await self._run(
-                lambda deps: handle_component(ctx, component.action, component.ref_id, deps)
+                ctx.guild_id,
+                lambda deps: handle_component(ctx, component.action, component.ref_id, deps),
             )
         return InteractionResponse("button.expired")
 
-    async def _run(self, call: Any) -> InteractionResponse:
-        async with self._scope() as session:
+    async def _run(self, guild_id: int | None, call: Any) -> InteractionResponse:
+        async with self._scope(guild_id) as session:
             deps = DbDeps(session, self._rl, self._settings)
             return await call(deps)  # type: ignore[no-any-return]
 
@@ -368,16 +371,14 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     from optimus.core.health import HealthServer
     from optimus.core.logging import configure_logging
     from optimus.core.readiness import db_check, redis_check
-    from optimus.db.engine import create_engine, create_session_factory, session_scope
+    from optimus.db.engine import create_engine, create_session_factory, create_session_scope
 
     settings = get_settings()
     configure_logging(level=settings.log_level, service_name="optimus-interactions")
 
     engine = create_engine()
     factory = create_session_factory(engine)
-
-    def scope() -> Any:
-        return session_scope(factory)
+    scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
     redis = _open_redis(settings)
     rate_limiter = build_rate_limiter(settings, redis)

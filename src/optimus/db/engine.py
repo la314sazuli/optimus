@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Any
+from typing import Any, Protocol
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -16,8 +16,21 @@ from sqlalchemy.ext.asyncio import (
 
 from optimus.core.config import Settings, get_settings
 
-#: A zero-arg factory yielding a transactional :class:`AsyncSession` scope.
-SessionScope = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+class SessionScope(Protocol):
+    """A factory yielding a transactional :class:`AsyncSession` scope.
+
+    Called with the ``guild_id`` of the tenant whose rows the scope will touch.
+    In multi-tenant mode that id is pushed into the ``optimus.guild_id`` session
+    GUC so Postgres row-level security (migration ``0002``) enforces isolation on
+    every query in the scope. ``guild_id=None`` (the default) opens an unscoped
+    transaction for cross-tenant/global work (readiness probes, the global-hash
+    index, deployment-wide enumeration).
+    """
+
+    def __call__(
+        self, guild_id: int | None = None
+    ) -> AbstractAsyncContextManager[AsyncSession]: ...
 
 
 def create_engine(
@@ -82,12 +95,45 @@ def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSessi
 @asynccontextmanager
 async def session_scope(
     factory: async_sessionmaker[AsyncSession],
+    *,
+    guild_id: int | None = None,
+    multi_tenant: bool = False,
 ) -> AsyncIterator[AsyncSession]:
-    """Provide a transactional session scope, committing or rolling back."""
+    """Provide a transactional session scope, committing or rolling back.
+
+    When ``multi_tenant`` is set and a ``guild_id`` is given, the transaction's
+    ``optimus.guild_id`` GUC is set as its first statement so Postgres RLS scopes
+    every subsequent query/insert to that tenant. ``set_config(..., is_local =>
+    true)`` ties the setting to this transaction, so it is discarded on commit or
+    rollback and never leaks to the next checkout of a pooled connection. In
+    single-tenant mode (and on SQLite, which has no ``set_config``) no GUC is set
+    and behaviour is unchanged.
+    """
     async with factory() as session:
         try:
+            if multi_tenant and guild_id is not None:
+                await session.execute(
+                    text("SELECT set_config('optimus.guild_id', :gid, true)"),
+                    {"gid": str(guild_id)},
+                )
             yield session
             await session.commit()
         except Exception:
             await session.rollback()
             raise
+
+
+def create_session_scope(
+    factory: async_sessionmaker[AsyncSession], *, multi_tenant: bool = False
+) -> SessionScope:
+    """Bind ``factory`` (and the tenancy switch) into a :class:`SessionScope`.
+
+    Every service composes its persistence around the returned callable, so the
+    RLS GUC wiring lives in one place: callers just pass the ``guild_id`` of the
+    tenant they are about to touch.
+    """
+
+    def scope(guild_id: int | None = None) -> AbstractAsyncContextManager[AsyncSession]:
+        return session_scope(factory, guild_id=guild_id, multi_tenant=multi_tenant)
+
+    return scope

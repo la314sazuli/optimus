@@ -46,7 +46,7 @@ async def enforce_retention(
         }
     for gid in guild_ids:
         cutoff = moment - timedelta(days=retention[gid])
-        async with scope() as session:
+        async with scope(gid) as session:
             deleted += await DetectionRepository(session, gid).delete_older_than(cutoff)
             deleted += await AppealRepository(session, gid).delete_older_than(cutoff)
             deleted += await ModActionRepository(session, gid).delete_older_than(cutoff)
@@ -125,7 +125,7 @@ async def roll_up_stats(scope: SessionScope, *, now: datetime | None = None) -> 
     async with scope() as session:
         guild_ids = list(await GuildListRepository(session).all_ids())
     for gid in guild_ids:
-        async with scope() as session:
+        async with scope(gid) as session:
             count = await DetectionRepository(session, gid).count_in_window(bucket, bucket_end)
             await StatsRollupRepository(session, gid).upsert(
                 bucket_start=bucket,

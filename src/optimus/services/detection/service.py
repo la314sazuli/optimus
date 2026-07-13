@@ -14,7 +14,6 @@ from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
@@ -37,7 +36,7 @@ from optimus.db.engine import (
     SessionScope,
     create_engine,
     create_session_factory,
-    session_scope,
+    create_session_scope,
 )
 from optimus.db.models import Detection
 from optimus.db.repositories import (
@@ -133,7 +132,7 @@ class DetectionService:
 
     async def _persist(self, result: DetectionResult) -> None:
         v = result.verdict
-        async with self._scope() as session:
+        async with self._scope(v.guild_id) as session:
             repo = DetectionRepository(session, v.guild_id)
             if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
                 return
@@ -207,9 +206,7 @@ def build_service(
     else:
         engine = create_engine()
         factory = create_session_factory(engine)
-
-        def scope() -> AbstractAsyncContextManager[AsyncSession]:
-            return session_scope(factory)
+        scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
     index_manager = IndexManager(scope, max_guilds=settings.detection_guild_index_cap)
 
@@ -231,12 +228,12 @@ def build_service(
         return await index_manager.global_index()
 
     async def whitelist(guild_id: int) -> list[WhitelistEntry]:
-        async with scope() as session:
+        async with scope(guild_id) as session:
             rows = await WhitelistRepository(session, guild_id).list()
             return [WhitelistEntry(phash=r.phash) for r in rows]
 
     async def sensitivity(guild_id: int) -> Sensitivity:
-        async with scope() as session:
+        async with scope(guild_id) as session:
             guild = await GuildRepository(session).get(guild_id)
             if guild is None:
                 return settings.sensitivity_default

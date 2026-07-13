@@ -12,11 +12,9 @@ import asyncio
 import contextlib
 import random
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager
 from typing import TYPE_CHECKING
 
 from prometheus_client import Counter, Gauge
-from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.elements import TextClause
@@ -33,7 +31,7 @@ from optimus.db.engine import (
     SessionScope,
     create_engine,
     create_session_factory,
-    session_scope,
+    create_session_scope,
 )
 from optimus.services.scheduler import tasks
 
@@ -243,9 +241,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
 
     engine = create_engine()
     factory = create_session_factory(engine)
-
-    def scope() -> AbstractAsyncContextManager[AsyncSession]:
-        return session_scope(factory)
+    scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
     delete_object = _build_evidence_deleter(settings)
     service = SchedulerService(settings, bus, scope, delete_object=delete_object)

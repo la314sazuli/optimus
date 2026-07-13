@@ -125,7 +125,7 @@ def single_session_scope(session: AsyncSession):  # type: ignore[no-untyped-def]
     """
 
     @asynccontextmanager
-    async def scope() -> AsyncIterator[AsyncSession]:
+    async def scope(guild_id: int | None = None) -> AsyncIterator[AsyncSession]:
         yield session
 
     return scope
