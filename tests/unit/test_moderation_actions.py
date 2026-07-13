@@ -66,6 +66,7 @@ def _executor(
         bot_user_id=999,
         rate=RateLimit(capacity=capacity, refill_rate=0.001),
         idempotency_acquire=guard.acquire,
+        idempotency_release=guard.release,
         dm_cooldown=Cooldown(redis, window_seconds=3600),
         breaker=breaker or CircuitBreaker(),
         backoff=BackoffPolicy(base=0.001, max_delay=0.002, max_attempts=3),
@@ -161,6 +162,42 @@ async def test_idempotency_blocks_duplicate() -> None:
     assert second.detail == "duplicate"
     # Only one ban happened.
     assert [c[0] for c in rest.calls].count("ban_member") == 1
+
+
+async def test_partial_failure_releases_claim_for_redelivery() -> None:
+    # A message deleted but not banned (punitive step fails) must release the
+    # claim so the verdict's redelivery re-runs the action rather than being
+    # suppressed as a duplicate with the ban never landing.
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+    class _BanFailingRest(_FakeRest):
+        async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None:
+            raise RuntimeError("ban failed")
+
+    rest = _BanFailingRest()
+    ex = _executor(rest, redis=redis)
+    first = await ex.execute(_req(Action.DELETE_BAN, key="same"))
+    assert not first.success
+    assert first.detail is not None and first.detail.startswith("error:")
+    # The redelivery is NOT short-circuited as a duplicate: it re-attempts.
+    second = await ex.execute(_req(Action.DELETE_BAN, key="same"))
+    assert second.detail is not None and second.detail.startswith("error:")
+
+
+async def test_later_step_failure_does_not_reissue_delete() -> None:
+    # Retries are per-step: a failing ban is retried on its own without
+    # re-issuing delete_message on the (now already-deleted) message.
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+    class _BanFailingRest(_FakeRest):
+        async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None:
+            raise RuntimeError("ban failed")
+
+    rest = _BanFailingRest()
+    ex = _executor(rest, redis=redis)
+    await ex.execute(_req(Action.DELETE_BAN, key="k"))
+    # delete_message succeeded once; the ban's retries never repeat it.
+    assert [c[0] for c in rest.calls].count("delete_message") == 1
 
 
 async def test_rate_limit_exhaustion_returns_failure() -> None:

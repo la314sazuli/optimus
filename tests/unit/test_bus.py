@@ -34,14 +34,27 @@ class _Evt(BaseModel):
     n: int = 0
 
 
-class _FakeMsg:
-    """A faithful stand-in for ``nats.aio.msg.Msg`` recording ack/nak/term."""
+class _FakeMeta:
+    def __init__(self, num_delivered: int) -> None:
+        self.num_delivered = num_delivered
 
-    def __init__(self, data: bytes) -> None:
+
+class _FakeMsg:
+    """A faithful stand-in for ``nats.aio.msg.Msg`` recording ack/nak/term.
+
+    ``num_delivered`` seeds JetStream delivery metadata so the dead-letter path
+    (which triggers once a message has been delivered ``max_deliver`` times) can
+    be exercised; omitting it leaves ``metadata`` absent, matching a message
+    whose delivery count cannot be read.
+    """
+
+    def __init__(self, data: bytes, num_delivered: int | None = None) -> None:
         self.data = data
         self.acked = False
         self.naked = False
         self.termed = False
+        if num_delivered is not None:
+            self.metadata = _FakeMeta(num_delivered)
 
     async def ack(self) -> None:
         self.acked = True
@@ -176,6 +189,43 @@ async def test_dispatch_terms_undecodable_payload() -> None:
 
     await _run_once(js, never)
     assert msg.termed and not msg.acked and not msg.naked
+
+
+# --- dead-letter on max_deliver exhaustion ----------------------------------
+
+
+async def test_dispatch_dead_letters_on_exhaustion() -> None:
+    # A handler that keeps failing once its delivery count has reached
+    # max_deliver must be routed to the dead-letter subject and terminated
+    # (not nak'd for a redelivery JetStream would refuse), so the loss is
+    # captured rather than silent.
+    from optimus.contracts.events import SUBJECT_DEAD_LETTER
+
+    msg = _FakeMsg(_Evt(n=1).model_dump_json().encode(), num_delivered=5)
+    js = _FakeJetStream(_FakeSub([msg]))
+
+    async def boom(_e: _Evt) -> None:
+        raise RuntimeError("still failing on the last delivery")
+
+    await _run_once(js, boom)
+    assert msg.termed and not msg.naked and not msg.acked
+    dead = [p for p in js.published if p[0] == SUBJECT_DEAD_LETTER]
+    assert len(dead) == 1
+
+
+async def test_dispatch_naks_before_exhaustion() -> None:
+    # Below max_deliver the message is nak'd for redelivery, never dead-lettered.
+    from optimus.contracts.events import SUBJECT_DEAD_LETTER
+
+    msg = _FakeMsg(_Evt(n=1).model_dump_json().encode(), num_delivered=1)
+    js = _FakeJetStream(_FakeSub([msg]))
+
+    async def boom(_e: _Evt) -> None:
+        raise RuntimeError("transient")
+
+    await _run_once(js, boom)
+    assert msg.naked and not msg.termed
+    assert not [p for p in js.published if p[0] == SUBJECT_DEAD_LETTER]
 
 
 # --- back-pressure: bounded in-flight ---------------------------------------

@@ -16,6 +16,8 @@ testable without a live gateway. DM warnings are rate-limited per user via a
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -118,6 +120,7 @@ class ActionExecutor:
         rate: RateLimit,
         idempotency_acquire: object,
         dm_cooldown: Cooldown,
+        idempotency_release: object | None = None,
         breaker: CircuitBreaker | None = None,
         backoff: BackoffPolicy | None = None,
     ) -> None:
@@ -126,6 +129,7 @@ class ActionExecutor:
         self._bot_user_id = bot_user_id
         self._rate = rate
         self._acquire = idempotency_acquire
+        self._release = idempotency_release
         self._dm_cooldown = dm_cooldown
         self._breaker = breaker or CircuitBreaker()
         # Attach metrics/logging to whichever breaker is used, including a
@@ -143,6 +147,11 @@ class ActionExecutor:
         Returns a ``success=False`` result (rather than raising) on rate-limit
         exhaustion, open circuit, idempotency replay, or REST failure so the
         caller can record an audit row in every case.
+
+        The idempotency claim is released on every non-``duplicate`` failure so
+        the verdict's redelivery re-runs the action. Without it a partial failure
+        (message deleted, ban not yet applied) would leave the key claimed and
+        the redelivery suppressed as a ``duplicate`` — the ban would never land.
         """
         if req.action in (Action.NONE, Action.REPORT_ONLY):
             return ActionResult(req.action, success=True, detail="no_enforcement")
@@ -151,32 +160,49 @@ class ActionExecutor:
             return ActionResult(req.action, success=False, detail="duplicate")
 
         if not await self._rl.acquire(f"modact:{req.guild_id}", self._rate):
+            await self._release_claim(req.idempotency_key)
             return ActionResult(req.action, success=False, detail="rate_limited")
 
         try:
             await self._breaker.call(lambda: self._run(req))
         except CircuitOpenError:
+            await self._release_claim(req.idempotency_key)
             return ActionResult(req.action, success=False, detail="circuit_open")
         except Exception as exc:
+            await self._release_claim(req.idempotency_key)
             return ActionResult(req.action, success=False, detail=f"error:{type(exc).__name__}")
         return ActionResult(req.action, success=True)
 
-    async def _run(self, req: ActionRequest) -> None:
-        await retry_async(lambda: self._apply(req), self._backoff)
-
-    async def _apply(self, req: ActionRequest) -> None:
-        # The message is always removed first; punitive steps follow.
-        await self._rest.delete_message(req.channel_id, req.message_id)
-        if req.action is Action.DELETE:
-            await self._maybe_dm(req)
+    async def _release_claim(self, key: str) -> None:
+        if self._release is None:
             return
+        with contextlib.suppress(Exception):
+            await self._release(key)  # type: ignore[operator]
+
+    async def _run(self, req: ActionRequest) -> None:
+        # Each step is retried independently so a transient failure in a later
+        # step (e.g. ban) re-attempts only that step, never re-issuing an
+        # already-completed delete on a now-missing message. The message is
+        # always removed first; punitive steps follow.
+        await self._retry(lambda: self._rest.delete_message(req.channel_id, req.message_id))
         if req.action is Action.DELETE_TIMEOUT:
-            await self._rest.timeout_member(req.guild_id, req.uploader_id, req.timeout_seconds)
+            await self._retry(
+                lambda: self._rest.timeout_member(
+                    req.guild_id, req.uploader_id, req.timeout_seconds
+                )
+            )
         elif req.action is Action.DELETE_KICK:
-            await self._rest.kick_member(req.guild_id, req.uploader_id, req.reason)
+            await self._retry(
+                lambda: self._rest.kick_member(req.guild_id, req.uploader_id, req.reason)
+            )
         elif req.action is Action.DELETE_BAN:
-            await self._rest.ban_member(req.guild_id, req.uploader_id, req.reason)
+            await self._retry(
+                lambda: self._rest.ban_member(req.guild_id, req.uploader_id, req.reason)
+            )
         await self._maybe_dm(req)
+
+    async def _retry(self, op: Callable[[], Awaitable[None]]) -> None:
+        await retry_async(op, self._backoff)
 
     async def _maybe_dm(self, req: ActionRequest) -> None:
         if req.uploader_id == self._bot_user_id:

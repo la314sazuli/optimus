@@ -14,7 +14,12 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from prometheus_client import Counter, Gauge
 from pydantic import BaseModel, ValidationError
 
-from optimus.contracts.events import EVENT_SUBJECTS, STREAM_EVENTS
+from optimus.contracts.events import (
+    EVENT_SUBJECTS,
+    STREAM_EVENTS,
+    SUBJECT_DEAD_LETTER,
+    DeadLetterEvent,
+)
 from optimus.core.logging import correlation_context, get_logger
 
 if TYPE_CHECKING:
@@ -44,6 +49,11 @@ MESSAGES_DROPPED = Counter(
     "optimus_bus_messages_dropped_total",
     "Messages dropped (undecodable / poison).",
     ["subject", "reason"],
+)
+MESSAGES_DEAD_LETTERED = Counter(
+    "optimus_bus_messages_dead_lettered_total",
+    "Messages routed to the dead-letter subject after exhausting max_deliver.",
+    ["subject"],
 )
 MESSAGES_INFLIGHT = Gauge(
     "optimus_bus_messages_inflight",
@@ -82,6 +92,19 @@ _BASE64_INFLATION = 4 / 3
 #: Fixed bytes reserved for the JSON envelope and NATS headers around the
 #: base64 image field. Generous: the real envelope is a few hundred bytes.
 _ENVELOPE_OVERHEAD_BYTES = 4096
+
+
+def _num_delivered(msg: Msg) -> int | None:
+    """Delivery count for ``msg`` from JetStream metadata, or ``None`` if absent.
+
+    A ``None`` (e.g. a non-JetStream message, or metadata that cannot be parsed)
+    means we cannot tell it is exhausted, so the caller nak's rather than
+    dead-letters — never dropping a message just because the count is unknown.
+    """
+    try:
+        return int(msg.metadata.num_delivered)
+    except Exception:
+        return None
 
 
 def inline_wire_size(raw_bytes: int) -> int:
@@ -201,7 +224,15 @@ class EventBus:
         redelivery) within the stream's duplicate window. The id is namespaced by
         subject so the same business key on two subjects never cross-dedups.
         """
-        payload = event.model_dump_json().encode("utf-8")
+        await self.publish_raw(subject, event.model_dump_json().encode("utf-8"), msg_id=msg_id)
+
+    async def publish_raw(self, subject: str, payload: bytes, msg_id: str | None = None) -> None:
+        """Publish already-serialized ``payload`` bytes to ``subject``.
+
+        The relay uses this to re-emit an outbox row's stored JSON without
+        re-instantiating its model; the ``Nats-Msg-Id`` dedup semantics match
+        :meth:`publish`.
+        """
         headers = {NATS_MSG_ID_HEADER: f"{subject}:{msg_id}"} if msg_id is not None else None
         await self._js.publish(subject, payload, headers=headers)
         MESSAGES_PUBLISHED.labels(subject=subject).inc()
@@ -270,7 +301,9 @@ class EventBus:
                 continue
             for msg in msgs:
                 await sem.acquire()
-                task = asyncio.create_task(self._dispatch(subject, model, handler, msg, sem))
+                task = asyncio.create_task(
+                    self._dispatch(subject, model, handler, msg, sem, max_deliver=max_deliver)
+                )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
 
@@ -284,6 +317,8 @@ class EventBus:
         handler: Callable[[E], Awaitable[None]],
         msg: Msg,
         sem: asyncio.Semaphore | None = None,
+        *,
+        max_deliver: int = 5,
     ) -> None:
         try:
             try:
@@ -300,10 +335,8 @@ class EventBus:
                 with correlation_context(cid):
                     try:
                         await handler(event)
-                    except Exception:
-                        MESSAGES_NAKED.labels(subject=subject).inc()
-                        _log.exception("bus_handler_failed", subject=subject)
-                        await msg.nak()
+                    except Exception as exc:
+                        await self._on_handler_failure(subject, msg, max_deliver, exc)
                         return
                 MESSAGES_ACKED.labels(subject=subject).inc()
                 await msg.ack()
@@ -312,3 +345,50 @@ class EventBus:
         finally:
             if sem is not None:
                 sem.release()
+
+    async def _on_handler_failure(
+        self, subject: str, msg: Msg, max_deliver: int, exc: Exception
+    ) -> None:
+        """Nak for redelivery, or dead-letter once ``max_deliver`` is exhausted.
+
+        Without this, a message that fails ``max_deliver`` times is dropped by
+        JetStream with nothing but a generic nak counter to show for it. On the
+        final attempt we route the raw payload to :data:`SUBJECT_DEAD_LETTER`,
+        count it, and log an error so the loss is captured and alertable rather
+        than silent. If the dead-letter publish itself fails we fall back to a
+        nak so the message is not lost on our account.
+        """
+        delivered = _num_delivered(msg)
+        if delivered is not None and delivered >= max_deliver:
+            try:
+                await self._dead_letter(subject, msg, delivered, exc)
+            except Exception:
+                MESSAGES_NAKED.labels(subject=subject).inc()
+                _log.exception("bus_dead_letter_failed", subject=subject)
+                await msg.nak()
+                return
+            MESSAGES_DEAD_LETTERED.labels(subject=subject).inc()
+            _log.error(
+                "bus_message_dead_lettered",
+                subject=subject,
+                delivered=delivered,
+                error=type(exc).__name__,
+            )
+            await msg.term()
+            return
+        MESSAGES_NAKED.labels(subject=subject).inc()
+        _log.exception("bus_handler_failed", subject=subject)
+        await msg.nak()
+
+    async def _dead_letter(self, subject: str, msg: Msg, delivered: int, exc: Exception) -> None:
+        from datetime import UTC, datetime
+
+        event = DeadLetterEvent(
+            correlation_id="dead-letter",
+            occurred_at=datetime.now(UTC),
+            original_subject=subject,
+            payload=msg.data.decode("utf-8", errors="replace"),
+            delivered=delivered,
+            error=type(exc).__name__,
+        )
+        await self.publish(SUBJECT_DEAD_LETTER, event)

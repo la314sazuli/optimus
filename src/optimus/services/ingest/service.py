@@ -15,6 +15,7 @@ from optimus.contracts.events import (
 )
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
+from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import (
     RateLimit,
@@ -89,6 +90,7 @@ async def _amain() -> None:
     await health.start()
 
     stop = asyncio.Event()
+    install_signal_handlers(stop)
     consume_task = asyncio.create_task(
         bus.consume(
             SUBJECT_MESSAGE_IMAGE,

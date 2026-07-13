@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 
 from sqlalchemy.exc import IntegrityError
@@ -24,10 +25,12 @@ from optimus.contracts.events import (
     SUBJECT_VERDICT,
     ImageFetchedEvent,
     IndexInvalidateEvent,
+    VerdictEvent,
 )
 from optimus.core.config import Sensitivity, Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.idempotency import IdempotencyGuard
+from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.readiness import db_check, nats_check, redis_check
 from optimus.db.engine import (
@@ -37,14 +40,23 @@ from optimus.db.engine import (
     session_scope,
 )
 from optimus.db.models import Detection
-from optimus.db.repositories import DetectionRepository, GuildRepository, WhitelistRepository
+from optimus.db.repositories import (
+    DetectionRepository,
+    GuildRepository,
+    OutboxRepository,
+    WhitelistRepository,
+)
 from optimus.hashing.decoder import DecodeLimits
 from optimus.services.detection.index import HashIndex, IndexManager
 from optimus.services.detection.matcher import WhitelistEntry
+from optimus.services.detection.relay import OutboxRelay
 from optimus.services.detection.swarm import SwarmCorrelator
 from optimus.services.detection.worker import DetectionResult, DetectionWorker
 
 _log = get_logger(__name__)
+
+#: Releases a previously-claimed idempotency key so redelivery can re-run.
+IdempotencyRelease = Callable[[str], Awaitable[None]]
 
 
 class DetectionService:
@@ -57,12 +69,17 @@ class DetectionService:
         worker: DetectionWorker,
         index_manager: IndexManager,
         session_scope_factory: SessionScope,
+        *,
+        idempotency_release: IdempotencyRelease | None = None,
+        use_outbox: bool = False,
     ) -> None:
         self._settings = settings
         self._bus = bus
         self._worker = worker
         self._indexes = index_manager
         self._scope = session_scope_factory
+        self._release = idempotency_release
+        self._use_outbox = use_outbox
 
     @property
     def scope(self) -> SessionScope:
@@ -74,17 +91,45 @@ class DetectionService:
         result = await self._worker.handle(event)
         if result is None:
             return
-        await self._persist(result)
-        await self._bus.publish(
-            SUBJECT_VERDICT, result.verdict, msg_id=result.verdict.idempotency_key
-        )
-        if result.swarm_alert is not None:
-            await self._bus.publish(SUBJECT_SWARM_ALERT, result.swarm_alert)
+        # The worker has already claimed the Redis idempotency key. The persist
+        # and publish below are fallible (DB/broker outage); if they raise, the
+        # claim would otherwise swallow this verdict forever on the redelivery
+        # that follows a nak. Release it so the redelivery can re-run the work;
+        # the DB unique constraint on idempotency_key remains the real authority
+        # against a genuine duplicate.
+        try:
+            if self._use_outbox:
+                await self._persist_and_enqueue(result)
+            else:
+                await self._persist(result)
+                await self._bus.publish(
+                    SUBJECT_VERDICT, result.verdict, msg_id=result.verdict.idempotency_key
+                )
+                if result.swarm_alert is not None:
+                    await self._bus.publish(SUBJECT_SWARM_ALERT, result.swarm_alert)
+        except Exception:
+            if self._release is not None:
+                with contextlib.suppress(Exception):
+                    await self._release(event.idempotency_key)
+            raise
 
     async def on_invalidate(self, event: IndexInvalidateEvent) -> None:
         """Reload an index in response to a control-plane invalidation."""
         await self._indexes.invalidate(event.guild_id)
         _log.info("index_invalidated", guild_id=event.guild_id)
+
+    @staticmethod
+    def _row(v: VerdictEvent) -> Detection:
+        return Detection(
+            guild_id=v.guild_id,
+            message_id=v.message_id,
+            channel_id=v.channel_id,
+            attachment_id=v.attachment_id,
+            uploader_id=v.uploader_id,
+            distances=dict(v.distances),
+            verdict=v.verdict.value,
+            idempotency_key=v.idempotency_key,
+        )
 
     async def _persist(self, result: DetectionResult) -> None:
         v = result.verdict
@@ -100,18 +145,38 @@ class DetectionService:
             # would redeliver a message whose row already exists, forever).
             try:
                 async with session.begin_nested():
-                    await repo.record(
-                        Detection(
-                            guild_id=v.guild_id,
-                            message_id=v.message_id,
-                            channel_id=v.channel_id,
-                            attachment_id=v.attachment_id,
-                            uploader_id=v.uploader_id,
-                            distances=dict(v.distances),
-                            verdict=v.verdict.value,
-                            idempotency_key=v.idempotency_key,
-                        )
+                    await repo.record(self._row(v))
+            except IntegrityError:
+                pass
+
+    async def _persist_and_enqueue(self, result: DetectionResult) -> None:
+        """Persist the detection and stage its bus messages in one transaction.
+
+        The verdict (and any swarm alert) are written to the outbox in the same
+        transaction as the ``Detection`` row, so a crash between persist and
+        publish can never leave a recorded detection with no verdict on the bus.
+        The :class:`OutboxRelay` drains the staged rows with at-least-once retry.
+        """
+        v = result.verdict
+        async with self._scope() as session:
+            repo = DetectionRepository(session, v.guild_id)
+            if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
+                return
+            outbox = OutboxRepository(session)
+            try:
+                async with session.begin_nested():
+                    await repo.record(self._row(v))
+                    await outbox.enqueue(
+                        subject=SUBJECT_VERDICT,
+                        payload=v.model_dump_json(),
+                        msg_id=v.idempotency_key,
                     )
+                    if result.swarm_alert is not None:
+                        await outbox.enqueue(
+                            subject=SUBJECT_SWARM_ALERT,
+                            payload=result.swarm_alert.model_dump_json(),
+                            msg_id=None,
+                        )
             except IntegrityError:
                 pass
 
@@ -123,6 +188,7 @@ def build_service(
     *,
     session_scope_factory: SessionScope | None = None,
     enable_swarm: bool = True,
+    enable_outbox: bool = False,
 ) -> DetectionService:
     """Wire a :class:`DetectionService` from settings and shared clients.
 
@@ -193,7 +259,15 @@ def build_service(
         swarm=swarm,
         limits=limits,
     )
-    return DetectionService(settings, bus, worker, index_manager, scope)
+    return DetectionService(
+        settings,
+        bus,
+        worker,
+        index_manager,
+        scope,
+        idempotency_release=guard.release,
+        use_outbox=enable_outbox,
+    )
 
 
 class _NullGuard:
@@ -201,6 +275,9 @@ class _NullGuard:
 
     async def acquire(self, key: str) -> bool:
         return True
+
+    async def release(self, key: str) -> None:
+        return None
 
 
 async def _amain() -> None:
@@ -210,7 +287,7 @@ async def _amain() -> None:
     bus, nc = await EventBus.connect(settings.nats_url)
     await bus.ensure_stream(duplicate_window=settings.bus_duplicate_window_seconds)
     redis = _open_redis(settings)
-    service = build_service(settings, bus, redis)
+    service = build_service(settings, bus, redis, enable_outbox=True)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
     health.add_readiness_check(nats_check(nc), name="nats")
@@ -230,6 +307,16 @@ async def _amain() -> None:
     sub = await nc.subscribe(SUBJECT_INDEX_INVALIDATE, cb=_invalidate_cb)
 
     stop = asyncio.Event()
+    install_signal_handlers(stop)
+    # Drain the outbox: verdicts are persisted+staged in one transaction by
+    # ``on_image`` and published from here with at-least-once retry.
+    relay = OutboxRelay(
+        service.scope,
+        bus.publish_raw,
+        batch=settings.detection_outbox_batch,
+        poll_seconds=settings.detection_outbox_poll_seconds,
+    )
+    relay_task = asyncio.create_task(relay.run(stop))
     consume_task = asyncio.create_task(
         bus.consume(
             SUBJECT_IMAGE_FETCHED,
@@ -248,6 +335,8 @@ async def _amain() -> None:
     finally:
         health.set_live(False)
         stop.set()
+        with contextlib.suppress(Exception):
+            await relay_task
         with contextlib.suppress(Exception):
             await sub.unsubscribe()
         with contextlib.suppress(Exception):

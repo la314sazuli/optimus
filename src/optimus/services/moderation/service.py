@@ -36,6 +36,7 @@ from optimus.contracts.events import (
 from optimus.core.circuit import CircuitBreaker
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
+from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit, RateLimiter, RedisRateLimiter
 from optimus.core.readiness import db_check, nats_check, redis_check
@@ -162,6 +163,7 @@ def build_coordinator(
             refill_rate=settings.mod_action_rate_refill,
         ),
         idempotency_acquire=guard.acquire,
+        idempotency_release=guard.release,
         dm_cooldown=cooldown,
         breaker=breaker,
     )
@@ -242,6 +244,10 @@ class _ActionIdempotency:
     async def acquire(self, key: str) -> bool:
         result = await self._redis.set(key, "1", nx=True, ex=self._ttl)  # type: ignore[attr-defined]
         return result is True or result == "OK"
+
+    async def release(self, key: str) -> None:
+        """Release a claim so a failed action's redelivery can re-run."""
+        await self._redis.delete(key)  # type: ignore[attr-defined]
 
 
 async def _resolve_target(  # pragma: no cover - requires live REST
@@ -334,6 +340,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     await health.start()
 
     stop = asyncio.Event()
+    install_signal_handlers(stop)
     tasks = [
         asyncio.create_task(
             bus.consume(
