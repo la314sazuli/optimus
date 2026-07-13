@@ -28,6 +28,7 @@ from optimus.db.models import (
     GuildTrustedUser,
     GuildWhitelist,
     ModAction,
+    OutboxEvent,
     StatsRollup,
     UserOptout,
 )
@@ -466,6 +467,55 @@ class EvidenceRepository:
         """Delete an evidence row by id; return rows deleted."""
         stmt = delete(Evidence).where(Evidence.id == evidence_id)
         result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+
+class OutboxRepository:
+    """Transactional-outbox access: stage rows in a write txn, drain via a relay."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def enqueue(self, *, subject: str, payload: str, msg_id: str | None) -> OutboxEvent:
+        """Stage a message for publish. Call inside the source write's transaction."""
+        row = OutboxEvent(subject=subject, payload=payload, msg_id=msg_id)
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def fetch_unpublished(self, limit: int) -> Sequence[OutboxEvent]:
+        """Return the oldest not-yet-published rows, oldest first."""
+        stmt = (
+            select(OutboxEvent)
+            .where(OutboxEvent.published_at.is_(None))
+            .order_by(OutboxEvent.id)
+            .limit(limit)
+        )
+        return (await self._session.execute(stmt)).scalars().all()
+
+    async def mark_published(self, ids: Sequence[int], *, now: datetime) -> int:
+        """Mark rows published; return rows updated."""
+        from sqlalchemy import update
+
+        if not ids:
+            return 0
+        stmt = update(OutboxEvent).where(OutboxEvent.id.in_(ids)).values(published_at=now)
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return cast("CursorResult[Any]", result).rowcount or 0
+
+    async def delete_published_before(self, cutoff: datetime, *, limit: int) -> int:
+        """Delete up to ``limit`` already-published rows older than ``cutoff``."""
+        ids_stmt = (
+            select(OutboxEvent.id)
+            .where(OutboxEvent.published_at.is_not(None), OutboxEvent.published_at < cutoff)
+            .limit(limit)
+        )
+        ids = list((await self._session.execute(ids_stmt)).scalars().all())
+        if not ids:
+            return 0
+        result = await self._session.execute(delete(OutboxEvent).where(OutboxEvent.id.in_(ids)))
         await self._session.flush()
         return cast("CursorResult[Any]", result).rowcount or 0
 

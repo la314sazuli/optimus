@@ -218,6 +218,10 @@ class Settings(BaseSettings):
     detection_max_deliver: int = Field(default=5, ge=1)
     #: JetStream publish-dedup window (seconds) applied to the events stream.
     bus_duplicate_window_seconds: float = Field(default=2 * 60 * 60, gt=0.0)
+    #: Rows the outbox relay publishes per drain before yielding.
+    detection_outbox_batch: int = Field(default=100, ge=1)
+    #: Seconds the outbox relay sleeps when the outbox is idle.
+    detection_outbox_poll_seconds: float = Field(default=0.5, gt=0.0)
 
     # Rate limiting
     #: Limiter backend. ``memory`` (default) is per-process and correct for a

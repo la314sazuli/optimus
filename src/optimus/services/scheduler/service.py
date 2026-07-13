@@ -26,6 +26,7 @@ from optimus.bus.nats import EventBus
 from optimus.contracts.events import SUBJECT_INDEX_INVALIDATE, IndexInvalidateEvent
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
+from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.readiness import nats_check
 from optimus.db.engine import (
@@ -213,6 +214,11 @@ class SchedulerService:
             ),
         ]
 
+    @property
+    def stop(self) -> asyncio.Event:
+        """The shared stop event driving every loop (for signal wiring)."""
+        return self._stop
+
     def request_stop(self) -> None:
         """Signal all loops to finish their current sleep and exit."""
         self._stop.set()
@@ -248,6 +254,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     health.add_readiness_check(nats_check(nc), name="nats")
     await health.start()
 
+    install_signal_handlers(service.stop)
     handles = service.start()
     try:
         await asyncio.gather(*handles)

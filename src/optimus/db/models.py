@@ -291,6 +291,30 @@ class StatsRollup(Base):
     actions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class OutboxEvent(Base):
+    """A bus message staged for publish in the same transaction that wrote its source.
+
+    The transactional-outbox row for a dual write: detection persists its
+    ``Detection`` and the ``verdict.v1`` (and any ``swarm_alert.v1``) row here in
+    one DB transaction, so a crash or bus outage can never leave a persisted
+    detection with no verdict on the bus. A relay drains unpublished rows and
+    publishes them with at-least-once semantics (``msg_id`` carries the
+    server-side dedup key so a retried publish never fans a duplicate).
+    """
+
+    __tablename__ = "outbox"
+    # The relay scans for the oldest not-yet-published rows; a partial index on
+    # the unpublished set keeps that scan cheap as published rows accumulate.
+    __table_args__ = (Index("ix_outbox_unpublished", "id", "published_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    msg_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _ts()
+
+
 class Evidence(Base):
     """A reference to a stored (encrypted, TTL'd) evidence object."""
 

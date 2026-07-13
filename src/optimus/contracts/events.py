@@ -19,6 +19,10 @@ SUBJECT_VERDICT = "events.verdict.v1"
 SUBJECT_ACTION_RESULT = "events.action_result.v1"
 SUBJECT_SWARM_ALERT = "events.swarm_alert.v1"
 SUBJECT_GUILD_JOINED = "events.guild_joined.v1"
+#: Terminal sink for messages that exhausted ``max_deliver`` on their original
+#: subject. Nothing consumes it by default; an operator/alert drains it so a
+#: poison or persistently-failing message is captured rather than silently lost.
+SUBJECT_DEAD_LETTER = "events.dead_letter.v1"
 
 #: Core-NATS (non-JetStream) pub/sub subject for hash-index invalidation.
 SUBJECT_INDEX_INVALIDATE = "control.index_invalidate.v1"
@@ -34,6 +38,7 @@ EVENT_SUBJECTS: tuple[str, ...] = (
     SUBJECT_ACTION_RESULT,
     SUBJECT_SWARM_ALERT,
     SUBJECT_GUILD_JOINED,
+    SUBJECT_DEAD_LETTER,
 )
 
 
@@ -180,3 +185,17 @@ class GuildJoinedEvent(_Event):
     guild_id: int
     guild_name: str | None = None
     owner_id: int | None = None
+
+
+class DeadLetterEvent(_Event):
+    """A message that exhausted ``max_deliver`` on its origin. Subject: ``dead_letter.v1``.
+
+    Carries the original subject, the raw (still-JSON) payload, how many times it
+    was delivered, and the last handler error, so the failure is captured for
+    inspection/replay instead of being dropped when JetStream gives up.
+    """
+
+    original_subject: str
+    payload: str
+    delivered: int = Field(ge=1)
+    error: str | None = None
