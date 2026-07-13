@@ -50,9 +50,11 @@ def upgrade() -> None:
         column = _GUILD_COLUMN.get(table, "guild_id")
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
         op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
+        # NULLIF maps an unset GUC (which reads as '' not NULL) to NULL so the
+        # comparison yields NULL -> zero rows, rather than raising on ''::bigint.
         op.execute(
             f"CREATE POLICY tenant_isolation ON {table} USING "
-            f"({column} = current_setting('optimus.guild_id', true)::bigint)"
+            f"({column} = NULLIF(current_setting('optimus.guild_id', true), '')::bigint)"
         )
 
 

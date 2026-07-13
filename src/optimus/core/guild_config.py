@@ -181,5 +181,7 @@ class GuildConfigCache:
             await self._redis.delete(self._key(guild_id))  # type: ignore[attr-defined]
 
     async def _load(self, guild_id: int) -> GuildConfig:
-        async with self._loader() as session:  # type: ignore[operator]
+        # Pass the guild id into the scope so multi-tenant mode sets the
+        # ``optimus.guild_id`` GUC and RLS scopes the config read to this tenant.
+        async with self._loader(guild_id) as session:  # type: ignore[operator]
             return await load_from_db(session, guild_id)

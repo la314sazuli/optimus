@@ -28,11 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from functools import partial
 
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from optimus.app.memory import MemoryStore
 from optimus.app.migrate import run_migrations
@@ -54,7 +53,12 @@ from optimus.core.health import HealthServer
 from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter
 from optimus.core.readiness import db_check
-from optimus.db.engine import SessionScope, create_engine, create_session_factory, session_scope
+from optimus.db.engine import (
+    SessionScope,
+    create_engine,
+    create_session_factory,
+    create_session_scope,
+)
 from optimus.services.detection.service import DetectionService
 from optimus.services.detection.service import build_service as build_detection
 from optimus.services.ingest.service import _handle as ingest_handle
@@ -118,9 +122,7 @@ class SimpleApp:
 
         engine = create_engine(url, settings=settings)
         factory = create_session_factory(engine)
-
-        def scope() -> AbstractAsyncContextManager[AsyncSession]:
-            return session_scope(factory)
+        scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
         bus = InProcessBus(duplicate_window=settings.bus_duplicate_window_seconds)
         store = MemoryStore()

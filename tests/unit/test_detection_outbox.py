@@ -47,8 +47,8 @@ async def scope() -> AsyncIterator[SessionScope]:
     factory = create_session_factory(engine)
 
     @asynccontextmanager
-    async def _scope() -> AsyncIterator[_Session]:
-        async with session_scope(factory) as s:
+    async def _scope(guild_id: int | None = None) -> AsyncIterator[_Session]:
+        async with session_scope(factory, guild_id=guild_id) as s:
             yield s
 
     yield _scope

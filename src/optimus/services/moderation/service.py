@@ -15,10 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
-
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
@@ -44,7 +41,7 @@ from optimus.db.engine import (
     SessionScope,
     create_engine,
     create_session_factory,
-    session_scope,
+    create_session_scope,
 )
 from optimus.db.models import Detection, Guild
 from optimus.db.repositories import (
@@ -95,7 +92,7 @@ class ModerationService:
 
     async def on_guild_joined(self, event: GuildJoinedEvent) -> None:
         """Ensure the guild row exists so config + review channel can be set up."""
-        async with self._scope() as session:
+        async with self._scope(event.guild_id) as session:
             repo = GuildRepository(session)
             if await repo.get(event.guild_id) is None:
                 await repo.upsert(Guild(guild_id=event.guild_id))
@@ -175,7 +172,7 @@ def build_coordinator(
     )
 
     async def config(guild_id: int) -> GuildModConfig:
-        async with scope() as session:
+        async with scope(guild_id) as session:
             guild = await GuildRepository(session).get(guild_id)
             action = Action(guild.action_policy) if guild is not None else Action.REPORT_ONLY
             return GuildModConfig(
@@ -198,7 +195,7 @@ def build_coordinator(
         return await _post_report(rest, channel_id, data)
 
     async def audit(event: VerdictEvent, action: str, result: ActionResult) -> int | None:
-        async with scope() as session:
+        async with scope(event.guild_id) as session:
             det_repo = DetectionRepository(session, event.guild_id)
             detection = await det_repo.get_by_idempotency_key(event.idempotency_key)
             if detection is None:
@@ -320,9 +317,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
 
     engine = create_engine()
     factory = create_session_factory(engine)
-
-    def scope() -> AbstractAsyncContextManager[AsyncSession]:
-        return session_scope(factory)
+    scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
     coordinator, dispatcher = build_coordinator(
         settings, scope, rest=rest, redis=redis, bot_user_id=bot_user_id

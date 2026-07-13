@@ -191,7 +191,7 @@ async def test_config_cache_loads_then_serves_from_cache() -> None:
         async def __aexit__(self, *exc: object) -> None:
             return None
 
-    def loader() -> _Loader:
+    def loader(guild_id: int | None = None) -> _Loader:
         return _Loader()
 
     async def fake_load(_session: object, guild_id: int) -> GuildConfig:
@@ -218,6 +218,6 @@ async def test_config_cache_loads_then_serves_from_cache() -> None:
 async def test_config_cache_invalidate_drops_key() -> None:
     redis = _FakeRedis()
     redis.store["optimus:guildcfg:1"] = GuildConfig(guild_id=1).to_json()
-    cache = GuildConfigCache(redis, lambda: None)
+    cache = GuildConfigCache(redis, lambda guild_id=None: None)
     await cache.invalidate(1)
     assert "optimus:guildcfg:1" not in redis.store

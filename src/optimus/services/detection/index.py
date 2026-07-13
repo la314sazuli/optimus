@@ -213,7 +213,7 @@ class IndexManager:
             self._store_guild(guild_id, await self._build_guild(guild_id))
 
     async def _build_guild(self, guild_id: int) -> HashIndex:
-        async with self._scope() as session:
+        async with self._scope(guild_id) as session:
             repo = GuildHashRepository(session, guild_id)
             rows = await repo.list_active()
             entries = [

@@ -183,15 +183,13 @@ async def _amain() -> None:
     await bus.ensure_stream()
 
     redis = _open_redis(settings)
-    from optimus.db.engine import create_engine, create_session_factory, session_scope
+    from optimus.db.engine import create_engine, create_session_factory, create_session_scope
 
     engine = create_engine()
     factory = create_session_factory(engine)
+    scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
-    def loader() -> object:
-        return session_scope(factory)
-
-    config_cache = GuildConfigCache(redis, loader)
+    config_cache = GuildConfigCache(redis, scope)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
     health.add_readiness_check(nats_check(nc), name="nats")
