@@ -292,6 +292,49 @@ async def test_publish_after_consumer_stop_does_not_block_publisher() -> None:
     await asyncio.wait_for(bus.publish("s", _Evt(n=3)), timeout=1.0)
 
 
+async def test_redelivery_does_not_deadlock_on_full_queue() -> None:
+    """A failing handler's redelivery must not wedge when the queue is full.
+
+    Regression: ``_dispatch`` requeued the failed delivery while still holding its
+    in-flight permit. The queue is sized to ``max_inflight``, so a redelivery
+    ``put`` blocks when the queue is full; holding the permit across that put let
+    a racing publisher steal the single slot the consume loop's ``get`` freed,
+    leaving every worker blocked on ``put``, the loop blocked on ``sem.acquire``,
+    and nothing able to drain — a permanent deadlock. Releasing the permit before
+    the requeue keeps the loop able to acquire and drain. The one-slot queue plus
+    concurrent publishers below reproduce the slot-steal race.
+    """
+    for _ in range(30):
+        bus = InProcessBus()
+        attempts: list[int] = []
+        done = asyncio.Event()
+
+        async def handler(
+            _evt: _Evt, counter: list[int] = attempts, signal: asyncio.Event = done
+        ) -> None:
+            counter.append(1)
+            if len(counter) >= 5:
+                signal.set()
+                return
+            raise RuntimeError("boom")
+
+        stop = asyncio.Event()
+        task = bus.run(
+            "s",
+            durable="d",
+            model=_Evt,
+            handler=handler,
+            max_inflight=1,
+            max_deliver=100,
+            stop_event=stop,
+        )
+        await asyncio.sleep(0)
+        publishers = [asyncio.create_task(bus.publish("s", _Evt(n=i))) for i in range(4)]
+        await asyncio.wait_for(asyncio.gather(*publishers), timeout=2.0)
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        await _drain(stop, task)
+
+
 async def test_concurrent_publish_during_consumer_shutdown_settles() -> None:
     """Publishes racing a consumer stop never hang and exactly-once still holds.
 

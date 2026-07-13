@@ -270,27 +270,41 @@ class InProcessBus:
     async def _dispatch(
         self, consumer: _Consumer, delivery: _Delivery, sem: asyncio.Semaphore
     ) -> None:
-        """Run the handler for one delivery, redelivering or dropping on failure."""
+        """Run the handler for one delivery, redelivering or dropping on failure.
+
+        The in-flight permit is released *before* any redelivery ``queue.put``.
+        The queue is sized to ``max_inflight``, so a requeue can block when the
+        queue is full; holding the permit across that put would let every worker
+        block on put while the consume loop is stuck on ``sem.acquire()`` and
+        cannot drain the queue — a deadlock. The waiting message is not in flight,
+        so it must not occupy a permit.
+        """
         try:
-            delivery.deliveries += 1
-            subject = consumer.subject
-            MESSAGES_INFLIGHT.labels(subject=subject).inc()
-            try:
-                cid = getattr(delivery.event, "correlation_id", None)
-                with correlation_context(cid):
-                    try:
-                        await consumer.handler(delivery.event)
-                    except Exception:
-                        await self._on_handler_failure(consumer, delivery)
-                        return
-                MESSAGES_ACKED.labels(subject=subject).inc()
-            finally:
-                MESSAGES_INFLIGHT.labels(subject=subject).dec()
+            requeue = await self._run_handler(consumer, delivery)
         finally:
             sem.release()
+        if requeue:
+            await consumer.queue.put(delivery)
 
-    async def _on_handler_failure(self, consumer: _Consumer, delivery: _Delivery) -> None:
-        """Redeliver a failed message up to ``max_deliver``, then drop it."""
+    async def _run_handler(self, consumer: _Consumer, delivery: _Delivery) -> bool:
+        """Invoke the handler once; return whether the delivery should be requeued."""
+        delivery.deliveries += 1
+        subject = consumer.subject
+        MESSAGES_INFLIGHT.labels(subject=subject).inc()
+        try:
+            cid = getattr(delivery.event, "correlation_id", None)
+            with correlation_context(cid):
+                try:
+                    await consumer.handler(delivery.event)
+                except Exception:
+                    return self._on_handler_failure(consumer, delivery)
+            MESSAGES_ACKED.labels(subject=subject).inc()
+            return False
+        finally:
+            MESSAGES_INFLIGHT.labels(subject=subject).dec()
+
+    def _on_handler_failure(self, consumer: _Consumer, delivery: _Delivery) -> bool:
+        """Record a failed delivery; return True to redeliver, False once dropped."""
         subject = consumer.subject
         MESSAGES_NAKED.labels(subject=subject).inc()
         if delivery.deliveries >= consumer.max_deliver:
@@ -301,6 +315,6 @@ class InProcessBus:
                 reason="max_deliver",
                 deliveries=delivery.deliveries,
             )
-            return
+            return False
         _log.warning("bus_handler_failed", subject=subject, deliveries=delivery.deliveries)
-        await consumer.queue.put(delivery)
+        return True
