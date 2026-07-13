@@ -39,6 +39,7 @@ from optimus.db.repositories import (
     WhitelistRepository,
 )
 from optimus.globaldb.service import GlobalHashService
+from optimus.globaldb.signing import Keyring
 from optimus.i18n import translate
 from optimus.services.interactions.handlers import (
     InteractionContext,
@@ -219,12 +220,31 @@ class DbDeps:
         )
 
     def global_service(self) -> GlobalHashService:
+        settings = self._settings
+        keys = dict(settings.signing_public_key_map)
+        # Ensure the active signing key is always trusted for verification, even
+        # if the operator only set the single public key rather than the map.
+        if settings.global_signing_key_id and settings.global_signing_public_key:
+            keys.setdefault(settings.global_signing_key_id, settings.global_signing_public_key)
+        keyring = Keyring(
+            keys=keys,
+            revoked=settings.revoked_signing_key_ids,
+            legacy_public_key_b64=settings.global_signing_public_key,
+            # Bind the mirrored legacy key to the active key id so revoking that
+            # id also rejects bare-format signatures from the same key — no
+            # signature-downgrade bypass of revocation.
+            legacy_key_id=settings.global_signing_key_id or None,
+        )
         return GlobalHashService(
             GlobalHashRepository(self._session),
             GlobalSubmitterRepository(self._session),
             self._rl,
-            signing_private_key_b64=self._settings.global_signing_private_key,
-            signing_public_key_b64=self._settings.global_signing_public_key,
+            signing_private_key_b64=settings.global_signing_private_key,
+            signing_public_key_b64=settings.global_signing_public_key,
+            signing_key_id=settings.global_signing_key_id,
+            verify_keyring=keyring,
+            min_distinct_guilds=settings.global_promotion_min_distinct,
+            trusted_guild_ids=settings.trusted_guild_id_set,
         )
 
 

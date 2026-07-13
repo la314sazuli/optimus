@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from optimus.core.config import Sensitivity, Settings, Tenancy
 from optimus.core.health import HealthServer
+from optimus.globaldb.signing import generate_keypair
 
 
 def test_settings_defaults() -> None:
@@ -46,6 +47,49 @@ def test_retention_and_pool_defaults() -> None:
     assert settings.db_max_overflow == 10
     assert settings.db_pool_recycle == 1800
     assert settings.db_pool_pre_ping is True
+
+
+def test_global_trust_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.global_promotion_min_distinct == 3
+    assert settings.trusted_guild_id_set is None
+    assert settings.signing_public_key_map == {}
+    assert settings.revoked_signing_key_ids == frozenset()
+
+
+def test_global_trust_parsing_from_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    _, pub1 = generate_keypair()
+    _, pub2 = generate_keypair()
+    monkeypatch.setenv("OPTIMUS_GLOBAL_PROMOTION_MIN_DISTINCT", "5")
+    monkeypatch.setenv("OPTIMUS_GLOBAL_TRUSTED_GUILD_IDS", "100, 200 ,300")
+    monkeypatch.setenv("OPTIMUS_GLOBAL_SIGNING_PUBLIC_KEYS", f"k1:{pub1}, k2:{pub2}")
+    monkeypatch.setenv("OPTIMUS_GLOBAL_REVOKED_KEY_IDS", "k1")
+    settings = Settings(_env_file=None)
+    assert settings.global_promotion_min_distinct == 5
+    assert settings.trusted_guild_id_set == frozenset({100, 200, 300})
+    assert settings.signing_public_key_map == {"k1": pub1, "k2": pub2}
+    assert settings.revoked_signing_key_ids == frozenset({"k1"})
+
+
+def test_malformed_signing_key_map_raises_at_startup(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Validation runs during Settings construction (startup), not lazily.
+    monkeypatch.setenv("OPTIMUS_GLOBAL_SIGNING_PUBLIC_KEYS", "no-colon-here")
+    with pytest.raises(ValidationError, match="malformed signing-key entry"):
+        Settings(_env_file=None)
+
+
+def test_signing_key_bad_base64_raises_at_startup(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # A typo'd key value is rejected loudly instead of silently failing to verify.
+    monkeypatch.setenv("OPTIMUS_GLOBAL_SIGNING_PUBLIC_KEYS", "k1:not-valid-base64!!")
+    with pytest.raises(ValidationError, match="not valid base64"):
+        Settings(_env_file=None)
+
+
+def test_signing_key_wrong_length_raises_at_startup(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Valid base64 but not a 32-byte Ed25519 key is rejected too.
+    monkeypatch.setenv("OPTIMUS_GLOBAL_SIGNING_PUBLIC_KEYS", "k1:AAAA")
+    with pytest.raises(ValidationError, match="must decode to 32 bytes"):
+        Settings(_env_file=None)
 
 
 def test_retention_settings_from_env(monkeypatch) -> None:  # type: ignore[no-untyped-def]
