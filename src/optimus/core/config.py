@@ -9,6 +9,8 @@ from typing import Self
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from optimus.globaldb.promotion import MIN_DISTINCT_APPROVERS
+
 
 def _parse_shard_ids(raw: str) -> tuple[int, ...]:
     """Parse a shard-id spec into a sorted, de-duplicated tuple.
@@ -32,6 +34,38 @@ def _parse_shard_ids(raw: str) -> tuple[int, ...]:
         else:
             ids.add(int(token))
     return tuple(sorted(ids))
+
+
+def _parse_key_map(raw: str) -> dict[str, str]:
+    """Parse a ``"key_id:b64,key_id2:b64"`` spec into an id -> public-key map.
+
+    Whitespace and blank entries are ignored. A malformed entry (missing ``:``
+    or a duplicate id) raises :class:`ValueError` so a bad rotation config fails
+    loudly at startup rather than silently dropping a key.
+    """
+    keys: dict[str, str] = {}
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        key_id, sep, value = token.partition(":")
+        key_id, value = key_id.strip(), value.strip()
+        if not sep or not key_id or not value:
+            raise ValueError(f"malformed signing-key entry: {token!r} (expected 'key_id:b64')")
+        if key_id in keys:
+            raise ValueError(f"duplicate signing key_id: {key_id!r}")
+        keys[key_id] = value
+    return keys
+
+
+def _parse_int_csv(raw: str) -> frozenset[int]:
+    """Parse a comma-separated list of ints into a frozenset (blanks ignored)."""
+    return frozenset(int(t.strip()) for t in raw.split(",") if t.strip())
+
+
+def _parse_str_csv(raw: str) -> frozenset[str]:
+    """Parse a comma-separated list of strings into a frozenset (blanks ignored)."""
+    return frozenset(t.strip() for t in raw.split(",") if t.strip())
 
 
 class Mode(StrEnum):
@@ -308,8 +342,27 @@ class Settings(BaseSettings):
     scheduler_jitter_fraction: float = Field(default=0.1, ge=0.0, le=1.0)
 
     # Global hash DB signing (Ed25519, base64-encoded)
+    #: Legacy single public key; also verifies pre-versioning (unsigned-id)
+    #: records. Kept for backward compatibility.
     global_signing_public_key: str = ""
     global_signing_private_key: str = ""
+    #: The active signing key's id. When set, new promotions are signed as
+    #: ``"{key_id}:{sig}"``; blank keeps the legacy bare-signature format.
+    global_signing_key_id: str = ""
+    #: Currently-valid verification keys as ``"id:b64,id2:b64"``. Holding more
+    #: than one enables key rotation with an overlap window.
+    global_signing_public_keys: str = ""
+    #: Comma-separated key ids that must never be trusted (revocation), even if
+    #: still listed in ``global_signing_public_keys``.
+    global_revoked_key_ids: str = ""
+
+    # Global hash DB promotion (anti-sybil)
+    #: Distinct (trusted) guilds required to promote a candidate fleet-wide.
+    global_promotion_min_distinct: int = Field(default=MIN_DISTINCT_APPROVERS, ge=1)
+    #: Optional allowlist of guild ids whose approvals corroborate a promotion,
+    #: as a comma-separated list. Blank trusts every guild (relying on the
+    #: distinct-count floor alone); setting it blocks sybil guilds entirely.
+    global_trusted_guild_ids: str = ""
 
     @field_validator("shard_count", mode="before")
     @classmethod
@@ -383,6 +436,22 @@ class Settings(BaseSettings):
                 f"got {list(self.shard_ids)}"
             )
         return self
+
+    @property
+    def signing_public_key_map(self) -> dict[str, str]:
+        """The currently-valid verification keys as an id -> base64 map."""
+        return _parse_key_map(self.global_signing_public_keys)
+
+    @property
+    def revoked_signing_key_ids(self) -> frozenset[str]:
+        """Key ids that must never be trusted, even if still listed."""
+        return _parse_str_csv(self.global_revoked_key_ids)
+
+    @property
+    def trusted_guild_id_set(self) -> frozenset[int] | None:
+        """The promotion trust allowlist, or ``None`` when unset (trust all)."""
+        parsed = _parse_int_csv(self.global_trusted_guild_ids)
+        return parsed or None
 
     @property
     def is_multi_tenant(self) -> bool:

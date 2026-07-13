@@ -9,16 +9,29 @@ from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit
 from optimus.db.repositories import GlobalHashRepository, GlobalSubmitterRepository
 from optimus.globaldb.promotion import REJECT_DELTA
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
-from optimus.globaldb.signing import HashRecord, generate_keypair, verify_record
+from optimus.globaldb.signing import HashRecord, Keyring, generate_keypair, verify_record
 
 
-def _service(session: AsyncSession, *, priv: str = "", pub: str = "") -> GlobalHashService:
+def _service(
+    session: AsyncSession,
+    *,
+    priv: str = "",
+    pub: str = "",
+    min_distinct: int = 2,
+    trusted_guild_ids: frozenset[int] | None = None,
+    signing_key_id: str = "",
+    verify_keyring: Keyring | None = None,
+) -> GlobalHashService:
     return GlobalHashService(
         GlobalHashRepository(session),
         GlobalSubmitterRepository(session),
         InMemoryRateLimiter(),
         signing_private_key_b64=priv,
         signing_public_key_b64=pub,
+        signing_key_id=signing_key_id,
+        verify_keyring=verify_keyring,
+        min_distinct_guilds=min_distinct,
+        trusted_guild_ids=trusted_guild_ids,
     )
 
 
@@ -217,6 +230,115 @@ async def test_promotion_without_submitter_skips_reputation_credit(
     assert row is not None
     assert row.status == "promoted"
     assert row.signature  # signed despite having no submitter to credit
+
+
+@pytest.mark.asyncio
+async def test_below_corroboration_threshold_does_not_promote(session: AsyncSession) -> None:
+    # Anti-sybil: two colluding guilds cannot trigger fleet-wide auto-moderation
+    # when the corroboration bar is three distinct guilds.
+    priv, pub = generate_keypair()
+    svc = _service(session, priv=priv, pub=pub, min_distinct=3)
+    await _submit(svc, "h1")
+    r1 = await svc.approve(hash_id="h1", approver_user_id=11, approver_guild_id=100)
+    r2 = await svc.approve(hash_id="h1", approver_user_id=22, approver_guild_id=200)
+    assert r1.promoted is False
+    assert r2.promoted is False
+    row = await GlobalHashRepository(session).get("h1")
+    assert row is not None
+    assert row.status == "candidate"
+
+
+@pytest.mark.asyncio
+async def test_at_corroboration_threshold_promotes(session: AsyncSession) -> None:
+    priv, pub = generate_keypair()
+    svc = _service(session, priv=priv, pub=pub, min_distinct=3)
+    await _submit(svc, "h1")
+    await svc.approve(hash_id="h1", approver_user_id=11, approver_guild_id=100)
+    await svc.approve(hash_id="h1", approver_user_id=22, approver_guild_id=200)
+    third = await svc.approve(hash_id="h1", approver_user_id=33, approver_guild_id=300)
+    assert third.promoted is True
+    assert third.distinct_guilds == 3
+    row = await GlobalHashRepository(session).get("h1")
+    assert row is not None
+    assert row.status == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_guild_approvals_never_corroborate(session: AsyncSession) -> None:
+    # With a trust allowlist, sybil guilds outside it contribute nothing — even
+    # in numbers far above the distinct-count floor.
+    priv, pub = generate_keypair()
+    svc = _service(
+        session, priv=priv, pub=pub, min_distinct=2, trusted_guild_ids=frozenset({100, 200})
+    )
+    await _submit(svc, "h1")
+    for user, guild in [(1, 900), (2, 901), (3, 902), (4, 903)]:
+        result = await svc.approve(hash_id="h1", approver_user_id=user, approver_guild_id=guild)
+        assert result.promoted is False
+        assert result.distinct_guilds == 0
+    row = await GlobalHashRepository(session).get("h1")
+    assert row is not None
+    assert row.status == "candidate"
+
+
+@pytest.mark.asyncio
+async def test_trusted_guild_corroboration_promotes(session: AsyncSession) -> None:
+    priv, pub = generate_keypair()
+    svc = _service(
+        session, priv=priv, pub=pub, min_distinct=2, trusted_guild_ids=frozenset({100, 200})
+    )
+    await _submit(svc, "h1")
+    # An untrusted approval is ignored; two trusted guilds meet the bar.
+    await svc.approve(hash_id="h1", approver_user_id=9, approver_guild_id=999)
+    await svc.approve(hash_id="h1", approver_user_id=11, approver_guild_id=100)
+    second = await svc.approve(hash_id="h1", approver_user_id=22, approver_guild_id=200)
+    assert second.promoted is True
+    assert second.distinct_guilds == 2
+
+
+@pytest.mark.asyncio
+async def test_verified_promoted_accepts_rotated_key(session: AsyncSession) -> None:
+    # Sign under key "k2"; verify against a keyring holding both "k1" and "k2"
+    # (an overlap window) — rotation works without a flag-day.
+    _, pub1 = generate_keypair()
+    priv2, pub2 = generate_keypair()
+    keyring = Keyring(keys={"k1": pub1, "k2": pub2})
+    svc = _service(
+        session, priv=priv2, pub=pub2, signing_key_id="k2", verify_keyring=keyring, min_distinct=2
+    )
+    await _submit(svc, "h1")
+    await svc.approve(hash_id="h1", approver_user_id=11, approver_guild_id=100)
+    await svc.approve(hash_id="h1", approver_user_id=22, approver_guild_id=200)
+
+    verified = await svc.verified_promoted()
+    assert {row.hash_id for row in verified} == {"h1"}
+    row = await GlobalHashRepository(session).get("h1")
+    assert row is not None
+    assert row.signature is not None
+    assert row.signature.startswith("k2:")
+
+
+@pytest.mark.asyncio
+async def test_verified_promoted_drops_revoked_key(session: AsyncSession) -> None:
+    priv, pub = generate_keypair()
+    # Promote while "k1" is valid, then rebuild verification with "k1" revoked.
+    signing = _service(
+        session,
+        priv=priv,
+        pub=pub,
+        signing_key_id="k1",
+        verify_keyring=Keyring(keys={"k1": pub}),
+        min_distinct=2,
+    )
+    await _submit(signing, "h1")
+    await signing.approve(hash_id="h1", approver_user_id=11, approver_guild_id=100)
+    await signing.approve(hash_id="h1", approver_user_id=22, approver_guild_id=200)
+    assert len(await signing.verified_promoted()) == 1
+
+    revoked_view = _service(
+        session, verify_keyring=Keyring(keys={"k1": pub}, revoked=frozenset({"k1"}))
+    )
+    assert await revoked_view.verified_promoted() == []
 
 
 @pytest.mark.asyncio

@@ -6,11 +6,14 @@ rate limiter to implement the full candidate lifecycle:
 
 * **submit** — gated by submitter reputation and a per-user Redis rate limit;
 * **approve** — idempotent per moderator; once approvals come from
-  :data:`MIN_DISTINCT_APPROVERS` distinct moderators in *different* guilds the
-  candidate is **promoted** and signed with the authority's private key;
+  ``min_distinct_guilds`` distinct moderators in *different* guilds (optionally
+  limited to a ``trusted_guild_ids`` allowlist so sybil guilds cannot
+  corroborate) the candidate is **promoted** and signed with the authority's
+  private key under its ``key_id``;
 * **revoke** — flips a promoted/candidate hash to ``revoked``;
-* **verify** — consumers check each promoted record's signature against the
-  configured public key and reject anything unsigned or invalid.
+* **verify** — consumers check each promoted record's signature against a
+  :class:`~optimus.globaldb.signing.Keyring` (a rotating set of valid keys with
+  revocation) and reject anything unsigned, invalid, or signed by a revoked key.
 
 The private signing key is read only here, only on the signing-authority
 deployment, and only from configuration sourced from the environment — it is
@@ -25,11 +28,12 @@ from optimus.core.ratelimit import RateLimit, RateLimiter
 from optimus.db.models import GlobalHash
 from optimus.db.repositories import GlobalHashRepository, GlobalSubmitterRepository
 from optimus.globaldb.promotion import (
+    MIN_DISTINCT_APPROVERS,
     ApprovalRecord,
     can_submit,
     evaluate_promotion,
 )
-from optimus.globaldb.signing import HashRecord, sign_record, verify_record
+from optimus.globaldb.signing import HashRecord, Keyring, sign_record, verify_record
 
 #: Default per-user submission budget: 5 candidates, refilling at 1 per minute.
 SUBMIT_RATE = RateLimit(capacity=5.0, refill_rate=1.0 / 60.0)
@@ -63,13 +67,26 @@ class GlobalHashService:
         *,
         signing_private_key_b64: str = "",
         signing_public_key_b64: str = "",
+        signing_key_id: str = "",
+        verify_keyring: Keyring | None = None,
+        min_distinct_guilds: int = MIN_DISTINCT_APPROVERS,
+        trusted_guild_ids: frozenset[int] | None = None,
         submit_rate: RateLimit = SUBMIT_RATE,
     ) -> None:
         self._hashes = hashes
         self._submitters = submitters
         self._rl = rate_limiter
         self._private_key = signing_private_key_b64
-        self._public_key = signing_public_key_b64
+        self._signing_key_id = signing_key_id or None
+        # Verify against an explicit keyring when supplied; otherwise fall back to
+        # the single configured public key (as both the active and legacy key) so
+        # existing single-key deployments keep verifying with no extra config.
+        self._keyring = verify_keyring or Keyring(
+            keys=({signing_key_id: signing_public_key_b64} if signing_key_id else {}),
+            legacy_public_key_b64=signing_public_key_b64,
+        )
+        self._min_distinct = min_distinct_guilds
+        self._trusted_guild_ids = trusted_guild_ids
         self._submit_rate = submit_rate
 
     async def submit(
@@ -123,7 +140,9 @@ class GlobalHashService:
             approver_guild_id=approver_guild_id,
         )
         decision = evaluate_promotion(
-            [ApprovalRecord(a.approver_user_id, a.approver_guild_id) for a in approvals]
+            [ApprovalRecord(a.approver_user_id, a.approver_guild_id) for a in approvals],
+            min_distinct=self._min_distinct,
+            trusted_guild_ids=self._trusted_guild_ids,
         )
 
         if decision.promotable and row.status != "promoted":
@@ -161,10 +180,10 @@ class GlobalHashService:
         return [row for row in rows if self._verify(row)]
 
     def _sign(self, row: GlobalHash) -> str:
-        return sign_record(self._record(row), self._private_key)
+        return sign_record(self._record(row), self._private_key, key_id=self._signing_key_id)
 
     def _verify(self, row: GlobalHash) -> bool:
-        return verify_record(self._record(row), row.signature, self._public_key)
+        return verify_record(self._record(row), row.signature, self._keyring)
 
     @staticmethod
     def _record(row: GlobalHash) -> HashRecord:
