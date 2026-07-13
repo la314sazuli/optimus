@@ -113,6 +113,10 @@ class GlobalHashService:
         *distinct* moderators in *distinct* guilds (same user or same guild does
         not stack). On promotion the submitter's reputation is credited.
         """
+        row = await self._hashes.get(hash_id)
+        if row is None:
+            raise KeyError(hash_id)
+
         approvals = await self._hashes.add_approval(
             hash_id=hash_id,
             approver_user_id=approver_user_id,
@@ -121,9 +125,6 @@ class GlobalHashService:
         decision = evaluate_promotion(
             [ApprovalRecord(a.approver_user_id, a.approver_guild_id) for a in approvals]
         )
-        row = await self._hashes.get(hash_id)
-        if row is None:
-            raise KeyError(hash_id)
 
         if decision.promotable and row.status != "promoted":
             signature = self._sign(row)

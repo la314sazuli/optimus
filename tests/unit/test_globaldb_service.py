@@ -173,11 +173,19 @@ async def test_revoke_unknown_raises(session: AsyncSession) -> None:
 
 @pytest.mark.asyncio
 async def test_approve_unknown_hash_raises(session: AsyncSession) -> None:
-    # An approval can be recorded for a hash_id that was never submitted; the
-    # service then fails to find the candidate row and raises.
+    # Approving a hash_id that was never submitted fails fast with KeyError and
+    # records no orphan approval row (the candidate is checked before insert).
     svc = _service(session)
     with pytest.raises(KeyError):
         await svc.approve(hash_id="ghost", approver_user_id=11, approver_guild_id=100)
+    from sqlalchemy import func, select
+
+    from optimus.db.models import GlobalHashApproval
+
+    count = (
+        await session.execute(select(func.count()).select_from(GlobalHashApproval))
+    ).scalar_one()
+    assert count == 0
 
 
 @pytest.mark.asyncio

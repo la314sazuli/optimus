@@ -54,6 +54,12 @@ def _apply_sqlite_pragmas(engine: AsyncEngine, *, busy_timeout_ms: int) -> None:
     0, so a second writer raises ``database is locked`` immediately. WAL lets
     readers proceed alongside one writer, and the busy timeout makes the brief
     writer-vs-writer overlaps wait-and-retry instead of erroring.
+
+    ``foreign_keys=ON`` is also required: SQLite disables foreign-key enforcement
+    per connection by default, which silently turns every ``ondelete="CASCADE"``
+    into a no-op. Without it the retention purge and GDPR erasure paths, which
+    lean on cascades to remove child rows (appeals/evidence under a detection,
+    detections under a guild), would orphan those rows in simple mode.
     """
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -63,6 +69,7 @@ def _apply_sqlite_pragmas(engine: AsyncEngine, *, busy_timeout_ms: int) -> None:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
 
