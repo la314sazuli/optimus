@@ -45,9 +45,7 @@ async def test_sqlite_enforces_ondelete_cascade() -> None:
     try:
         async with factory() as session:
             session.add(Guild(guild_id=1))
-            session.add(
-                GuildHash(guild_id=1, hash_id="h1", phash=1, dhash=2, whash=3)
-            )
+            session.add(GuildHash(guild_id=1, hash_id="h1", phash=1, dhash=2, whash=3))
             detection = Detection(
                 guild_id=1,
                 message_id=10,
