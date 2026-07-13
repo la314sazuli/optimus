@@ -97,12 +97,25 @@ tests in `tests/unit/test_interactions_handlers.py` and
   filter every query by `guild_id`; no raw SQL / `text()` interpolation. In
   multi-tenant builds the session scope sets the transaction-local
   `optimus.guild_id` GUC (`SELECT set_config(..., true)`) for guild-scoped work,
-  so migration `0002`'s PostgreSQL row-level security actually enforces tenant
-  isolation at the database (not merely defence in depth). An unset GUC evaluates
-  to NULL, so an RLS-subject role with no GUC sees zero rows. Single-tenant/simple
-  mode never sets the GUC and does not depend on RLS. Verified by
+  so migrations `0002`/`0007`'s PostgreSQL row-level security actually enforces
+  tenant isolation at the database (not merely defence in depth). An unset GUC
+  evaluates to NULL, so an RLS-subject role with no GUC sees zero rows.
+  Single-tenant/simple mode never sets the GUC and does not depend on RLS.
+- **Two-role least privilege** (`docker-compose.yml`,
+  `deploy/postgres/10-init-rls-roles.sh`): because FORCE ROW LEVEL SECURITY
+  returns *zero* rows (not all rows) for an unscoped query, a single role cannot
+  do both per-tenant isolation and cross-tenant maintenance. Request/detection
+  services connect as `optimus_app` (NOBYPASSRLS — the RLS-subject role);
+  genuinely account-wide work connects as `optimus_maintenance` (BYPASSRLS) via
+  `OPTIMUS_MAINTENANCE_DATABASE_URL`: the scheduler's retention/purge/rollup/
+  enumeration jobs and the DM-only `/forget_me` GDPR erasure (which spans every
+  guild a user appears in). The compose stack no longer runs the superuser as the
+  effective app role, so the isolation is real out of the box; the superuser is
+  used only by the one-shot `migrate` job that owns the schema. Verified by
   `tests/integration/test_rls_isolation.py` (skipped unless
-  `OPTIMUS_TEST_POSTGRES_URL` points at a real Postgres).
+  `OPTIMUS_TEST_POSTGRES_URL` points at a real Postgres), which asserts both
+  per-tenant isolation on the RLS-subject role and correct cross-tenant effects
+  on the BYPASSRLS role.
 - **Secrets** (`core/config.py`, `core/logging.py`): all secrets come from
   `OPTIMUS_`-prefixed env via pydantic-settings; `.env`/`.env.*` are gitignored
   (with `.env.example` whitelisted and containing only empty placeholders); no

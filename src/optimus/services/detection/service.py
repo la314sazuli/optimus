@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager
 
 from sqlalchemy.exc import IntegrityError
 

@@ -137,3 +137,27 @@ def create_session_scope(
         return session_scope(factory, guild_id=guild_id, multi_tenant=multi_tenant)
 
     return scope
+
+
+def create_maintenance_scope(factory: async_sessionmaker[AsyncSession]) -> SessionScope:
+    """Bind ``factory`` into a scope for cross-tenant *maintenance* work.
+
+    Unlike :func:`create_session_scope`, this never sets the ``optimus.guild_id``
+    GUC: maintenance jobs (retention, deployment-wide purge, per-hour rollups,
+    guild enumeration, GDPR erasure) span every tenant, so scoping to one guild
+    would be wrong. Any ``guild_id`` passed by a caller is ignored for GUC
+    purposes; per-guild correctness comes from the repositories' own ``WHERE
+    guild_id = …`` clauses.
+
+    Under FORCE ROW LEVEL SECURITY an unscoped query returns zero rows for an
+    RLS-subject role, so in multi-tenant mode ``factory`` MUST be bound to an
+    engine using a BYPASSRLS role (see
+    :attr:`~optimus.core.config.Settings.maintenance_database_url`). Binding it to
+    the ordinary NOBYPASSRLS request role would make every maintenance job a
+    silent no-op.
+    """
+
+    def scope(guild_id: int | None = None) -> AbstractAsyncContextManager[AsyncSession]:
+        return session_scope(factory, guild_id=None, multi_tenant=False)
+
+    return scope

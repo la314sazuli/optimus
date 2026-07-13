@@ -113,6 +113,16 @@ class Settings(BaseSettings):
 
     # Datastores
     database_url: str = "postgresql+asyncpg://optimus:optimus@localhost:5432/optimus"
+    #: Connection URL for cross-tenant *maintenance* work (the scheduler's
+    #: retention/purge/rollup/enumeration jobs and the interactions GDPR erasure
+    #: path). In multi-tenant mode ``database_url`` must be a NOBYPASSRLS role so
+    #: request paths are subject to row-level security; that same role sees ZERO
+    #: rows for any unscoped/cross-tenant query, which would silently no-op every
+    #: maintenance job. Point this at a role with the BYPASSRLS attribute so those
+    #: genuinely account-wide operations are not filtered away. Unset (the
+    #: default) falls back to ``effective_database_url`` — correct for
+    #: single-tenant/simple mode, where no RLS is in force.
+    maintenance_database_url: str | None = None
     redis_url: str = "redis://localhost:6379/0"
     #: Per-operation socket timeout (seconds) for the async Redis client. Bounds
     #: how long a single command blocks when Redis is unreachable so a dead Redis
@@ -398,6 +408,17 @@ class Settings(BaseSettings):
     def effective_database_url(self) -> str:
         """The DB URL for the active mode: SQLite in simple, configured otherwise."""
         return self.simple_database_url if self.is_simple_mode else self.database_url
+
+    @property
+    def effective_maintenance_database_url(self) -> str:
+        """The DB URL for cross-tenant maintenance jobs (scheduler, GDPR erasure).
+
+        Defaults to :attr:`effective_database_url`. In multi-tenant mode operators
+        MUST override :attr:`maintenance_database_url` with a BYPASSRLS role;
+        otherwise maintenance shares the RLS-subject role and every unscoped sweep
+        silently affects zero rows.
+        """
+        return self.maintenance_database_url or self.effective_database_url
 
 
 @lru_cache(maxsize=1)

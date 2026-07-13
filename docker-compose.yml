@@ -16,9 +16,19 @@ x-optimus-image: &optimus-image
 
 x-optimus-env: &optimus-env
   # In-cluster datastore URLs override the localhost defaults from .env.example.
-  OPTIMUS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-optimus}:${POSTGRES_PASSWORD:-optimus}@postgres:5432/${POSTGRES_DB:-optimus}
+  # Request/detection services connect as the RLS-subject role `optimus_app`
+  # (NOBYPASSRLS), created by deploy/postgres/10-init-rls-roles.sh. It only ever
+  # sees the tenant whose id the app sets in optimus.guild_id, so multi-tenant
+  # isolation is real out of the box — NOT the superuser, which would bypass RLS.
+  OPTIMUS_DATABASE_URL: postgresql+asyncpg://optimus_app:${OPTIMUS_APP_DB_PASSWORD:-optimus_app}@postgres:5432/${POSTGRES_DB:-optimus}
   OPTIMUS_REDIS_URL: redis://redis:6379/0
   OPTIMUS_NATS_URL: nats://nats:4222
+
+# URL for the BYPASSRLS `optimus_maintenance` role. Cross-tenant maintenance
+# (scheduler sweeps, GDPR erasure) uses this so account-wide work is not filtered
+# to zero rows by FORCE ROW LEVEL SECURITY.
+x-optimus-maintenance-url: &optimus-maintenance-url
+  postgresql+asyncpg://optimus_maintenance:${OPTIMUS_MAINTENANCE_DB_PASSWORD:-optimus_maintenance}@postgres:5432/${POSTGRES_DB:-optimus}
 
 x-optimus-service: &optimus-service
   <<: *optimus-image
@@ -51,8 +61,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-optimus}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-optimus}
       POSTGRES_DB: ${POSTGRES_DB:-optimus}
+      # Passwords for the two least-privilege app roles the init script creates.
+      OPTIMUS_APP_DB_PASSWORD: ${OPTIMUS_APP_DB_PASSWORD:-optimus_app}
+      OPTIMUS_MAINTENANCE_DB_PASSWORD: ${OPTIMUS_MAINTENANCE_DB_PASSWORD:-optimus_maintenance}
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Runs once on first boot (empty data dir): creates optimus_app (NOBYPASSRLS)
+      # and optimus_maintenance (BYPASSRLS) and grants them table access.
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-optimus} -d ${POSTGRES_DB:-optimus}"]
       interval: 10s
@@ -104,7 +120,14 @@ services:
     <<: *optimus-image
     restart: "no"
     env_file: .env
-    environment: *optimus-env
+    environment:
+      <<: *optimus-env
+      # Migrations run as the schema OWNER (the superuser), not the RLS-subject
+      # app role: creating tables, enabling FORCE RLS, and defining policies all
+      # require ownership/privilege the app role deliberately lacks. Tables the
+      # owner creates auto-grant to both app roles via ALTER DEFAULT PRIVILEGES
+      # (see deploy/postgres/10-init-rls-roles.sh).
+      OPTIMUS_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-optimus}:${POSTGRES_PASSWORD:-optimus}@postgres:5432/${POSTGRES_DB:-optimus}
     command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
@@ -129,10 +152,20 @@ services:
 
   interactions:
     <<: *optimus-service
+    # Guild commands run as optimus_app (RLS-subject); the DM-only /forget_me
+    # erasure spans every guild, so it uses the maintenance (BYPASSRLS) URL.
+    environment:
+      <<: *optimus-env
+      OPTIMUS_MAINTENANCE_DATABASE_URL: *optimus-maintenance-url
     command: ["python", "-m", "optimus.services.interactions"]
 
   scheduler:
     <<: *optimus-service
+    # Purely cross-tenant maintenance: connect via the BYPASSRLS role so
+    # retention/purge/rollup/enumeration act on all tenants, not zero rows.
+    environment:
+      <<: *optimus-env
+      OPTIMUS_MAINTENANCE_DATABASE_URL: *optimus-maintenance-url
     command: ["python", "-m", "optimus.services.scheduler"]
 
   # ---- Optional monitoring stack -------------------------------------------

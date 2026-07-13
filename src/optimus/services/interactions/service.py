@@ -55,7 +55,7 @@ from optimus.services.interactions.logic import (
 from optimus.services.moderation.review import decode_custom_id
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 _log = get_logger(__name__)
 
@@ -231,10 +231,23 @@ class DbDeps:
 class InteractionService:
     """Routes hikari interactions through the pure handlers within a DB scope."""
 
-    def __init__(self, scope: SessionScope, rate_limiter: RateLimiter, settings: Settings) -> None:
+    def __init__(
+        self,
+        scope: SessionScope,
+        rate_limiter: RateLimiter,
+        settings: Settings,
+        *,
+        maintenance_scope: SessionScope | None = None,
+    ) -> None:
         self._scope = scope
         self._rl = rate_limiter
         self._settings = settings
+        # DM-reachable commands (guild_id is None) can be genuinely cross-tenant:
+        # /forget_me erases a user's rows across every guild. Under FORCE RLS the
+        # unscoped request role sees zero rows, so those run through a maintenance
+        # (BYPASSRLS) scope when one is supplied. Absent it (single-tenant/simple
+        # mode, or tests) the ordinary scope is used, which is unfiltered anyway.
+        self._maintenance_scope = maintenance_scope or scope
 
     async def dispatch_command(self, ctx: InteractionContext) -> InteractionResponse:
         """Run a slash command within a fresh transactional session scope."""
@@ -256,7 +269,11 @@ class InteractionService:
         return InteractionResponse("button.expired")
 
     async def _run(self, guild_id: int | None, call: Any) -> InteractionResponse:
-        async with self._scope(guild_id) as session:
+        # A guild-scoped invocation runs under the per-tenant RLS scope; a DM
+        # (guild_id is None) runs under the maintenance scope so cross-tenant
+        # commands like /forget_me are not silently filtered to zero rows.
+        scope = self._scope if guild_id is not None else self._maintenance_scope
+        async with scope(guild_id) as session:
             deps = DbDeps(session, self._rl, self._settings)
             return await call(deps)  # type: ignore[no-any-return]
 
@@ -371,7 +388,12 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     from optimus.core.health import HealthServer
     from optimus.core.logging import configure_logging
     from optimus.core.readiness import db_check, redis_check
-    from optimus.db.engine import create_engine, create_session_factory, create_session_scope
+    from optimus.db.engine import (
+        create_engine,
+        create_maintenance_scope,
+        create_session_factory,
+        create_session_scope,
+    )
 
     settings = get_settings()
     configure_logging(level=settings.log_level, service_name="optimus-interactions")
@@ -380,9 +402,20 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     factory = create_session_factory(engine)
     scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
 
+    # Cross-tenant DM commands (GDPR erasure) need a BYPASSRLS role in
+    # multi-tenant mode. Only stand up a second engine when the maintenance URL
+    # actually differs from the request URL; otherwise reuse the request scope.
+    maintenance_engine: AsyncEngine | None = None
+    maintenance_scope: SessionScope | None = None
+    if settings.effective_maintenance_database_url != settings.effective_database_url:
+        maintenance_engine = create_engine(
+            settings.effective_maintenance_database_url, settings=settings
+        )
+        maintenance_scope = create_maintenance_scope(create_session_factory(maintenance_engine))
+
     redis = _open_redis(settings)
     rate_limiter = build_rate_limiter(settings, redis)
-    service = InteractionService(scope, rate_limiter, settings)
+    service = InteractionService(scope, rate_limiter, settings, maintenance_scope=maintenance_scope)
 
     health = HealthServer(host=settings.health_host, port=settings.health_port)
     # Interactions serve appeals/commands straight from Postgres, so DB
@@ -418,6 +451,8 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
             await bot.close()
         await health.stop()
         await engine.dispose()
+        if maintenance_engine is not None:
+            await maintenance_engine.dispose()
 
 
 def main() -> None:  # pragma: no cover - console entrypoint

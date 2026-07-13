@@ -30,8 +30,8 @@ from optimus.core.readiness import nats_check
 from optimus.db.engine import (
     SessionScope,
     create_engine,
+    create_maintenance_scope,
     create_session_factory,
-    create_session_scope,
 )
 from optimus.services.scheduler import tasks
 
@@ -239,9 +239,14 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     bus, nc = await EventBus.connect(settings.nats_url)
     await bus.ensure_stream()
 
-    engine = create_engine()
+    # The scheduler does exclusively cross-tenant maintenance (retention, purge,
+    # rollups, enumeration), so it connects with the maintenance role and never
+    # sets the per-tenant GUC. In multi-tenant mode that role has BYPASSRLS so the
+    # account-wide sweeps are not filtered to zero rows by FORCE RLS; in
+    # single-tenant/simple mode the URL falls back to the ordinary database.
+    engine = create_engine(settings.effective_maintenance_database_url, settings=settings)
     factory = create_session_factory(engine)
-    scope = create_session_scope(factory, multi_tenant=settings.is_multi_tenant)
+    scope = create_maintenance_scope(factory)
 
     delete_object = _build_evidence_deleter(settings)
     service = SchedulerService(settings, bus, scope, delete_object=delete_object)
