@@ -230,6 +230,10 @@ class DbDeps:
             keys=keys,
             revoked=settings.revoked_signing_key_ids,
             legacy_public_key_b64=settings.global_signing_public_key,
+            # Bind the mirrored legacy key to the active key id so revoking that
+            # id also rejects bare-format signatures from the same key — no
+            # signature-downgrade bypass of revocation.
+            legacy_key_id=settings.global_signing_key_id or None,
         )
         return GlobalHashService(
             GlobalHashRepository(self._session),

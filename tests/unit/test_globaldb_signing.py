@@ -141,6 +141,41 @@ def test_legacy_signature_verifies_against_legacy_key() -> None:
     assert verify_record(_record(), legacy_sig, pub) is True
 
 
+def test_revoked_key_rejected_via_both_signature_formats() -> None:
+    # A compromised key is revoked. The attacker holds the private key and can
+    # produce EITHER a versioned "kid:sig" or a bare legacy signature. Both must
+    # be rejected — revocation cannot be dodged by downgrading the format.
+    priv, pub = generate_keypair()
+    versioned_sig = sign_record(_record(), priv, key_id="k1")
+    bare_sig = sign_record(_record(), priv)
+    assert ":" not in bare_sig
+    # The deployment mirrors the active key into the legacy slot (single-key
+    # setup) and binds it to the active key id, then revokes that id.
+    keyring = Keyring(
+        keys={"k1": pub},
+        revoked=frozenset({"k1"}),
+        legacy_public_key_b64=pub,
+        legacy_key_id="k1",
+    )
+    assert verify_record(_record(), versioned_sig, keyring) is False
+    assert verify_record(_record(), bare_sig, keyring) is False
+
+
+def test_genuinely_old_legacy_key_still_verifies_when_not_revoked() -> None:
+    # A distinct pre-versioning legacy key (its own id, not revoked) keeps
+    # verifying bare signatures — backward compat is preserved where it does not
+    # reintroduce the bypass.
+    priv, pub = generate_keypair()
+    bare_sig = sign_record(_record(), priv)
+    keyring = Keyring(legacy_public_key_b64=pub, legacy_key_id="legacy1")
+    assert verify_record(_record(), bare_sig, keyring) is True
+    # Revoking that legacy id then rejects it too.
+    revoked = Keyring(
+        legacy_public_key_b64=pub, legacy_key_id="legacy1", revoked=frozenset({"legacy1"})
+    )
+    assert verify_record(_record(), bare_sig, revoked) is False
+
+
 def test_versioned_signature_needs_keyring_not_bare_key() -> None:
     # A single bare public key cannot satisfy a versioned signature (no key_id
     # mapping) — fails closed rather than mis-verifying.

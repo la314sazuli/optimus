@@ -84,6 +84,7 @@ class GlobalHashService:
         self._keyring = verify_keyring or Keyring(
             keys=({signing_key_id: signing_public_key_b64} if signing_key_id else {}),
             legacy_public_key_b64=signing_public_key_b64,
+            legacy_key_id=signing_key_id or None,
         )
         self._min_distinct = min_distinct_guilds
         self._trusted_guild_ids = trusted_guild_ids

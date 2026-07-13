@@ -14,7 +14,9 @@ overlap window (old and new both valid) and individually *revoked* (a revoked
 id is never trusted even if its public key is still listed). Signatures written
 before versioning carry no ``key_id`` (a bare base64 string); those verify
 against the keyring's ``legacy_public_key_b64`` using the pre-versioning payload
-encoding, so old records keep verifying after the upgrade.
+encoding, so old records keep verifying after the upgrade. The legacy key is
+bound to ``legacy_key_id`` and honours revocation too, so a revoked key cannot
+be laundered through the bare format to defeat its own revocation.
 """
 
 from __future__ import annotations
@@ -50,19 +52,29 @@ class Keyring:
       if still present in ``keys`` — revocation wins over presence.
     * ``legacy_public_key_b64`` verifies pre-versioning signatures that carry no
       ``key_id`` (kept for backward-compatible migration).
+    * ``legacy_key_id`` binds the legacy key to a ``key_id`` so bare-format
+      signatures are covered by revocation too. When a deployment mirrors its
+      active key into the legacy slot, this is the active key's id; revoking it
+      then rejects that key in *both* the ``"kid:sig"`` and the bare format,
+      closing the signature-downgrade bypass.
     """
 
     keys: Mapping[str, str] = field(default_factory=dict)
     revoked: frozenset[str] = frozenset()
     legacy_public_key_b64: str = ""
+    legacy_key_id: str | None = None
 
     def public_key(self, key_id: str | None) -> str:
         """Return the trusted public key for ``key_id`` (``""`` if not trusted).
 
         ``None`` selects the legacy key. A revoked or unknown ``key_id`` yields
-        ``""`` so verification fails closed.
+        ``""`` so verification fails closed. The legacy key is also subject to
+        revocation via ``legacy_key_id``, so a compromised key cannot dodge its
+        revocation by falling back to the bare signature format.
         """
         if key_id is None:
+            if self.legacy_key_id is not None and self.legacy_key_id in self.revoked:
+                return ""
             return self.legacy_public_key_b64
         if key_id in self.revoked:
             return ""

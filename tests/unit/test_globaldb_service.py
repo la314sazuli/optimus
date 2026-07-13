@@ -341,6 +341,32 @@ async def test_verified_promoted_drops_revoked_key(session: AsyncSession) -> Non
     assert await revoked_view.verified_promoted() == []
 
 
+def test_service_wiring_revocation_covers_both_signature_formats(session: AsyncSession) -> None:
+    # End-to-end wiring: a single-key deployment mirrors its active key into the
+    # legacy slot. Once the active key id is revoked, neither the versioned
+    # "kid:sig" nor a bare legacy signature from that (compromised) key may
+    # verify — the signature-downgrade bypass is closed.
+    from optimus.core.config import Settings
+    from optimus.globaldb.signing import sign_record
+    from optimus.services.interactions.service import DbDeps
+
+    priv, pub = generate_keypair()
+    settings = Settings(
+        _env_file=None,
+        global_signing_private_key=priv,
+        global_signing_public_key=pub,
+        global_signing_key_id="k1",
+        global_revoked_key_ids="k1",
+    )
+    keyring = DbDeps(session, InMemoryRateLimiter(), settings).global_service()._keyring
+
+    record = HashRecord(hash_id="h1", phash=1, dhash=2, whash=3)
+    versioned_sig = sign_record(record, priv, key_id="k1")
+    bare_sig = sign_record(record, priv)
+    assert verify_record(record, versioned_sig, keyring) is False
+    assert verify_record(record, bare_sig, keyring) is False
+
+
 @pytest.mark.asyncio
 async def test_revoke_without_submitter_skips_reputation_dock(session: AsyncSession) -> None:
     from optimus.db.models import GlobalHash

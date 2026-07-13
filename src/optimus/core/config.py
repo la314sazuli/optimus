@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from enum import StrEnum
 from functools import lru_cache
 from typing import Self
@@ -36,12 +38,29 @@ def _parse_shard_ids(raw: str) -> tuple[int, ...]:
     return tuple(sorted(ids))
 
 
+def _validate_ed25519_public_key_b64(value: str, *, label: str) -> None:
+    """Reject a public key that is not valid base64 for a 32-byte Ed25519 key.
+
+    Verification silently fails for a malformed key (``verify_record`` swallows
+    the decode error and returns ``False``), so a typo would otherwise drop the
+    key without any signal. Validating at load turns that into a loud config
+    error instead.
+    """
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"{label} is not valid base64: {value!r}") from exc
+    if len(decoded) != 32:
+        raise ValueError(f"{label} must decode to 32 bytes (Ed25519), got {len(decoded)}")
+
+
 def _parse_key_map(raw: str) -> dict[str, str]:
     """Parse a ``"key_id:b64,key_id2:b64"`` spec into an id -> public-key map.
 
-    Whitespace and blank entries are ignored. A malformed entry (missing ``:``
-    or a duplicate id) raises :class:`ValueError` so a bad rotation config fails
-    loudly at startup rather than silently dropping a key.
+    Whitespace and blank entries are ignored. A malformed entry (missing ``:``,
+    a duplicate id, or a value that is not a valid base64 Ed25519 public key)
+    raises :class:`ValueError` so a bad rotation config fails loudly at startup
+    rather than silently dropping a key or failing verification later.
     """
     keys: dict[str, str] = {}
     for part in raw.split(","):
@@ -54,6 +73,7 @@ def _parse_key_map(raw: str) -> dict[str, str]:
             raise ValueError(f"malformed signing-key entry: {token!r} (expected 'key_id:b64')")
         if key_id in keys:
             raise ValueError(f"duplicate signing key_id: {key_id!r}")
+        _validate_ed25519_public_key_b64(value, label=f"signing key {key_id!r}")
         keys[key_id] = value
     return keys
 
@@ -435,6 +455,19 @@ class Settings(BaseSettings):
                 f"every shard id must be < shard_count ({self.shard_count}); "
                 f"got {list(self.shard_ids)}"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_signing_config(self) -> Self:
+        """Eagerly parse the signing key config so a bad value fails at startup.
+
+        The maps/sets are exposed as cached-nothing properties; touching them
+        here means a malformed ``global_signing_public_keys`` (bad base64 or a
+        duplicate id) raises during ``Settings`` construction rather than lazily
+        on first verification, honouring the "fails loudly at startup" contract.
+        """
+        _ = self.signing_public_key_map
+        _ = self.revoked_signing_key_ids
         return self
 
     @property
