@@ -341,10 +341,43 @@ async def test_worker_offloads_decode_and_hash_to_thread() -> None:
     assert ran_on[0] != loop_thread, "decode+hash ran on the event-loop thread"
 
 
+async def test_worker_reports_matching_frame_not_first_frame() -> None:
+    # Regression: for a multi-frame image whose first frame is innocuous but a
+    # later frame is the scam, the swarm observation and the verdict's reported
+    # hashes must come from the matching frame, not frame 0. Previously the
+    # worker always used frames[0], so swarm correlated the wrong phash and the
+    # verdict carried the wrong hashes downstream.
+    clean = {"phash": 0, "dhash": 0, "whash": 0, "ahash": 0}
+    scam = dict(CANDIDATE)  # exact match for KNOWN -> SCAM
+
+    class _TwoFrame(DetectionWorker):
+        def _decode_and_hash(self, data: bytes) -> list[dict[str, int]] | None:  # type: ignore[override]
+            return [clean, scam]
+
+    observed: list[int] = []
+
+    class _RecordingSwarm:
+        window_seconds = 300
+
+        async def observe(self, phash: int, guild_id: int) -> SwarmObservation:
+            observed.append(phash)
+            return SwarmObservation(distinct_guilds=3, is_swarming=True)
+
+    worker = _worker(guild_index=_guild_index(), swarm=_RecordingSwarm(), cls=_TwoFrame)
+    result = await worker.handle(_event(key="multi"))
+    assert result is not None
+    assert result.verdict.verdict is Verdict.SCAM
+    assert result.verdict.hashes is not None
+    assert result.verdict.hashes.phash == scam["phash"]
+    assert observed == [scam["phash"]]
+    assert result.swarm_alert is not None
+    assert result.swarm_alert.phash == scam["phash"]
+
+
 async def test_worker_swarm_escalates_ambiguous_to_scam() -> None:
     class _AmbiguousMatcher(DetectionWorker):
-        def _best_frame_outcome(self, *a: object, **k: object) -> MatchOutcome:  # type: ignore[override]
-            return MatchOutcome(verdict=Verdict.AMBIGUOUS, confidence=0.4)
+        def _best_frame_outcome(self, frames, *a: object, **k: object):  # type: ignore[override]
+            return MatchOutcome(verdict=Verdict.AMBIGUOUS, confidence=0.4), frames[0]
 
     async def gi(_gid: int) -> HashIndex:
         return EMPTY

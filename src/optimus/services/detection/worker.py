@@ -126,8 +126,9 @@ class DetectionWorker:
         whitelist = await self._whitelist(event.guild_id)
         sensitivity = await self._sensitivity(event.guild_id)
 
-        outcome = self._best_frame_outcome(frames, guild_idx, global_idx, whitelist, sensitivity)
-        primary = frames[0]
+        outcome, primary = self._best_frame_outcome(
+            frames, guild_idx, global_idx, whitelist, sensitivity
+        )
 
         swarm_alert: SwarmAlertEvent | None = None
         if (
@@ -172,10 +173,19 @@ class DetectionWorker:
         global_idx: HashIndex,
         whitelist: list[WhitelistEntry],
         sensitivity: Sensitivity,
-    ) -> MatchOutcome:
-        """Match every frame and keep the most incriminating outcome."""
-        best: MatchOutcome | None = None
+    ) -> tuple[MatchOutcome, dict[str, int]]:
+        """Match every frame; return the most incriminating outcome and its frame.
+
+        The frame is returned alongside the outcome because downstream callers
+        need the hashes of the frame that *drove* the verdict, not an arbitrary
+        one: the swarm correlator observes its phash and the verdict event
+        reports it. For a multi-frame image (e.g. an animation whose first frame
+        is innocuous but a later frame is the scam) frame 0 is the wrong source.
+        Ties within a verdict band are broken toward higher confidence.
+        """
         rank = {Verdict.SCAM: 0, Verdict.AMBIGUOUS: 1, Verdict.CLEAN: 2, Verdict.NON_DECISION: 3}
+        best: MatchOutcome | None = None
+        best_frame = frames[0]
         for candidate in frames:
             outcome = match(
                 candidate,
@@ -185,10 +195,15 @@ class DetectionWorker:
                 sensitivity=sensitivity,
             )
             if outcome.whitelisted:
-                return outcome  # whitelist always wins, immediately
-            if best is None or rank[outcome.verdict] < rank[best.verdict]:
-                best = outcome
-        return best if best is not None else MatchOutcome(verdict=Verdict.CLEAN, confidence=1.0)
+                return outcome, candidate  # whitelist always wins, immediately
+            if best is None or (rank[outcome.verdict], -outcome.confidence) < (
+                rank[best.verdict],
+                -best.confidence,
+            ):
+                best, best_frame = outcome, candidate
+        if best is None:
+            best = MatchOutcome(verdict=Verdict.CLEAN, confidence=1.0)
+        return best, best_frame
 
     def _verdict(
         self,
