@@ -27,13 +27,14 @@ WORKDIR /app
 # 1. Install only third-party dependencies first, in a cached layer that is
 #    invalidated only when the lockfile or project metadata changes. The source
 #    tree is deliberately excluded here so editing code does not bust the cache.
+#    Plain COPY (not --mount=type=bind) is used because Railway's builder only
+#    accepts type=cache mounts on RUN; other mount types are rejected outright.
+COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,id=s/df3ac583-26fc-4f39-98d7-90e26a2e4474-/root/.cache/uv,target=/root/.cache/uv \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --no-dev
 
 # 2. Install the project itself (its own package) on top of the cached deps.
-COPY pyproject.toml uv.lock README.md ./
+COPY README.md ./
 COPY src ./src
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
