@@ -27,7 +27,7 @@ WORKDIR /app
 # 1. Install only third-party dependencies first, in a cached layer that is
 #    invalidated only when the lockfile or project metadata changes. The source
 #    tree is deliberately excluded here so editing code does not bust the cache.
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --no-dev
@@ -38,7 +38,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
 COPY scripts ./scripts
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # ---- Runtime: slim final image with only what is needed to run --------------
@@ -74,13 +74,15 @@ COPY --from=builder --chown=optimus:optimus /app/scripts /app/scripts
 COPY --from=builder --chown=optimus:optimus /app/pyproject.toml /app/pyproject.toml
 
 # Simple mode persists its SQLite database under /data, a directory kept separate
-# from the read-only app install at /app. The README's one-liner mounts a named
-# volume here (`-v optimus-data:/data`), so it never shadows the venv or source,
-# and /data is owned by the unprivileged runtime user so the first boot can
+# from the read-only app install at /app. Attach persistent storage at this path
+# via your platform's volume mechanism (e.g. `docker run -v optimus-data:/data`,
+# or a Railway Volume mounted at /data in the service settings) -- this image
+# deliberately does not declare a Docker VOLUME, since Railway's builder rejects
+# that instruction and some platforms treat it as an unmanaged anonymous volume
+# anyway. /data is owned by the unprivileged runtime user so the first boot can
 # create the database file (a volume mounted over /app would be root-owned and
 # unwritable). OPTIMUS_SIMPLE_DATABASE_URL above points the engine at /data.
 RUN mkdir -p /data && chown optimus:optimus /data
-VOLUME ["/data"]
 
 USER optimus
 
