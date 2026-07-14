@@ -27,7 +27,7 @@ WORKDIR /app
 # 1. Install only third-party dependencies first, in a cached layer that is
 #    invalidated only when the lockfile or project metadata changes. The source
 #    tree is deliberately excluded here so editing code does not bust the cache.
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=s/df3ac583-26fc-4f39-98d7-90e26a2e4474-/root/.cache/uv,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --no-dev
@@ -38,7 +38,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY alembic.ini ./alembic.ini
 COPY scripts ./scripts
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=s/df3ac583-26fc-4f39-98d7-90e26a2e4474-/root/.cache/uv,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # ---- Runtime: slim final image with only what is needed to run --------------
