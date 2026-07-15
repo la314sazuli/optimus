@@ -46,13 +46,11 @@ RUN --mount=type=cache,id=s/df3ac583-26fc-4f39-98d7-90e26a2e4474-/root/.cache/uv
 FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 
 # curl is used by the compose healthchecks to probe /readyz; tini reaps the
-# decode subprocesses the detection worker spawns so they cannot become zombies;
-# gosu lets the entrypoint drop from root to the unprivileged `optimus` user
-# after fixing up volume ownership (see docker-entrypoint.sh). Versions are
-# intentionally unpinned so apt pulls current security patches.
+# decode subprocesses the detection worker spawns so they cannot become zombies.
+# Versions are intentionally unpinned so apt pulls current security patches.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y curl tini gosu \
+    && apt-get install --no-install-recommends -y curl tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user; the app lives under /app owned by that user.
@@ -82,23 +80,16 @@ COPY --from=builder --chown=optimus:optimus /app/pyproject.toml /app/pyproject.t
 # or a Railway Volume mounted at /data in the service settings) -- this image
 # deliberately does not declare a Docker VOLUME, since Railway's builder rejects
 # that instruction and some platforms treat it as an unmanaged anonymous volume
-# anyway. /data is created (and pre-owned, for the no-volume case) here at build
-# time, but a platform volume mounted over /data at container *start* replaces
-# that ownership with whatever the volume provisioner defaulted to (often root)
-# -- see docker-entrypoint.sh, which re-applies ownership after the mount
-# happens and before the app starts. OPTIMUS_SIMPLE_DATABASE_URL above points
-# the engine at /data.
+# anyway. /data is owned by the unprivileged runtime user so the first boot can
+# create the database file (a volume mounted over /app would be root-owned and
+# unwritable). OPTIMUS_SIMPLE_DATABASE_URL above points the engine at /data.
 RUN mkdir -p /data && chown optimus:optimus /data
 
-COPY --chown=optimus:optimus --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-
-# Stays root here (no USER switch) so the entrypoint can chown a freshly
-# mounted volume before dropping to `optimus` via gosu -- see
-# docker-entrypoint.sh for why this ordering is required.
+USER optimus
 
 EXPOSE 8080
 
-ENTRYPOINT ["tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["tini", "--"]
 # Default to simple mode: the whole bot in one process (OPTIMUS_MODE=simple).
 # A single `docker run -e OPTIMUS_DISCORD_TOKEN=... optimus` runs the bot with no
 # external services. Distributed deployments override the command per service
