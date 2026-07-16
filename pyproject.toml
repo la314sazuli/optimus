@@ -40,10 +40,10 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "hypothesis>=6.156.4",
+    "hypothesis>=6.156.6",
     "fakeredis>=2.36.2",
-    "ruff>=0.15.20",
-    "mypy>=2.2.0",
+    "ruff>=0.15.21",
+    "mypy>=2.3.0",
     "pre-commit>=4.6.0",
     "types-redis",
 ]
