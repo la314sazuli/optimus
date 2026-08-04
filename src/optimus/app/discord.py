@@ -25,7 +25,7 @@ from optimus.core.guild_config import GuildConfigCache
 from optimus.core.logging import get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter
 from optimus.services.gateway.bot import GATEWAY_INTENTS, GatewayService, shard_start_kwargs
-from optimus.services.interactions.service import InteractionService, run_interaction
+from optimus.services.interactions.service import InteractionService, respond_to_interaction
 
 if TYPE_CHECKING:
     from optimus.app.simple import SimpleApp
@@ -62,15 +62,7 @@ async def run_discord_edges(  # pragma: no cover - requires a live gateway
         interaction = event.interaction
         if not isinstance(interaction, hikari.CommandInteraction | hikari.ComponentInteraction):
             return
-        message = await run_interaction(interactions, interaction)
-        if not message:
-            return
-        with contextlib.suppress(Exception):
-            await interaction.create_initial_response(
-                hikari.ResponseType.MESSAGE_CREATE,
-                message,
-                flags=hikari.MessageFlag.EPHEMERAL,
-            )
+        await respond_to_interaction(interactions, interaction)
 
     try:
         await bot.start(**shard_start_kwargs(settings))  # type: ignore[arg-type]

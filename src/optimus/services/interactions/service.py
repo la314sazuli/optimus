@@ -317,6 +317,32 @@ async def run_interaction(  # pragma: no cover - hikari glue
         return render(response, locale)
 
 
+async def respond_to_interaction(service: InteractionService, interaction: Any) -> None:
+    """Defer an interaction before dispatch, then edit in the rendered result."""
+    import hikari
+
+    log_context = {
+        "interaction_id": str(interaction.id),
+        "command_name": getattr(interaction, "command_name", None),
+    }
+    try:
+        await interaction.create_initial_response(
+            hikari.ResponseType.DEFERRED_MESSAGE_CREATE,
+            flags=hikari.MessageFlag.EPHEMERAL,
+        )
+    except Exception:
+        _log.exception("interaction_defer_failed", **log_context)
+        return
+
+    message = await run_interaction(service, interaction)
+    if not message:
+        return
+    try:
+        await interaction.edit_initial_response(message)
+    except Exception:
+        _log.exception("interaction_edit_failed", **log_context)
+
+
 def _component_context(interaction: Any) -> InteractionContext:  # pragma: no cover - hikari glue
     member = interaction.member
     perms = int(member.permissions) if member is not None and member.permissions else 0
@@ -398,15 +424,7 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
         interaction = event.interaction
         if not isinstance(interaction, hikari.CommandInteraction | hikari.ComponentInteraction):
             return
-        message = await run_interaction(service, interaction)
-        if not message:
-            return
-        with contextlib.suppress(Exception):
-            await interaction.create_initial_response(
-                hikari.ResponseType.MESSAGE_CREATE,
-                message,
-                flags=hikari.MessageFlag.EPHEMERAL,
-            )
+        await respond_to_interaction(service, interaction)
 
     try:
         await bot.start()
