@@ -263,21 +263,22 @@ def render(response: InteractionResponse, locale: str) -> str:
     return translate(response.i18n_key, locale, **response.params)
 
 
-def to_context(interaction: Any) -> InteractionContext:  # pragma: no cover - hikari glue
+def to_context(interaction: Any) -> InteractionContext:
     """Adapt a hikari command interaction into an :class:`InteractionContext`.
 
     The member's *effective* permissions come from ``interaction.member`` as
     resolved by Discord (role permissions OR'd, owner short-circuited) — never
     from the command's ``default_member_permissions`` hint.
     """
-    options = {opt.name: opt.value for opt in (interaction.options or [])}
+    interaction_options = interaction.options or []
+    options = {option.name: option.value for option in interaction_options}
     subcommand: str | None = None
-    # A subcommand arrives as a single nested option of SUB_COMMAND type.
-    if len(options) == 1:
-        only_name, only_value = next(iter(options.items()))
-        if isinstance(only_value, list):
-            subcommand = only_name
-            options = {o.name: o.value for o in only_value}
+    # Subcommands and groups carry their selected branch in ``options``, not ``value``.
+    while len(interaction_options) == 1 and interaction_options[0].options is not None:
+        selected = interaction_options[0]
+        subcommand = selected.name
+        interaction_options = selected.options
+        options = {option.name: option.value for option in interaction_options}
     member = interaction.member
     perms = int(member.permissions) if member is not None and member.permissions else 0
     return InteractionContext(
