@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import resource
 import subprocess
 import sys
@@ -42,10 +43,20 @@ class DecodeLimits:
     #: BMP) have no way to avoid a full-resolution decode buffer before the
     #: post-decode thumbnail() resize can run, so this limit is sized for
     #: the worst measured case across supported formats at the configured
-    #: max_image_pixels cap instead: WebP was the most memory-hungry at 24MP,
-    #: needing ~600MB at minimum (measured directly); 768MB keeps headroom
-    #: above that floor while still well under half of what full-resolution
-    #: float64 decoding needed before this module decoded to a thumbnail.
+    #: max_image_pixels cap instead: WebP measured as the most memory-hungry
+    #: format at 24MP, needing ~500-550MB at minimum even with BLAS threading
+    #: pinned to 1 (see _CHILD_ENV_OVERRIDES) -- libwebp's own decode working
+    #: set, not a numpy/BLAS artifact. 768MB keeps headroom above that floor.
+    #: Note: without pinning BLAS/OMP threads to 1, this same number was
+    #: intermittently insufficient on hosts with a high detected CPU count
+    #: (production hit "OpenBLAS error: Memory allocation still failed after
+    #: 10 retries" at this exact limit) -- OpenBLAS sizes its thread pool
+    #: against the host's CPU count, not the container's cgroup quota, and
+    #: that pool's own allocation can consume a large, host-dependent chunk
+    #: of this budget before any image work happens. This never reproduced
+    #: in local testing on a 2-vCPU sandbox, which is what let it ship
+    #: initially -- the thread pool overhead is invisible until the host has
+    #: enough cores to make it large.
     mem_bytes: int = 768 * 1024 * 1024
     wall_timeout: float = 5.0
     max_image_pixels: int = 24_000_000
@@ -73,6 +84,31 @@ def _apply_rlimits(limits: DecodeLimits) -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_seconds, limits.cpu_seconds + 1))
     resource.setrlimit(resource.RLIMIT_AS, (limits.mem_bytes, limits.mem_bytes))
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+
+#: OpenBLAS (numpy's backing library for the tiny matrix-vector product in
+#: luminance()) sizes its thread pool against the *host's* detected CPU count,
+#: not the container's cgroup CPU quota -- on a host with many cores this
+#: pool's own allocation can be tens to hundreds of MB before a single pixel
+#: is touched, which is pure waste for an operation this small (at most
+#: 128x128x3 elements) and gains nothing from parallelism. This surfaced as
+#: "OpenBLAS error: Memory allocation still failed after 10 retries" in
+#: production even after the mem_bytes budget was sized generously against
+#: locally-measured decode costs alone. Forcing every BLAS/OMP thread pool to
+#: a single thread removes that variable host-dependent overhead entirely.
+_CHILD_ENV_OVERRIDES = {
+    "OPENBLAS_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+}
+
+
+def _child_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(_CHILD_ENV_OVERRIDES)
+    return env
 
 
 # Child program: reads JSON {data, max_pixels, max_frames, hash_side} on
@@ -175,6 +211,7 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
             capture_output=True,
             timeout=lim.wall_timeout,
             preexec_fn=lambda: _apply_rlimits(lim),
+            env=_child_env(),
             check=True,
         )
     except subprocess.TimeoutExpired:

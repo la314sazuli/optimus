@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
+from unittest import mock
 
 import numpy as np
 import pytest
 from PIL import Image
 
+from optimus.hashing import decoder
 from optimus.hashing import perceptual as ph
 from optimus.hashing.decoder import DecodeLimits, decode
 
@@ -143,3 +147,54 @@ def test_decode_does_not_upscale_small_images() -> None:
     result = decode(_jpeg_bytes((50, 50)))
     assert result is not None
     assert result.frames[0].shape == (50, 50)
+
+
+def test_decode_pins_blas_threads_regardless_of_host_env() -> None:
+    """Regression test for a real production failure.
+
+    Even after mem_bytes was sized generously against locally-measured decode
+    costs (see test_decode_succeeds_at_configured_pixel_cap), production
+    still failed with "OpenBLAS error: Memory allocation still failed after
+    10 retries, giving up." OpenBLAS sizes its thread pool against the
+    *host's* detected CPU count, not the container's cgroup quota, and that
+    pool's own allocation -- pure overhead for the tiny (<=128x128x3)
+    matrix-vector product this module actually does -- can consume a large,
+    host-dependent chunk of the memory budget before any image work happens.
+    This is inherently host-topology-dependent and did not reproduce in local
+    testing on a low-core-count sandbox even with OPENBLAS_NUM_THREADS forced
+    high in the parent env, which is exactly what made it easy to miss before
+    shipping. Rather than assert on the OOM symptom (unreproducible here),
+    this asserts on the actual fix's mechanism: the child process must always
+    receive single-threaded BLAS/OMP env vars, regardless of what the parent
+    process's environment holds -- inheriting the parent's env unmodified was
+    the bug.
+    """
+    captured_env: dict[str, str] = {}
+    real_run = subprocess.run
+
+    def _capturing_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured_env.update(kwargs.get("env") or {})  # type: ignore[arg-type]
+        return real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    hostile_env = {"OPENBLAS_NUM_THREADS": "64", "OMP_NUM_THREADS": "64"}
+    original = {k: os.environ.get(k) for k in hostile_env}
+    try:
+        os.environ.update(hostile_env)
+        with mock.patch.object(decoder.subprocess, "run", _capturing_run):
+            result = decode(_jpeg_bytes((64, 64)))
+    finally:
+        for k, v in original.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert result is not None
+    for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        assert captured_env.get(var) == "1", (
+            f"{var} must be pinned to 1 on the actual decode subprocess call, "
+            f"regardless of the parent's environment (was {captured_env.get(var)!r})"
+        )
+    # The override must not simply drop the rest of the parent environment
+    # (e.g. PATH) needed to actually locate the interpreter and libraries.
+    assert "PATH" in captured_env
