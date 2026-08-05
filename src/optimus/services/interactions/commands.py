@@ -100,7 +100,7 @@ COMMANDS: tuple[Command, ...] = (
             SubCommand(
                 name="reviewmsg",
                 description=(
-                    "Hash every image on a past message, add them as scam hashes, "
+                    "Hash images on a past message, add as scam hashes, "
                     "and act on the author if not already banned."
                 ),
                 options=(
