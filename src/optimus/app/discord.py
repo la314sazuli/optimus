@@ -45,7 +45,9 @@ async def run_discord_edges(  # pragma: no cover - requires a live gateway
 
     config_cache = GuildConfigCache(app.store, app._scope)
     gateway = GatewayService(settings, app.bus, config_cache, app.health)
-    interactions = InteractionService(app._scope, InMemoryRateLimiter(), settings)
+    interactions = InteractionService(
+        app._scope, InMemoryRateLimiter(), settings, detection=app.detection
+    )
 
     bot = hikari.GatewayBot(token=settings.discord_token, intents=GATEWAY_INTENTS)
 

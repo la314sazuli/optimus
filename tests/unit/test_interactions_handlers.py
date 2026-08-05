@@ -8,6 +8,7 @@ import pytest
 
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.services.interactions.attachment_hash import AttachmentHashError
 from optimus.services.interactions.handlers import (
     _CONFIG_VIEW_ORDER,
     InteractionContext,
@@ -48,6 +49,9 @@ class FakeDeps:
         self._next_appeal_id = 1
         self._global_service = _FakeGlobalService(flags.get("submit_error"))
         self.global_submitted: list[str] = []
+        #: attachment_id -> exception to raise, or a hash_id string to return.
+        self._attachment_outcomes: dict[int, Any] = flags.get("attachment_outcomes", {})
+        self.confirmed_scams: list[dict[str, Any]] = []
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         self.hashes[gh.hash_id] = gh
@@ -119,6 +123,48 @@ class FakeDeps:
 
     def global_service(self) -> GlobalHashService:
         return self._global_service  # type: ignore[return-value]
+
+    async def hash_and_store_attachment(
+        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
+    ) -> GuildHash:
+        outcome = self._attachment_outcomes.get(attachment_id, f"{attachment_id:016x}")
+        if isinstance(outcome, Exception):
+            raise outcome
+        existing = self.hashes.get(outcome)
+        if existing is not None:
+            return existing
+        gh = GuildHash(
+            hash_id=outcome,
+            phash=attachment_id,
+            dhash=attachment_id,
+            whash=attachment_id,
+            ahash=0,
+            source="reviewmsg",
+            added_by=added_by,
+        )
+        self.hashes[outcome] = gh
+        return gh
+
+    async def submit_confirmed_scam(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        message_id: int,
+        attachment_id: int,
+        uploader_id: int,
+        matched_hash_id: str,
+    ) -> None:
+        self.confirmed_scams.append(
+            {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "uploader_id": uploader_id,
+                "matched_hash_id": matched_hash_id,
+            }
+        )
 
 
 class _FakeGlobalService:
@@ -640,3 +686,142 @@ async def test_review_button_actions_audit(action: ReviewAction, key: str) -> No
     resp = await handle_review_button(_ctx("", perms=MANAGE), parsed, deps)
     assert resp.i18n_key == key
     assert deps.audits[0][1] == 99
+
+
+# --- /scamhash reviewmsg and the "Review as scam" context-menu entry ----------
+
+
+def _review_ctx(
+    *,
+    command: str = "scamhash",
+    subcommand: str | None = "reviewmsg",
+    attachments: list[tuple[int, str]] | None = None,
+    channel_id: int = 111,
+    message_id: int = 222,
+    author_id: int = 333,
+    perms: int = MANAGE,
+) -> InteractionContext:
+    return InteractionContext(
+        guild_id=1,
+        user_id=99,
+        member_permissions=perms,
+        command=command,
+        subcommand=subcommand,
+        options={
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "author_id": author_id,
+            "attachments": attachments if attachments is not None else [(1, "https://x/1.png")],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_denied_without_manage_guild() -> None:
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(_review_ctx(perms=NONE), FakeDeps())
+    assert exc.value.reason is CommandError.NO_PERMISSION
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_rate_limited_rejected() -> None:
+    deps = FakeDeps(hash_rate_ok=False)
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(_review_ctx(), deps)
+    assert exc.value.reason is CommandError.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_no_images_short_circuits() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(_review_ctx(attachments=[]), deps)
+    assert resp.i18n_key == "command.reviewmsg_no_images"
+    assert deps.confirmed_scams == []
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_single_attachment_hashes_and_actions_author() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
+    )
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params == {"added": 1, "failed": 0, "author_id": 333}
+    assert len(deps.confirmed_scams) == 1
+    assert deps.confirmed_scams[0]["uploader_id"] == 333
+    assert deps.confirmed_scams[0]["attachment_id"] == 1
+    assert len(deps.audits) == 1
+    assert deps.audits[0][2] == "scamhash.reviewmsg"
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_multiple_attachments_all_succeed() -> None:
+    deps = FakeDeps()
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 3
+    assert resp.params["failed"] == 0
+    assert len(deps.confirmed_scams) == 3
+    assert len(deps.hashes) == 3
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_some_attachments_fail_are_skipped() -> None:
+    deps = FakeDeps(attachment_outcomes={2: AttachmentHashError("bad image")})
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 2
+    assert resp.params["failed"] == 1
+    # The failed attachment never reaches the moderation pipeline.
+    assert {c["attachment_id"] for c in deps.confirmed_scams} == {1, 3}
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_all_attachments_fail() -> None:
+    deps = FakeDeps(
+        attachment_outcomes={
+            1: AttachmentHashError("bad"),
+            2: AttachmentHashError("bad"),
+        }
+    )
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_all_failed"
+    assert resp.params == {"failed": 2}
+    assert deps.confirmed_scams == []
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_duplicate_hash_is_idempotent() -> None:
+    """Re-reviewing a message (or an image already hashed by another path)
+    must not raise -- ``hash_and_store_attachment`` returns the existing row."""
+    deps = FakeDeps()
+    existing = GuildHash(hash_id=f"{1:016x}", phash=1, dhash=1, whash=1, ahash=0, source="local")
+    deps.hashes[existing.hash_id] = existing
+    resp = await handle_command(_review_ctx(attachments=[(1, "https://x/1.png")]), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 1
+    assert len(deps.confirmed_scams) == 1
+    assert deps.confirmed_scams[0]["matched_hash_id"] == existing.hash_id
+
+
+@pytest.mark.asyncio
+async def test_context_menu_review_message_routes_to_shared_core() -> None:
+    """The context-menu entry point (``review_message``) shares ``_review_message``
+    with the slash command -- both are gated by the same permission and both
+    read the glue-resolved options in the same shape."""
+    deps = FakeDeps()
+    ctx = _review_ctx(command="review_message", subcommand=None)
+    resp = await handle_command(ctx, deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
+async def test_context_menu_review_message_denied_without_manage_guild() -> None:
+    ctx = _review_ctx(command="review_message", subcommand=None, perms=NONE)
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(ctx, FakeDeps())
+    assert exc.value.reason is CommandError.NO_PERMISSION

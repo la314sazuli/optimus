@@ -9,7 +9,14 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from optimus.services.interactions.commands import COMMANDS, required_permission
+from optimus.services.interactions.commands import (
+    COMMAND_PERMISSIONS,
+    COMMANDS,
+    MESSAGE_COMMANDS,
+    REVIEW_MESSAGE_COMMAND,
+    build_context_menu_command_builders,
+    required_permission,
+)
 from optimus.services.interactions.logic import (
     MAX_IMPORT_BYTES,
     MAX_IMPORT_HASHES,
@@ -23,6 +30,7 @@ from optimus.services.interactions.logic import (
     encode_component_id,
     has_permission,
     parse_hash_hex,
+    parse_message_reference,
     validate_config_set,
     validate_import,
 )
@@ -63,6 +71,30 @@ def test_delete_server_requires_administrator() -> None:
 def test_appeal_and_forget_me_require_no_permission() -> None:
     assert required_permission("appeal") is None
     assert required_permission("forget_me") is None
+
+
+# --- context-menu commands ("Review as scam") -----------------------------------
+
+
+def test_review_message_requires_manage_guild() -> None:
+    assert COMMAND_PERMISSIONS[REVIEW_MESSAGE_COMMAND] == Permission.MANAGE_GUILD
+    assert required_permission(REVIEW_MESSAGE_COMMAND) == Permission.MANAGE_GUILD
+
+
+def test_build_context_menu_command_builders_has_review_as_scam() -> None:
+    builders = build_context_menu_command_builders()
+    assert len(builders) == len(MESSAGE_COMMANDS)
+    names = [b.name for b in builders]
+    assert "Review as scam" in names
+
+
+def test_build_context_menu_command_builders_sets_manage_guild_permission() -> None:
+    import hikari
+
+    builders = build_context_menu_command_builders()
+    review = next(b for b in builders if b.name == "Review as scam")
+    assert review.type is hikari.CommandType.MESSAGE
+    assert review.default_member_permissions == int(Permission.MANAGE_GUILD)
 
 
 # --- hash hex parsing ----------------------------------------------------------
@@ -253,3 +285,54 @@ def test_component_id_roundtrip(action: ComponentAction) -> None:
 )
 def test_decode_component_id_rejects_foreign(bad: str) -> None:
     assert decode_component_id(bad) is None
+
+
+# --- parse_message_reference ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://discord.com/channels/1402357722430570498/1408060752371257535/1517941473855799567",
+        "https://discordapp.com/channels/1402357722430570498/1408060752371257535/1517941473855799567",
+        "https://ptb.discord.com/channels/1402357722430570498/1408060752371257535/1517941473855799567",
+        "https://canary.discord.com/channels/1402357722430570498/1408060752371257535/1517941473855799567",
+        (
+            "  https://discord.com/channels/1402357722430570498"
+            "/1408060752371257535/1517941473855799567  "
+        ),
+    ],
+)
+def test_parse_message_reference_link_forms(link: str) -> None:
+    channel_id, message_id = parse_message_reference(link)
+    assert channel_id == 1408060752371257535
+    assert message_id == 1517941473855799567
+
+
+def test_parse_message_reference_bare_id_has_no_channel() -> None:
+    channel_id, message_id = parse_message_reference("1517941473855799567")
+    assert channel_id is None
+    assert message_id == 1517941473855799567
+
+
+def test_parse_message_reference_bare_id_strips_whitespace() -> None:
+    channel_id, message_id = parse_message_reference("  1517941473855799567  ")
+    assert channel_id is None
+    assert message_id == 1517941473855799567
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "not-a-message",
+        "https://discord.com/channels/1/2/notanumber",
+        "https://example.com/channels/1/2/3",
+        str(MAX_UINT64 + 1),
+        "-1",
+    ],
+)
+def test_parse_message_reference_rejects_invalid(bad: str) -> None:
+    with pytest.raises(InteractionRejected) as exc:
+        parse_message_reference(bad)
+    assert exc.value.reason is CommandError.MESSAGE_NOT_FOUND

@@ -739,6 +739,79 @@ async def test_persist_swallows_unique_race(
     assert len([d for d in rows if d.idempotency_key == "race-1"]) == 1
 
 
+# --- submit_confirmed_match (moderator-reviewed historical message) --------
+
+
+async def test_submit_confirmed_match_drives_same_moderation_pipeline(
+    db_session: _Session, redis: fakeredis.aioredis.FakeRedis
+) -> None:
+    # A moderator-confirmed match (from reviewing a historical message) must
+    # flow through the exact same verdict -> moderation pipeline a live
+    # detection would, so the guild's action_policy (delete_ban here) applies
+    # identically -- no separate/duplicated enforcement path.
+    await _seed_guild(db_session, action_policy="delete_ban")
+    rest = RecordingRest()
+    bus = await _wire_pipeline(db_session, redis, rest=rest)
+    service = _build_detection_service(bus, db_session, redis)
+
+    verdict = VerdictEvent(
+        correlation_id="reviewmsg:4242:555:444",
+        occurred_at=datetime.now(UTC),
+        guild_id=GUILD_ID,
+        channel_id=222,
+        message_id=555,
+        attachment_id=444,
+        uploader_id=SCAM_UPLOADER,
+        idempotency_key="reviewmsg:4242:555:444",
+        verdict=Verdict.SCAM,
+        confidence=1.0,
+        matched_hash_id="reviewmsg-hash",
+    )
+    await service.submit_confirmed_match(verdict)
+
+    # Moderation auto-acted exactly as it would for a live detection.
+    assert rest.verbs[:2] == ["delete_message", "ban_member"]
+    assert ("ban_member", (GUILD_ID, SCAM_UPLOADER)) in rest.calls
+
+    detection = await DetectionRepository(db_session, GUILD_ID).get_by_idempotency_key(
+        "reviewmsg:4242:555:444"
+    )
+    assert detection is not None
+    assert detection.verdict == "scam"
+    assert detection.action_taken == "delete_ban"
+
+
+async def test_submit_confirmed_match_is_idempotent_on_resubmission(
+    db_session: _Session, redis: fakeredis.aioredis.FakeRedis
+) -> None:
+    # Re-submitting the same reviewed message (e.g. a moderator double-clicking
+    # or retrying the command) must not double-persist or double-act.
+    await _seed_guild(db_session, action_policy="delete_ban")
+    rest = RecordingRest()
+    bus = await _wire_pipeline(db_session, redis, rest=rest)
+    service = _build_detection_service(bus, db_session, redis)
+
+    verdict = VerdictEvent(
+        correlation_id="reviewmsg:4242:556:445",
+        occurred_at=datetime.now(UTC),
+        guild_id=GUILD_ID,
+        channel_id=222,
+        message_id=556,
+        attachment_id=445,
+        uploader_id=SCAM_UPLOADER,
+        idempotency_key="reviewmsg:4242:556:445",
+        verdict=Verdict.SCAM,
+        confidence=1.0,
+        matched_hash_id="reviewmsg-hash-2",
+    )
+    await service.submit_confirmed_match(verdict)
+    await service.submit_confirmed_match(verdict)
+
+    recents = await DetectionRepository(db_session, GUILD_ID).list_recent()
+    assert len([d for d in recents if d.idempotency_key == "reviewmsg:4242:556:445"]) == 1
+    assert len([c for c in rest.calls if c[0] == "ban_member"]) == 1
+
+
 async def _none() -> None:
     return None
 

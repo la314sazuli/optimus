@@ -14,6 +14,7 @@ permissions (:func:`has_permission`) before any side effect runs.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from enum import IntFlag, StrEnum
 from typing import Any
@@ -74,6 +75,8 @@ class CommandError(StrEnum):
     UNKNOWN_FIELD = "config_unknown_field"
     INVALID_VALUE = "config_invalid_value"
     BELOW_THRESHOLD = "submit_global_below_threshold"
+    MESSAGE_NOT_FOUND = "reviewmsg_not_found"
+    FETCH_FAILED = "reviewmsg_fetch_failed"
 
 
 class InteractionRejected(Exception):  # noqa: N818 - control-flow signal, not an error
@@ -272,6 +275,33 @@ def parse_channel_reference(text: str) -> int | None:
     if not 0 <= channel_id <= MAX_UINT64:
         raise InteractionRejected(CommandError.INVALID_VALUE)
     return channel_id
+
+
+def parse_message_reference(text: str) -> tuple[int | None, int]:
+    """Parse a ``/scamhash reviewmsg message:`` value into (channel_id, message_id).
+
+    Accepts a full Discord message link
+    (``https://discord.com/channels/<guild>/<channel>/<message>``, with or
+    without the ``ptb.``/``canary.`` subdomain) or a bare numeric message id.
+    The channel id is only known from a link -- a bare id relies on the caller
+    already knowing which channel to fetch from (typically the invoking
+    channel), so this returns ``None`` for the channel in that case.
+    """
+    stripped = text.strip()
+    match = re.search(
+        r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)\s*$",
+        stripped,
+    )
+    if match is not None:
+        _guild_id, channel_id, message_id = match.groups()
+        return int(channel_id), int(message_id)
+    try:
+        message_id = int(stripped)
+    except ValueError as exc:
+        raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND) from exc
+    if not 0 <= message_id <= MAX_UINT64:
+        raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND)
+    return None, message_id
 
 
 class ComponentAction(StrEnum):

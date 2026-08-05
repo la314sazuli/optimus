@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.services.interactions.attachment_hash import AttachmentHashError
 from optimus.services.interactions.commands import required_permission
 from optimus.services.interactions.logic import (
     CommandError,
@@ -91,6 +92,38 @@ class InteractionDeps(Protocol):
         self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
     ) -> None: ...
     def global_service(self) -> GlobalHashService: ...
+    async def hash_and_store_attachment(
+        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
+    ) -> GuildHash:
+        """Fetch, decode, and hash one attachment, then store it as a guild hash.
+
+        Raises :class:`AttachmentHashError` (see
+        :mod:`optimus.services.interactions.attachment_hash`) if the attachment
+        cannot be fetched or decoded as an image; the caller decides how to
+        surface that (skip-and-continue for a multi-image review). If a hash
+        with the same id already exists for this guild (e.g. re-reviewing a
+        message, or an image an earlier detection already caught), returns the
+        existing row rather than raising -- adding a scam hash is idempotent.
+        """
+        ...
+
+    async def submit_confirmed_scam(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        message_id: int,
+        attachment_id: int,
+        uploader_id: int,
+        matched_hash_id: str,
+    ) -> None:
+        """Record a moderator-confirmed scam match and run the moderation pipeline.
+
+        Feeds the same ``verdict.v1`` path a live detection would, so the
+        guild's configured ``action_policy`` (e.g. delete + ban) is applied
+        exactly as it would be for a message caught in real time.
+        """
+        ...
 
 
 def _require(ctx: InteractionContext, permission: Permission | None) -> None:
@@ -145,7 +178,74 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
             [_ImportHash(phash=r.phash, dhash=r.dhash, whash=r.whash) for r in rows]
         )
         return InteractionResponse("command.export_ok", {"count": len(rows)}, attachment=body)
+    if sub == "reviewmsg":
+        return await _review_message(ctx, deps)
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
+
+
+async def _cmd_review_message(
+    ctx: InteractionContext, deps: InteractionDeps
+) -> InteractionResponse:
+    """Entry point for the "Review as scam" message context-menu command.
+
+    ``required_permission("review_message")`` gates this the same as
+    ``/scamhash reviewmsg`` (``MANAGE_GUILD``); the glue layer has already
+    resolved the target message's attachments/author into ``ctx.options``
+    since a context-menu command carries no typed options of its own.
+    """
+    return await _review_message(ctx, deps)
+
+
+async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
+    """Shared core for both the ``/scamhash reviewmsg`` and context-menu entry points.
+
+    Expects the glue layer to have pre-resolved the target message into
+    ``ctx.options``: ``channel_id``, ``message_id``, ``author_id`` (all ints),
+    and ``attachments`` (a list of ``(attachment_id, url)`` pairs already
+    filtered to image content types). Hashes every attachment, adds each as a
+    new guild hash, and -- for each one successfully hashed -- feeds a
+    confirmed-scam verdict into the moderation pipeline so the configured
+    action policy (e.g. delete + ban) is applied. A REST-level failure to
+    fetch/decode one attachment is skipped rather than aborting the whole
+    review, since a message can carry several images and a moderator's intent
+    is best served by processing every image that *can* be processed.
+    """
+    assert ctx.guild_id is not None  # guaranteed by _require (MANAGE_GUILD => guild-only)
+    if not await deps.hash_rate_ok(ctx.user_id):
+        raise InteractionRejected(CommandError.RATE_LIMITED)
+    channel_id = int(ctx.options["channel_id"])
+    message_id = int(ctx.options["message_id"])
+    author_id = int(ctx.options["author_id"])
+    attachments: list[tuple[int, str]] = list(ctx.options["attachments"])
+    if not attachments:
+        return InteractionResponse("command.reviewmsg_no_images")
+
+    added_hash_ids: list[str] = []
+    failed = 0
+    for attachment_id, url in attachments:
+        try:
+            stored = await deps.hash_and_store_attachment(
+                ctx.guild_id, attachment_id=attachment_id, url=url, added_by=ctx.user_id
+            )
+        except AttachmentHashError:
+            failed += 1
+            continue
+        added_hash_ids.append(stored.hash_id)
+        await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
+        await deps.submit_confirmed_scam(
+            ctx.guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            uploader_id=author_id,
+            matched_hash_id=stored.hash_id,
+        )
+    if not added_hash_ids:
+        return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
+    return InteractionResponse(
+        "command.reviewmsg_result",
+        {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
+    )
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
@@ -288,6 +388,7 @@ _COMMAND_HANDLERS: dict[str, _CommandHandler] = {
     "delete_server_data": _cmd_delete_server_data,
     "forget_me": _cmd_forget_me,
     "appeal": _cmd_appeal,
+    "review_message": _cmd_review_message,
 }
 
 

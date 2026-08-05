@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from optimus.contracts.events import Verdict, VerdictEvent
 from optimus.core.config import Settings
-from optimus.core.logging import correlation_context, get_logger
+from optimus.core.logging import correlation_context, get_correlation_id, get_logger
 from optimus.core.ratelimit import RateLimit, RateLimiter
 from optimus.db.engine import SessionScope
 from optimus.db.models import Guild, GuildHash, GuildWhitelist
@@ -40,6 +42,8 @@ from optimus.db.repositories import (
 )
 from optimus.globaldb.service import GlobalHashService
 from optimus.i18n import translate
+from optimus.ingest.fetcher import FetchedImage, fetch_image
+from optimus.services.interactions.attachment_hash import FetchFn, hash_attachment
 from optimus.services.interactions.handlers import (
     InteractionContext,
     InteractionResponse,
@@ -57,7 +61,29 @@ from optimus.services.moderation.review import decode_custom_id
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from optimus.services.detection.service import DetectionService
+
 _log = get_logger(__name__)
+
+
+def _default_fetch(settings: Settings) -> FetchFn:
+    """Build the same bounded fetch used by the passive ingest pipeline.
+
+    Reusing ``ingest_max_bytes``/``ingest_max_redirects`` keeps a
+    command-driven hash (``/scamhash add image:``, message review) under the
+    same SSRF/size guarantees as an attachment the bot observes live.
+    """
+    fetch = partial(
+        fetch_image,
+        max_bytes=settings.ingest_max_bytes,
+        max_redirects=settings.ingest_max_redirects,
+    )
+
+    async def _fetch(url: str) -> FetchedImage:
+        return await fetch(url)
+
+    return _fetch
+
 
 #: Per-user budgets for the rate-limited commands.
 HASH_RATE = RateLimit(capacity=10.0, refill_rate=1.0 / 6.0)
@@ -74,6 +100,8 @@ _ERROR_KEYS: dict[CommandError, str] = {
     CommandError.UNKNOWN_FIELD: "command.config_unknown_field",
     CommandError.INVALID_VALUE: "command.config_invalid_value",
     CommandError.BELOW_THRESHOLD: "command.submit_global_below_threshold",
+    CommandError.MESSAGE_NOT_FOUND: "command.reviewmsg_not_found",
+    CommandError.FETCH_FAILED: "command.reviewmsg_fetch_failed",
 }
 
 
@@ -100,11 +128,15 @@ class DbDeps:
         settings: Settings,
         *,
         appeal_cooldown_seconds: int = 3600,
+        fetch: FetchFn | None = None,
+        detection: DetectionService | None = None,
     ) -> None:
         self._session = session
         self._rl = rate_limiter
         self._settings = settings
         self._appeal_cooldown = appeal_cooldown_seconds
+        self._fetch = fetch or _default_fetch(settings)
+        self._detection = detection
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         return await GuildHashRepository(self._session, guild_id).add(gh)
@@ -251,14 +283,78 @@ class DbDeps:
             signing_public_key_b64=self._settings.global_signing_public_key,
         )
 
+    async def hash_and_store_attachment(
+        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
+    ) -> GuildHash:
+        hashes = await hash_attachment(self._fetch, attachment_id=attachment_id, url=url)
+        hash_id = f"{hashes.phash:016x}"
+        repo = GuildHashRepository(self._session, guild_id)
+        existing = await repo.get(hash_id)
+        if existing is not None:
+            return existing
+        return await repo.add(
+            GuildHash(
+                hash_id=hash_id,
+                phash=hashes.phash,
+                dhash=hashes.dhash,
+                whash=hashes.whash,
+                ahash=hashes.ahash,
+                mphash=hashes.mphash,
+                mdhash=hashes.mdhash,
+                mwhash=hashes.mwhash,
+                mahash=hashes.mahash,
+                source="reviewmsg",
+                added_by=added_by,
+            )
+        )
+
+    async def submit_confirmed_scam(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        message_id: int,
+        attachment_id: int,
+        uploader_id: int,
+        matched_hash_id: str,
+    ) -> None:
+        if self._detection is None:  # pragma: no cover - always wired at app startup
+            _log.warning("reviewmsg_no_detection_service", guild_id=guild_id)
+            return
+        idempotency_key = f"reviewmsg:{guild_id}:{message_id}:{attachment_id}"
+        verdict = VerdictEvent(
+            correlation_id=get_correlation_id() or idempotency_key,
+            occurred_at=datetime.now(UTC),
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            uploader_id=uploader_id,
+            idempotency_key=idempotency_key,
+            verdict=Verdict.SCAM,
+            confidence=1.0,
+            matched_hash_id=matched_hash_id,
+        )
+        await self._detection.submit_confirmed_match(verdict)
+
 
 class InteractionService:
     """Routes hikari interactions through the pure handlers within a DB scope."""
 
-    def __init__(self, scope: SessionScope, rate_limiter: RateLimiter, settings: Settings) -> None:
+    def __init__(
+        self,
+        scope: SessionScope,
+        rate_limiter: RateLimiter,
+        settings: Settings,
+        *,
+        fetch: FetchFn | None = None,
+        detection: DetectionService | None = None,
+    ) -> None:
         self._scope = scope
         self._rl = rate_limiter
         self._settings = settings
+        self._fetch = fetch
+        self._detection = detection
 
     async def dispatch_command(self, ctx: InteractionContext) -> InteractionResponse:
         """Run a slash command within a fresh transactional session scope."""
@@ -278,7 +374,13 @@ class InteractionService:
 
     async def _run(self, call: Any) -> InteractionResponse:
         async with self._scope() as session:
-            deps = DbDeps(session, self._rl, self._settings)
+            deps = DbDeps(
+                session,
+                self._rl,
+                self._settings,
+                fetch=self._fetch,
+                detection=self._detection,
+            )
             return await call(deps)  # type: ignore[no-any-return]
 
 
@@ -287,14 +389,101 @@ def render(response: InteractionResponse, locale: str) -> str:
     return translate(response.i18n_key, locale, **response.params)
 
 
+def _image_attachments(attachments: Any) -> list[tuple[int, str]]:
+    """Filter a message's attachments down to ``(id, url)`` pairs for images.
+
+    A scam post usually carries several images (screenshots, QR codes) but can
+    also attach unrelated files (e.g. a PDF) that ``attachment_hash`` cannot
+    decode -- filtering on ``media_type`` here avoids a doomed fetch attempt
+    for those rather than surfacing them as a per-attachment failure below.
+    """
+    return [
+        (int(att.id), att.url) for att in attachments if (att.media_type or "").startswith("image/")
+    ]
+
+
+def _context_menu_context(interaction: Any) -> InteractionContext:
+    """Adapt a MESSAGE context-menu interaction ("Review as scam").
+
+    The target message and its author are already resolved by Discord onto
+    the interaction itself (``interaction.resolved``), so this needs no REST
+    round-trip, unlike the slash-command path in :func:`resolve_review_options`.
+    """
+    from optimus.services.interactions.commands import REVIEW_MESSAGE_COMMAND
+
+    message = interaction.resolved.messages[interaction.target_id]
+    member = interaction.member
+    perms = int(member.permissions) if member is not None and member.permissions else 0
+    return InteractionContext(
+        guild_id=int(interaction.guild_id) if interaction.guild_id is not None else None,
+        user_id=int(interaction.user.id),
+        member_permissions=perms,
+        command=REVIEW_MESSAGE_COMMAND,
+        options={
+            "channel_id": int(message.channel_id),
+            "message_id": int(message.id),
+            "author_id": int(message.author.id),
+            "attachments": _image_attachments(message.attachments),
+        },
+        locale=str(getattr(interaction, "locale", "en") or "en"),
+    )
+
+
+async def _resolve_reviewmsg_options(
+    ctx: InteractionContext, interaction: Any, *, rest: Any
+) -> InteractionContext:
+    """Resolve ``/scamhash reviewmsg message:<link-or-id>`` via REST.
+
+    Unlike the context-menu entry point, a slash command only carries the
+    moderator-typed string -- the target message must be fetched explicitly.
+    A bare id relies on the invoking channel; a full link carries its own
+    channel id. Raises :class:`InteractionRejected` (``MESSAGE_NOT_FOUND`` /
+    ``FETCH_FAILED``) rather than letting a hikari REST error escape, so the
+    normal rejection-to-ephemeral-message path in :func:`run_interaction`
+    handles it.
+    """
+    from optimus.services.interactions.logic import parse_message_reference
+
+    channel_id, message_id = parse_message_reference(str(ctx.options["message"]))
+    if channel_id is None:
+        channel_id = int(interaction.channel_id)
+    try:
+        message = await rest.fetch_message(channel_id, message_id)
+    except Exception as exc:
+        import hikari
+
+        if isinstance(exc, hikari.NotFoundError):
+            raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND) from exc
+        raise InteractionRejected(CommandError.FETCH_FAILED) from exc
+    return InteractionContext(
+        guild_id=ctx.guild_id,
+        user_id=ctx.user_id,
+        member_permissions=ctx.member_permissions,
+        command=ctx.command,
+        subcommand=ctx.subcommand,
+        options={
+            "channel_id": int(message.channel_id),
+            "message_id": int(message.id),
+            "author_id": int(message.author.id),
+            "attachments": _image_attachments(message.attachments),
+        },
+        locale=ctx.locale,
+    )
+
+
 def to_context(interaction: Any) -> InteractionContext:
     """Adapt a hikari command interaction into an :class:`InteractionContext`.
 
     The member's *effective* permissions come from ``interaction.member`` as
     resolved by Discord (role permissions OR'd, owner short-circuited) — never
-    from the command's ``default_member_permissions`` hint.
+    from the command's ``default_member_permissions`` hint. MESSAGE-type
+    (context-menu) interactions are delegated to :func:`_context_menu_context`,
+    which has an entirely different resolved-data shape from a SLASH command.
     """
     import hikari
+
+    if getattr(interaction, "command_type", hikari.CommandType.SLASH) == hikari.CommandType.MESSAGE:
+        return _context_menu_context(interaction)
 
     interaction_options = interaction.options or []
     options = {option.name: option.value for option in interaction_options}
@@ -337,6 +526,10 @@ async def run_interaction(  # pragma: no cover - hikari glue
             if isinstance(interaction, hikari.CommandInteraction):
                 ctx = to_context(interaction)
                 locale = ctx.locale
+                if ctx.command == "scamhash" and ctx.subcommand == "reviewmsg":
+                    ctx = await _resolve_reviewmsg_options(
+                        ctx, interaction, rest=interaction.app.rest
+                    )
                 response = await service.dispatch_command(ctx)
             elif isinstance(interaction, hikari.ComponentInteraction):
                 ctx = _component_context(interaction)

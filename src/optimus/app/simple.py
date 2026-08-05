@@ -339,12 +339,15 @@ async def _register_commands(rest: object, bot_user_id: int) -> None:  # pragma:
     """
     import hikari
 
-    from optimus.services.interactions.commands import build_command_builders
+    from optimus.services.interactions.commands import (
+        build_command_builders,
+        build_context_menu_command_builders,
+    )
 
     try:
         await rest.set_application_commands(  # type: ignore[attr-defined]
             hikari.Snowflake(bot_user_id),
-            build_command_builders(),
+            build_command_builders() + build_context_menu_command_builders(),
         )
     except Exception:
         _log.warning("command_registration_failed", exc_info=True)

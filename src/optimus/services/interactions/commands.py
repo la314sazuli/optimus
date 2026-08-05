@@ -97,6 +97,21 @@ COMMANDS: tuple[Command, ...] = (
                 options=(Option("file", "A JSON export file.", OPT_ATTACHMENT, required=True),),
             ),
             SubCommand(name="export", description="Export this server's scam hashes as JSON."),
+            SubCommand(
+                name="reviewmsg",
+                description=(
+                    "Hash every image on a past message, add them as scam hashes, "
+                    "and act on the author if not already banned."
+                ),
+                options=(
+                    Option(
+                        "message",
+                        "A message link or ID to review.",
+                        OPT_STRING,
+                        required=True,
+                    ),
+                ),
+            ),
         ),
     ),
     Command(
@@ -145,10 +160,43 @@ COMMANDS: tuple[Command, ...] = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ContextMenuCommand:
+    """A Discord message-context-menu (\"Apps\" right-click) command.
+
+    Unlike a slash :class:`Command`, this has no description or options --
+    Discord shows only its ``name`` in the right-click menu, and the target
+    message is supplied by ``interaction.resolved`` rather than typed options.
+    """
+
+    name: str
+    required_permission: Permission | None = None
+
+
+#: The command name used for dispatch (``ctx.command``) -- distinct from the
+#: user-visible menu label, which can be changed without touching handler code.
+REVIEW_MESSAGE_COMMAND = "review_message"
+
+MESSAGE_COMMANDS: tuple[ContextMenuCommand, ...] = (
+    ContextMenuCommand(
+        name=REVIEW_MESSAGE_COMMAND,
+        required_permission=Permission.MANAGE_GUILD,
+    ),
+)
+
+#: The label shown in Discord's right-click "Apps" menu for each context-menu
+#: command, keyed by dispatch name.
+MESSAGE_COMMAND_LABELS: dict[str, str] = {
+    REVIEW_MESSAGE_COMMAND: "Review as scam",
+}
+
+
 #: Map of every command/subcommand path to the permission the service enforces.
 COMMAND_PERMISSIONS: dict[str, Permission | None] = {}
 for _cmd in COMMANDS:
     COMMAND_PERMISSIONS[_cmd.name] = _cmd.required_permission
+for _menu_cmd in MESSAGE_COMMANDS:
+    COMMAND_PERMISSIONS[_menu_cmd.name] = _menu_cmd.required_permission
 
 
 def required_permission(command_name: str) -> Permission | None:
@@ -198,3 +246,23 @@ def _to_option(option: Option) -> hikari.CommandOption:
         description=option.description,
         is_required=option.required,
     )
+
+
+def build_context_menu_command_builders() -> list[hikari.api.ContextMenuCommandBuilder]:
+    """Build hikari ``ContextMenuCommandBuilder`` objects for global registration.
+
+    Message context-menu commands only ever run inside a guild here (every
+    entry in :data:`MESSAGE_COMMANDS` requires ``MANAGE_GUILD``), so they are
+    always scoped to guild context, unlike the DM-permitting slash commands.
+    """
+    import hikari
+
+    builders: list[hikari.api.ContextMenuCommandBuilder] = []
+    for cmd in MESSAGE_COMMANDS:
+        label = MESSAGE_COMMAND_LABELS[cmd.name]
+        builder = hikari.impl.ContextMenuCommandBuilder(type=hikari.CommandType.MESSAGE, name=label)
+        if cmd.required_permission is not None:
+            builder.set_default_member_permissions(int(cmd.required_permission))
+        builder.set_context_types([hikari.ApplicationContextType.GUILD])
+        builders.append(builder)
+    return builders
