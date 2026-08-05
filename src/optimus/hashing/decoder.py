@@ -29,7 +29,16 @@ class DecodeLimits:
     """Resource limits applied to the decode subprocess."""
 
     cpu_seconds: int = 5
-    mem_bytes: int = 512 * 1024 * 1024
+    #: Sized for the worst case at max_image_pixels: decoding a 24MP image needs
+    #: a uint8 RGB buffer (~72MB) plus a float32 RGB cast for luminance
+    #: (~288MB) plus the resulting float32 luminance frame (~96MB) plus
+    #: Pillow's own JPEG decode working set (~100MB) plus Python/numpy/Pillow
+    #: import baseline (~100MB) -- roughly 650MB with the float32 luminance
+    #: path below, or nearly double that with the float64 path this replaced.
+    #: The previous 512MB limit silently failed to decode any image near a
+    #: modern phone camera's real resolution. 1.5GB keeps comfortable headroom
+    #: above the calculated worst case on either path.
+    mem_bytes: int = 1536 * 1024 * 1024
     wall_timeout: float = 5.0
     max_image_pixels: int = 24_000_000
     max_frames: int = 8
@@ -60,8 +69,12 @@ import numpy as np
 from PIL import Image, ImageSequence
 
 def luminance(im):
-    arr = np.asarray(im.convert("RGB"), dtype=np.float64)
-    w = np.array([0.299, 0.587, 0.114], dtype=np.float64)
+    # float32 (not float64) for the RGB cast: halves peak memory for the
+    # largest intermediate in this pipeline with no meaningful precision loss
+    # for 0-255 luminance weights, and the caller re-serializes to float32
+    # anyway (see the frames output below).
+    arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+    w = np.array([0.299, 0.587, 0.114], dtype=np.float32)
     return arr @ w
 
 req = json.load(sys.stdin)
@@ -122,11 +135,17 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
     except subprocess.TimeoutExpired:
         _log.warning("decode_timeout")
         return None
-    except subprocess.CalledProcessError:
-        _log.warning("decode_failed")
+    except subprocess.CalledProcessError as exc:
+        # Surface the child's stderr (e.g. a numpy MemoryError, a Pillow
+        # DecompressionBombError) -- without this, every decode rejection
+        # looked identical from the logs alone, which made a systemic issue
+        # like an undersized memory limit indistinguishable from routine
+        # per-image corruption.
+        stderr_tail = (exc.stderr or b"").decode("utf-8", errors="replace")[-500:]
+        _log.warning("decode_failed", returncode=exc.returncode, stderr=stderr_tail)
         return None
-    except Exception:
-        _log.warning("decode_error")
+    except Exception as exc:
+        _log.warning("decode_error", reason=str(exc))
         return None
 
     try:
@@ -136,8 +155,8 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
             buf = base64.b64decode(b64)
             arr = np.frombuffer(buf, dtype="<f4").astype(np.float64).reshape(shape)
             frames.append(arr)
-    except Exception:
-        _log.warning("decode_unpack_failed")
+    except Exception as exc:
+        _log.warning("decode_unpack_failed", reason=str(exc))
         return None
 
     if not frames:

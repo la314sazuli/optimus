@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from optimus.core.logging import get_logger
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
 from optimus.services.interactions.attachment_hash import AttachmentHashError
@@ -38,6 +39,8 @@ from optimus.services.interactions.logic import (
     ImportHash as _ImportHash,
 )
 from optimus.services.moderation.review import ParsedCustomId, ReviewAction
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +230,13 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
             stored = await deps.hash_and_store_attachment(
                 ctx.guild_id, attachment_id=attachment_id, url=url, added_by=ctx.user_id
             )
-        except AttachmentHashError:
+        except AttachmentHashError as exc:
+            _log.warning(
+                "reviewmsg_attachment_hash_failed",
+                guild_id=ctx.guild_id,
+                attachment_id=attachment_id,
+                reason=str(exc),
+            )
             failed += 1
             continue
         added_hash_ids.append(stored.hash_id)
