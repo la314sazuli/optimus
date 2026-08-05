@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from optimus.core.config import Settings
 from optimus.core.logging import correlation_context, get_logger
 from optimus.core.ratelimit import RateLimit, RateLimiter
 from optimus.db.engine import SessionScope
-from optimus.db.models import GuildHash, GuildWhitelist
+from optimus.db.models import Guild, GuildHash, GuildWhitelist
 from optimus.db.repositories import (
     AppealRepository,
     DetectionRepository,
@@ -139,10 +139,28 @@ class DbDeps:
             "optin_evidence_storage": guild.optin_evidence_storage,
         }
 
+    #: Maps a /config set field name to the Guild ORM attribute it actually
+    #: writes, for the one field where they differ. "review_channel" is the
+    #: command-facing name (matches validate_config_set and get_config's dict
+    #: key); Guild's mapped column is "review_channel_id". Every other field
+    #: name is identical to its column name and needs no entry here.
+    _FIELD_TO_COLUMN: ClassVar[dict[str, str]] = {"review_channel": "review_channel_id"}
+
     async def set_config_field(self, guild_id: int, field: str, value: Any) -> None:
         repo = GuildRepository(self._session)
         guild = await repo.get_or_create(guild_id)
-        setattr(guild, field, value)
+        column = self._FIELD_TO_COLUMN.get(field, field)
+        # setattr on a mismatched/unmapped name fails silently (it just sets a
+        # plain Python attribute with no ORM tracking, discarded on flush) --
+        # exactly how "review_channel" broke before _FIELD_TO_COLUMN existed.
+        # Guard against that class of bug recurring for any future field.
+        if column not in Guild.__table__.columns:
+            raise AttributeError(
+                f"set_config_field: {field!r} (column {column!r}) is not a mapped "
+                "Guild column -- add an entry to _FIELD_TO_COLUMN if the command "
+                "field name intentionally differs from the column name."
+            )
+        setattr(guild, column, value)
         await self._session.flush()
 
     async def stats_summary(self, guild_id: int) -> dict[str, Any]:
