@@ -49,11 +49,25 @@ class GuildRepository:
         await self._session.flush()
         return merged
 
-    async def set_safe_mode(self, guild_id: int, enabled: bool) -> None:
-        """Toggle a guild's safe mode."""
+    async def get_or_create(self, guild_id: int) -> Guild:
+        """Return the guild's row, lazily provisioning a default one if missing.
+
+        Guild rows are normally created eagerly when the bot joins a server (see
+        ``ModerationService.on_guild_joined``), which only fires once per invite
+        on Discord's gateway. If that one-shot event was ever missed or failed to
+        persist (e.g. during a deployment outage), the guild would otherwise 404
+        on every config-touching command forever with no retry path. Using the
+        same ``session.merge`` pattern as :meth:`upsert` keeps this safe to call
+        concurrently for the same ``guild_id``.
+        """
         guild = await self.get(guild_id)
-        if guild is None:
-            raise KeyError(guild_id)
+        if guild is not None:
+            return guild
+        return await self.upsert(Guild(guild_id=guild_id))
+
+    async def set_safe_mode(self, guild_id: int, enabled: bool) -> None:
+        """Toggle a guild's safe mode, auto-provisioning the row if missing."""
+        guild = await self.get_or_create(guild_id)
         guild.safe_mode = enabled
         await self._session.flush()
 

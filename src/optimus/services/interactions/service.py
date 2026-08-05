@@ -133,9 +133,7 @@ class DbDeps:
 
     async def set_config_field(self, guild_id: int, field: str, value: Any) -> None:
         repo = GuildRepository(self._session)
-        guild = await repo.get(guild_id)
-        if guild is None:
-            raise KeyError(guild_id)
+        guild = await repo.get_or_create(guild_id)
         setattr(guild, field, value)
         await self._session.flush()
 
