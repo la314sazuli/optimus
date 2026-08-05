@@ -9,6 +9,7 @@ import pytest
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
 from optimus.services.interactions.handlers import (
+    _CONFIG_VIEW_ORDER,
     InteractionContext,
     handle_command,
     handle_component,
@@ -484,7 +485,7 @@ async def test_config_view_renders_review_channel_as_mention() -> None:
 
 
 async def _fake_get_config_with_channel(guild_id: int) -> dict[str, Any]:
-    return {"locale": "en", "review_channel_id": 1402357722430570498}
+    return {"locale": "en", "review_channel": 1402357722430570498}
 
 
 @pytest.mark.asyncio
@@ -497,6 +498,76 @@ async def test_config_view_no_row_shows_defaults_message() -> None:
 
 async def _fake_get_config_empty(guild_id: int) -> dict[str, Any]:
     return {}
+
+
+@pytest.mark.parametrize("field", _CONFIG_VIEW_ORDER)
+def test_every_config_view_field_is_settable_under_the_same_name(field: str) -> None:
+    """Every field /config view can display must be settable via /config set
+    under that exact same name -- guards against the DB-column-name leak this
+    regressed as for "review_channel" (view said "review_channel_id").
+
+    Uses each field's already-valid value from FakeDeps' default config shape
+    so this only checks *name* recognition, not value validation (that's
+    covered by test_validate_config_set_valid/_invalid_value already).
+    """
+    from optimus.services.interactions.logic import validate_config_set
+
+    sample_values = {
+        "sensitivity": "balanced",
+        "action_policy": "report_only",
+        "mod_queue_threshold": "0.5",
+        "review_channel": "none",
+        "safe_mode": "false",
+        "retention_days": "30",
+        "locale": "en",
+        "optin_global_db": "false",
+        "optin_scan_bots": "false",
+        "optin_evidence_storage": "false",
+    }
+    assert field in sample_values, f"add a sample value for new config field {field!r}"
+    # Must not raise InteractionRejected(UNKNOWN_FIELD) -- i.e. the name itself
+    # is recognized. A ValueError here would mean the sample value is wrong,
+    # which is a test bug, not a production one.
+    validate_config_set(field, sample_values[field])
+
+
+@pytest.mark.asyncio
+async def test_config_set_field_name_matches_config_view_field_name() -> None:
+    """Regression test: /config set field:<X> and /config view must agree on
+    the name <X> for every field, so a name copied from one always works
+    verbatim in the other. This previously drifted for the review channel:
+    /config set accepted "review_channel" but /config view rendered it back
+    as "review_channel_id" (the raw DB column name), so a user reading
+    /config view's output and pasting it into /config set got an "Unknown
+    configuration field" rejection.
+    """
+    store: dict[str, Any] = {"locale": "en"}
+    deps = FakeDeps()
+
+    async def fake_get_config(guild_id: int) -> dict[str, Any]:
+        return dict(store)
+
+    async def fake_set_config_field(guild_id: int, field: str, value: Any) -> None:
+        store[field] = value
+        deps.config_set.append((field, value))
+
+    deps.get_config = fake_get_config  # type: ignore[method-assign]
+    deps.set_config_field = fake_set_config_field  # type: ignore[method-assign]
+
+    set_resp = await handle_command(
+        _ctx(
+            "config",
+            subcommand="set",
+            field="review_channel",
+            value="<#1402357722430570498>",
+        ),
+        deps,
+    )
+    assert set_resp.i18n_key == "command.config_set_ok"
+
+    view_resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "**review_channel**: `<#1402357722430570498>`" in view_resp.params["summary"]
+    assert "review_channel_id" not in view_resp.params["summary"]
 
 
 @pytest.mark.asyncio

@@ -129,7 +129,11 @@ class DbDeps:
             "retention_days": guild.retention_days,
             "locale": guild.locale,
             "safe_mode": guild.safe_mode,
-            "review_channel_id": guild.review_channel_id,
+            # Keyed as "review_channel" (not the DB column's "review_channel_id")
+            # so this dict's keys always match the field names /config set
+            # accepts -- the DB column name is an internal storage detail and
+            # must not leak into the user-facing config surface.
+            "review_channel": guild.review_channel_id,
             "optin_global_db": guild.optin_global_db,
             "optin_scan_bots": guild.optin_scan_bots,
             "optin_evidence_storage": guild.optin_evidence_storage,

@@ -165,11 +165,16 @@ async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> Interac
 
 
 #: Display order for /config view; keeps related settings grouped together.
+#: These keys must exactly match both the dict keys returned by
+#: InteractionDeps.get_config() and the field names validate_config_set()
+#: accepts for /config set -- i.e. "review_channel", never the DB column's
+#: "review_channel_id" -- so a field name copied from /config view always
+#: works verbatim in /config set and vice versa.
 _CONFIG_VIEW_ORDER = (
     "sensitivity",
     "action_policy",
     "mod_queue_threshold",
-    "review_channel_id",
+    "review_channel",
     "safe_mode",
     "retention_days",
     "locale",
@@ -183,7 +188,7 @@ def _render_config_summary(current: dict[str, Any]) -> str:
     """Render a guild's config dict (from ``get_config``) as a display block.
 
     Empty (no row yet / guild never configured) renders a single explanatory
-    line rather than an empty list. ``review_channel_id`` renders as a real
+    line rather than an empty list. ``review_channel`` renders as a real
     channel mention (or "not set") to match ``_render_config_value``.
     """
     if not current:
@@ -193,7 +198,7 @@ def _render_config_summary(current: dict[str, Any]) -> str:
         if config_field not in current:
             continue
         value = current[config_field]
-        if config_field == "review_channel_id":
+        if config_field == "review_channel":
             rendered = f"<#{value}>" if value is not None else "not set"
         else:
             rendered = str(value)
