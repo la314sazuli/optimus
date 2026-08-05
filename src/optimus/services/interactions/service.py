@@ -268,14 +268,24 @@ def to_context(interaction: Any) -> InteractionContext:
     resolved by Discord (role permissions OR'd, owner short-circuited) — never
     from the command's ``default_member_permissions`` hint.
     """
+    import hikari
+
     interaction_options = interaction.options or []
     options = {option.name: option.value for option in interaction_options}
     subcommand: str | None = None
-    # Subcommands and groups carry their selected branch in ``options``, not ``value``.
-    while len(interaction_options) == 1 and interaction_options[0].options is not None:
+    # A SUB_COMMAND/SUB_COMMAND_GROUP option carries its selected branch in
+    # ``options`` instead of ``value`` — but a parameterless leaf subcommand
+    # (e.g. ``/config view``, ``/scamhash list``) also has ``options=None``,
+    # identical in shape to a leaf parameter. Discriminate on ``type`` instead
+    # of ``options is not None`` so a parameterless subcommand still descends
+    # correctly rather than being mistaken for "no more nesting to do".
+    while len(interaction_options) == 1 and interaction_options[0].type in (
+        hikari.OptionType.SUB_COMMAND,
+        hikari.OptionType.SUB_COMMAND_GROUP,
+    ):
         selected = interaction_options[0]
         subcommand = selected.name
-        interaction_options = selected.options
+        interaction_options = selected.options or []
         options = {option.name: option.value for option in interaction_options}
     member = interaction.member
     perms = int(member.permissions) if member is not None and member.permissions else 0
