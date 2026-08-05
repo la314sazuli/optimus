@@ -5,6 +5,13 @@ a decompression bomb or a malicious decoder cannot exhaust the worker. The child
 applies CPU/memory rlimits and a Pillow pixel cap; the parent enforces a wall
 clock timeout. Any failure yields a *non-decision* (``None``) — the pipeline
 never acts on an image it could not safely decode.
+
+Perceptual hashing only ever consumes a small (<=32x32) reduction of each
+frame (see :mod:`optimus.hashing.perceptual`), so the child decodes straight
+to a small thumbnail -- via JPEG's native ``draft()`` decode-time downscale
+where available, and a post-decode ``thumbnail()`` resize otherwise -- rather
+than ever materializing a full-resolution pixel buffer. Memory use is
+therefore roughly constant regardless of the source image's resolution.
 """
 
 from __future__ import annotations
@@ -29,19 +36,26 @@ class DecodeLimits:
     """Resource limits applied to the decode subprocess."""
 
     cpu_seconds: int = 5
-    #: Sized for the worst case at max_image_pixels: decoding a 24MP image needs
-    #: a uint8 RGB buffer (~72MB) plus a float32 RGB cast for luminance
-    #: (~288MB) plus the resulting float32 luminance frame (~96MB) plus
-    #: Pillow's own JPEG decode working set (~100MB) plus Python/numpy/Pillow
-    #: import baseline (~100MB) -- roughly 650MB with the float32 luminance
-    #: path below, or nearly double that with the float64 path this replaced.
-    #: The previous 512MB limit silently failed to decode any image near a
-    #: modern phone camera's real resolution. 1.5GB keeps comfortable headroom
-    #: above the calculated worst case on either path.
-    mem_bytes: int = 1536 * 1024 * 1024
+    #: JPEG (the common case for real photos/screenshots) decodes straight to
+    #: a small thumbnail via draft() and needs well under 256MB regardless of
+    #: source resolution. Formats without a draft-equivalent (PNG/GIF/WebP/
+    #: BMP) have no way to avoid a full-resolution decode buffer before the
+    #: post-decode thumbnail() resize can run, so this limit is sized for
+    #: the worst measured case across supported formats at the configured
+    #: max_image_pixels cap instead: WebP was the most memory-hungry at 24MP,
+    #: needing ~600MB at minimum (measured directly); 768MB keeps headroom
+    #: above that floor while still well under half of what full-resolution
+    #: float64 decoding needed before this module decoded to a thumbnail.
+    mem_bytes: int = 768 * 1024 * 1024
     wall_timeout: float = 5.0
     max_image_pixels: int = 24_000_000
     max_frames: int = 8
+    #: Side length (pixels) the child decodes/resizes each frame down to
+    #: before returning it. Perceptual hashing only ever consumes up to a
+    #: 32x32 reduction (see optimus.hashing.perceptual), so decoding to 4x
+    #: that gives _resize_mean real pixels to area-average from without ever
+    #: holding a full-resolution frame in memory.
+    hash_side: int = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,28 +75,58 @@ def _apply_rlimits(limits: DecodeLimits) -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
 
 
-# Child program: reads JSON {data, max_pixels, max_frames} on stdin, writes JSON
-# {frames:[base64 float32 LE], width, height, frame_count} on stdout.
+# Child program: reads JSON {data, max_pixels, max_frames, hash_side} on
+# stdin, writes JSON {frames:[base64 float32 LE], width, height, frame_count}
+# on stdout. Every frame is shrunk down to at most hash_side x hash_side
+# *during* decode (JPEG) or immediately after (all other formats) so peak
+# memory never scales with the source image's resolution -- perceptual
+# hashing only ever consumes a <=32x32 reduction of each frame, so nothing
+# downstream needs (or benefits from) full-resolution pixels.
 _CHILD_SOURCE = r"""
 import sys, json, base64, io
 import numpy as np
 from PIL import Image, ImageSequence
 
-def luminance(im):
-    # float32 (not float64) for the RGB cast: halves peak memory for the
-    # largest intermediate in this pipeline with no meaningful precision loss
-    # for 0-255 luminance weights, and the caller re-serializes to float32
-    # anyway (see the frames output below).
-    arr = np.asarray(im.convert("RGB"), dtype=np.float32)
+def shrink(im, side):
+    # draft() only applies to JPEG/MPO and must run before any pixel access;
+    # it asks the decoder itself to emit a downscaled DCT output, so a 6000x4000
+    # JPEG never exists at full resolution anywhere in this process. Harmless
+    # no-op (returns None) for formats/images it can't accelerate.
+    im.draft("RGB", (side, side))
+    im.load()
+    # Safety net for formats draft() can't touch (PNG/GIF/WebP/BMP) and for
+    # JPEGs draft() only partially reduced: a further resize down to the exact
+    # target. Cheap once draft has already done the heavy lifting; for other
+    # formats this is the only reduction, bounded by the max_pixels decode cap
+    # enforced by Image.MAX_IMAGE_PIXELS below.
+    if im.width > side or im.height > side:
+        # thumbnail() mutates and resizes in place -- no defensive copy needed
+        # here, since each frame object is either freshly produced by the
+        # sequence iterator or the sole reference to a non-animated image.
+        # Skipping the copy avoids briefly holding two full decode buffers at
+        # once, which matters at this memory budget.
+        im.thumbnail((side, side), Image.Resampling.BOX)
+    return im
+
+def luminance(im, side):
+    small = shrink(im, side)
+    # float32 (not float64) for the RGB cast: halves peak memory for this
+    # intermediate with no meaningful precision loss for 0-255 luminance
+    # weights, and the caller re-serializes to float32 anyway (see the frames
+    # output below).
+    arr = np.asarray(small.convert("RGB"), dtype=np.float32)
     w = np.array([0.299, 0.587, 0.114], dtype=np.float32)
     return arr @ w
 
 req = json.load(sys.stdin)
 Image.MAX_IMAGE_PIXELS = int(req["max_pixels"])
 max_frames = int(req["max_frames"])
+hash_side = int(req["hash_side"])
 raw = base64.b64decode(req["data"])
 im = Image.open(io.BytesIO(raw))
-im.load()
+# Capture the TRUE original dimensions before draft()/thumbnail() touch
+# im.size -- draft() rewrites im.size in place to the reduced size the moment
+# it runs, so this must happen first and be read from the file header alone.
 w, h = im.size
 
 frames = []
@@ -92,11 +136,11 @@ if total > 1:
     for idx, frame in enumerate(ImageSequence.Iterator(im)):
         if idx % step != 0:
             continue
-        frames.append(luminance(frame))
+        frames.append(luminance(frame, hash_side))
         if len(frames) >= max_frames:
             break
 if not frames:
-    frames.append(luminance(im))
+    frames.append(luminance(im, hash_side))
 
 out = {
     "frames": [base64.b64encode(f.astype("<f4").tobytes()).decode() for f in frames],
@@ -121,6 +165,7 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
             "data": base64.b64encode(data).decode("ascii"),
             "max_pixels": lim.max_image_pixels,
             "max_frames": lim.max_frames,
+            "hash_side": lim.hash_side,
         }
     )
     try:
