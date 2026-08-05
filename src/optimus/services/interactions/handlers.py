@@ -151,14 +151,66 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
     assert ctx.guild_id is not None
     if ctx.subcommand == "view":
-        await deps.get_config(ctx.guild_id)
-        return InteractionResponse("command.config_view_header")
+        current = await deps.get_config(ctx.guild_id)
+        return InteractionResponse(
+            "command.config_view_header", {"summary": _render_config_summary(current)}
+        )
     change = validate_config_set(str(ctx.options["field"]), str(ctx.options["value"]))
     await deps.set_config_field(ctx.guild_id, change.field, change.value)
     await deps.audit(ctx.guild_id, ctx.user_id, "config.set", target=change.field)
     return InteractionResponse(
-        "command.config_set_ok", {"field": change.field, "value": change.value}
+        "command.config_set_ok",
+        {"field": change.field, "value": _render_config_value(change.field, change.value)},
     )
+
+
+#: Display order for /config view; keeps related settings grouped together.
+_CONFIG_VIEW_ORDER = (
+    "sensitivity",
+    "action_policy",
+    "mod_queue_threshold",
+    "review_channel_id",
+    "safe_mode",
+    "retention_days",
+    "locale",
+    "optin_global_db",
+    "optin_scan_bots",
+    "optin_evidence_storage",
+)
+
+
+def _render_config_summary(current: dict[str, Any]) -> str:
+    """Render a guild's config dict (from ``get_config``) as a display block.
+
+    Empty (no row yet / guild never configured) renders a single explanatory
+    line rather than an empty list. ``review_channel_id`` renders as a real
+    channel mention (or "not set") to match ``_render_config_value``.
+    """
+    if not current:
+        return "_No configuration set yet \u2014 defaults are in effect._"
+    lines = []
+    for config_field in _CONFIG_VIEW_ORDER:
+        if config_field not in current:
+            continue
+        value = current[config_field]
+        if config_field == "review_channel_id":
+            rendered = f"<#{value}>" if value is not None else "not set"
+        else:
+            rendered = str(value)
+        lines.append(f"**{config_field}**: `{rendered}`")
+    return "\n".join(lines)
+
+
+def _render_config_value(field: str, value: Any) -> str:
+    """Render a validated config value for the ``config_set_ok`` confirmation.
+
+    ``review_channel`` stores a raw channel id (or ``None`` when cleared); show
+    it as a real channel mention (or "none") instead of a bare integer/"None".
+    Every other field renders as-is.
+    """
+    if field == "review_channel":
+        return f"<#{value}>" if value is not None else "none"
+    return str(value)
 
 
 async def _cmd_stats(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:

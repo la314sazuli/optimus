@@ -227,6 +227,34 @@ async def test_config_set_persists_and_audits() -> None:
     assert deps.audits[0][2] == "config.set"
 
 
+@pytest.mark.asyncio
+async def test_config_set_review_channel_renders_as_mention() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _ctx(
+            "config",
+            subcommand="set",
+            field="review_channel",
+            value="<#1402357722430570498>",
+        ),
+        deps,
+    )
+    assert resp.i18n_key == "command.config_set_ok"
+    assert deps.config_set == [("review_channel", 1402357722430570498)]
+    assert resp.params["value"] == "<#1402357722430570498>"
+
+
+@pytest.mark.asyncio
+async def test_config_set_review_channel_clear_renders_as_none() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _ctx("config", subcommand="set", field="review_channel", value="none"), deps
+    )
+    assert resp.i18n_key == "command.config_set_ok"
+    assert deps.config_set == [("review_channel", None)]
+    assert resp.params["value"] == "none"
+
+
 # --- review button auth --------------------------------------------------------
 
 
@@ -443,6 +471,32 @@ async def test_scamhash_export_roundtrips() -> None:
 async def test_config_view() -> None:
     resp = await handle_command(_ctx("config", subcommand="view"), FakeDeps())
     assert resp.i18n_key == "command.config_view_header"
+    # FakeDeps.get_config's default {"locale": "en"} still renders a summary line.
+    assert "**locale**: `en`" in resp.params["summary"]
+
+
+@pytest.mark.asyncio
+async def test_config_view_renders_review_channel_as_mention() -> None:
+    deps = FakeDeps()
+    deps.get_config = _fake_get_config_with_channel  # type: ignore[method-assign]
+    resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "<#1402357722430570498>" in resp.params["summary"]
+
+
+async def _fake_get_config_with_channel(guild_id: int) -> dict[str, Any]:
+    return {"locale": "en", "review_channel_id": 1402357722430570498}
+
+
+@pytest.mark.asyncio
+async def test_config_view_no_row_shows_defaults_message() -> None:
+    deps = FakeDeps()
+    deps.get_config = _fake_get_config_empty  # type: ignore[method-assign]
+    resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "defaults are in effect" in resp.params["summary"]
+
+
+async def _fake_get_config_empty(guild_id: int) -> dict[str, Any]:
+    return {}
 
 
 @pytest.mark.asyncio

@@ -243,7 +243,35 @@ def validate_config_set(field: str, raw_value: str) -> ConfigChange:
         if text.lower() not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
             raise InteractionRejected(CommandError.INVALID_VALUE)
         return ConfigChange(field, text.lower() in {"true", "1", "yes", "on"})
+    if field == "review_channel":
+        return ConfigChange(field, parse_channel_reference(text))
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)
+
+
+#: Accepted spellings for "unset the review channel" on ``/config set``.
+_CLEAR_CHANNEL_VALUES = frozenset({"none", "off", "clear", "unset", "0"})
+
+
+def parse_channel_reference(text: str) -> int | None:
+    """Coerce a ``/config set field:review_channel`` value into a channel id.
+
+    Accepts a Discord channel mention as typed by the client (``<#123...>``),
+    a bare numeric snowflake, or one of :data:`_CLEAR_CHANNEL_VALUES` to unset
+    the field (``None``). Rejects anything else, and any id outside the valid
+    64-bit unsigned snowflake range, as ``INVALID_VALUE``.
+    """
+    if text.lower() in _CLEAR_CHANNEL_VALUES:
+        return None
+    candidate = text
+    if candidate.startswith("<#") and candidate.endswith(">"):
+        candidate = candidate[2:-1]
+    try:
+        channel_id = int(candidate)
+    except ValueError as exc:
+        raise InteractionRejected(CommandError.INVALID_VALUE) from exc
+    if not 0 <= channel_id <= MAX_UINT64:
+        raise InteractionRejected(CommandError.INVALID_VALUE)
+    return channel_id
 
 
 class ComponentAction(StrEnum):

@@ -194,6 +194,12 @@ def test_validate_import_never_crashes_on_text(blob: str) -> None:
         ("locale", "sr", "sr"),
         ("optin_global_db", "true", True),
         ("optin_scan_bots", "off", False),
+        ("review_channel", "<#1402357722430570498>", 1402357722430570498),
+        ("review_channel", "1402357722430570498", 1402357722430570498),
+        ("review_channel", "none", None),
+        ("review_channel", "off", None),
+        ("review_channel", "clear", None),
+        ("review_channel", "0", None),
     ],
 )
 def test_validate_config_set_valid(field: str, value: str, expected: object) -> None:
@@ -217,6 +223,10 @@ def test_validate_config_set_unknown_field() -> None:
         ("retention_days", "9999"),
         ("locale", "xx"),
         ("optin_global_db", "maybe"),
+        ("review_channel", "not-a-channel"),
+        ("review_channel", "<#not-numeric>"),
+        ("review_channel", "-1"),
+        ("review_channel", str(2**64)),
     ],
 )
 def test_validate_config_set_invalid_value(field: str, value: str) -> None:

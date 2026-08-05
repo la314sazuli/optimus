@@ -36,7 +36,7 @@
     "import_invalid": "Datoteka za uvoz je nevažeća: {reason}",
     "import_too_large": "Datoteka za uvoz prelazi maksimum od {limit} stavki.",
     "export_ok": "Izvezeno {count} heševa.",
-    "config_view_header": "Konfiguracija za ovaj server:",
+    "config_view_header": "Konfiguracija za ovaj server:\n{summary}",
     "config_set_ok": "Polje **{field}** je ažurirano na `{value}`.",
     "config_unknown_field": "Nepoznato polje konfiguracije `{field}`.",
     "config_invalid_value": "Nevažeća vrednost za **{field}**: {reason}",

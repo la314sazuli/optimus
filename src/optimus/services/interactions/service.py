@@ -129,6 +129,10 @@ class DbDeps:
             "retention_days": guild.retention_days,
             "locale": guild.locale,
             "safe_mode": guild.safe_mode,
+            "review_channel_id": guild.review_channel_id,
+            "optin_global_db": guild.optin_global_db,
+            "optin_scan_bots": guild.optin_scan_bots,
+            "optin_evidence_storage": guild.optin_evidence_storage,
         }
 
     async def set_config_field(self, guild_id: int, field: str, value: Any) -> None:
