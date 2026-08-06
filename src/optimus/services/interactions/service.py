@@ -22,7 +22,10 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sqlalchemy.exc import OperationalError
+
 from optimus.contracts.events import Verdict, VerdictEvent
+from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.config import Settings
 from optimus.core.logging import correlation_context, get_correlation_id, get_logger
 from optimus.core.ratelimit import RateLimit, RateLimiter
@@ -372,21 +375,83 @@ class InteractionService:
             )
         return InteractionResponse("button.expired")
 
+    #: Bounded retry budget for interactions that hit a transient SQLite
+    #: "database is locked" error. Each interaction gets a *fresh* session on
+    #: retry (a failed session's transaction is already rolled back by
+    #: :func:`session_scope`'s exception handler on the way out), so retrying
+    #: the whole call is safe as long as the handler itself is idempotent --
+    #: which every write path here already has to be for message-bus
+    #: redelivery (see :meth:`DetectionService._persist`'s idempotency-key
+    #: savepoint). This does not attempt to diagnose *why* SQLite reports the
+    #: database as locked (WAL requires brief exclusive access to its shared
+    #: -shm/-wal files even for readers, and a busy Railway volume can stall
+    #: that past the point a single attempt tolerates); it only keeps a rare,
+    #: transient lock from surfacing as a failed Discord interaction.
+    _LOCK_RETRY_BACKOFF: ClassVar[BackoffPolicy] = BackoffPolicy(
+        base=0.05, multiplier=2.0, max_delay=1.0, max_attempts=3
+    )
+
     async def _run(self, call: Any) -> InteractionResponse:
-        async with self._scope() as session:
-            deps = DbDeps(
-                session,
-                self._rl,
-                self._settings,
-                fetch=self._fetch,
-                detection=self._detection,
+        attempt = 0
+
+        async def attempt_once() -> InteractionResponse:
+            nonlocal attempt
+            attempt += 1
+            try:
+                async with self._scope() as session:
+                    deps = DbDeps(
+                        session,
+                        self._rl,
+                        self._settings,
+                        fetch=self._fetch,
+                        detection=self._detection,
+                    )
+                    return await call(deps)  # type: ignore[no-any-return]
+            except OperationalError as exc:
+                if not _is_sqlite_lock_error(exc):
+                    raise _NonRetryableDbError from exc
+                _log.warning(
+                    "interaction_db_locked_retry",
+                    attempt=attempt,
+                    max_attempts=self._LOCK_RETRY_BACKOFF.max_attempts,
+                )
+                raise
+
+        try:
+            return await retry_async(
+                attempt_once, self._LOCK_RETRY_BACKOFF, retry_on=(OperationalError,)
             )
-            return await call(deps)  # type: ignore[no-any-return]
+        except _NonRetryableDbError as exc:
+            assert exc.__cause__ is not None
+            raise exc.__cause__ from None
+
+
+class _NonRetryableDbError(Exception):
+    """Internal sentinel: an ``OperationalError`` that is not a lock error.
+
+    :func:`InteractionService._run` retries on ``OperationalError`` broadly
+    (via :func:`optimus.core.backoff.retry_async`'s type-based filter), but
+    only a SQLite "database is locked" message is actually transient. Raising
+    this distinct type from inside the retried closure stops the retry loop
+    immediately for anything else (e.g. a genuinely broken migration), while
+    still letting the original exception surface unchanged to the caller.
+    """
 
 
 def render(response: InteractionResponse, locale: str) -> str:
     """Localize a successful handler response for ephemeral display."""
     return translate(response.i18n_key, locale, **response.params)
+
+
+def _is_sqlite_lock_error(exc: OperationalError) -> bool:
+    """Whether ``exc`` is SQLite's transient ``database is locked`` error.
+
+    ``OperationalError`` covers many unrelated conditions (e.g. a genuinely
+    missing table on a broken migration); only the specific SQLite lock
+    message is worth a retry, so this checks the wrapped driver message
+    rather than treating every ``OperationalError`` as transient.
+    """
+    return "database is locked" in str(exc.orig).lower()
 
 
 def _image_attachments(attachments: Any) -> list[tuple[int, str]]:
