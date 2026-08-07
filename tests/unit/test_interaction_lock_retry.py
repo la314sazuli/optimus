@@ -123,3 +123,40 @@ async def test_run_propagates_non_operational_errors_immediately() -> None:
         await service._run(call)
 
     assert attempts == 1
+
+
+async def test_pool_diagnostics_reports_real_pool_stats(tmp_path: Any) -> None:
+    """Against a real file-backed SQLite engine, diagnostics should report the
+    actual AsyncAdaptedQueuePool stats rather than falling back to an error."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from optimus.db.engine import create_engine
+    from optimus.services.interactions.service import _pool_diagnostics
+
+    db_path = tmp_path / "diag.db"
+    engine = create_engine(f"sqlite+aiosqlite:///{db_path}")
+    try:
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            # A freshly opened AsyncSession is lazy -- it doesn't check out a
+            # connection from the pool until it actually runs something, so
+            # execute a no-op query first to get a realistic "mid-request"
+            # snapshot matching what _run's retry path observes.
+            await session.execute(text("SELECT 1"))
+            diagnostics = _pool_diagnostics(session)
+            assert diagnostics["pool_class"] == "AsyncAdaptedQueuePool"
+            assert diagnostics["checkedout"] == 1  # this session's own connection
+            assert isinstance(diagnostics["checkedin"], int)
+    finally:
+        await engine.dispose()
+
+
+async def test_pool_diagnostics_falls_back_gracefully_for_fake_session() -> None:
+    """A session-like object with no real ``get_bind()`` must not raise --
+    diagnostics logging must never mask or replace the real error being
+    reported alongside it."""
+    from optimus.services.interactions.service import _pool_diagnostics
+
+    diagnostics = _pool_diagnostics(_FakeSession())
+    assert "pool_diagnostics_error" in diagnostics

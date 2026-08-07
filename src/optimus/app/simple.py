@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import signal
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from functools import partial
@@ -244,6 +245,36 @@ class _NoopRest:
     async def send_dm(self, user_id: int, content: str) -> None: ...
 
 
+def _install_shutdown_signal_handler(task: asyncio.Task[None]) -> None:
+    """Cancel ``task`` on SIGTERM/SIGINT so shutdown runs the normal ``finally`` chain.
+
+    Railway (and most container platforms) send SIGTERM on redeploy or stop, then
+    SIGKILL after a grace period. Python's default SIGTERM action is immediate
+    process termination with no chance to run cleanup code, which skips the
+    ``finally: await app.aclose()`` block in :func:`run_simple` — including
+    ``engine.dispose()``. On a SQLite database living on a shared Railway volume,
+    that means the next container can start writing to the file before this
+    process's connections are released, surfacing as a "database is locked"
+    error that looks transient but is actually caused by a skipped clean
+    shutdown, not by ordinary in-process contention.
+
+    ``loop.add_signal_handler`` requires a running loop and only works on the
+    main thread on POSIX platforms; both hold here since this is called from
+    inside :func:`run_simple` while it runs under ``asyncio.run``.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _cancel(sig: signal.Signals) -> None:
+        _log.info("shutdown_signal_received", signal=sig.name)
+        task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            # NotImplementedError on platforms without signal-handler support in
+            # the event loop (e.g. some Windows configurations) — best effort.
+            loop.add_signal_handler(sig, _cancel, sig)
+
+
 async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
     """Entrypoint for ``OPTIMUS_MODE=simple``: compose and run everything.
 
@@ -308,12 +339,21 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
 
     from optimus.app.discord import run_discord_edges
 
-    try:
-        await run_discord_edges(app, settings, rest=rest)
-    finally:
-        await app.aclose()
-        await app.health.stop()
-        await _close_rest(rest, rest_app)
+    async def _serve() -> None:
+        try:
+            await run_discord_edges(app, settings, rest=rest)
+        finally:
+            await app.aclose()
+            await app.health.stop()
+            await _close_rest(rest, rest_app)
+
+    serve_task = asyncio.ensure_future(_serve())
+    _install_shutdown_signal_handler(serve_task)
+    # Expected on SIGTERM/SIGINT: _serve()'s own finally block already ran
+    # (app.aclose/engine.dispose, health.stop, rest close) before this
+    # cancellation propagates out, so shutdown is complete at this point.
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve_task
 
 
 async def _close_rest(rest: object, rest_app: object) -> None:  # pragma: no cover - net

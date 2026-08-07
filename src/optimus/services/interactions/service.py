@@ -414,6 +414,7 @@ class InteractionService:
                     "interaction_db_locked_retry",
                     attempt=attempt,
                     max_attempts=self._LOCK_RETRY_BACKOFF.max_attempts,
+                    **_pool_diagnostics(session),
                 )
                 raise
 
@@ -452,6 +453,29 @@ def _is_sqlite_lock_error(exc: OperationalError) -> bool:
     rather than treating every ``OperationalError`` as transient.
     """
     return "database is locked" in str(exc.orig).lower()
+
+
+def _pool_diagnostics(session: Any) -> dict[str, int | str]:
+    """Best-effort snapshot of the session's connection pool state.
+
+    A "database is locked" error that survives every retry attempt is not
+    supposed to happen under a healthy pool -- either every connection is
+    genuinely busy (checkedout == pool size, pointing at a leak or a stuck
+    long-lived transaction elsewhere) or something odd is going on with the
+    pool configuration itself. This is deliberately defensive: pool types
+    that don't track checkout counts (e.g. ``StaticPool`` for ``:memory:``
+    databases in tests) shouldn't turn a diagnostic log call into a second
+    exception on top of the one being reported.
+    """
+    try:
+        pool = session.get_bind().pool
+        return {
+            "pool_class": type(pool).__name__,
+            "checkedout": pool.checkedout(),
+            "checkedin": pool.checkedin(),
+        }
+    except Exception as exc:
+        return {"pool_diagnostics_error": str(exc)}
 
 
 def _image_attachments(attachments: Any) -> list[tuple[int, str]]:
