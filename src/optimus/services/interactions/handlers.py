@@ -22,7 +22,10 @@ from typing import Any, Protocol
 from optimus.core.logging import get_logger
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
-from optimus.services.interactions.attachment_hash import AttachmentHashError
+from optimus.services.interactions.attachment_hash import (
+    AttachmentHashError,
+    AttachmentHashes,
+)
 from optimus.services.interactions.commands import required_permission
 from optimus.services.interactions.logic import (
     CommandError,
@@ -95,18 +98,37 @@ class InteractionDeps(Protocol):
         self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
     ) -> None: ...
     def global_service(self) -> GlobalHashService: ...
-    async def hash_and_store_attachment(
-        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
-    ) -> GuildHash:
-        """Fetch, decode, and hash one attachment, then store it as a guild hash.
+    async def compute_attachment_hashes(self, *, attachment_id: int, url: str) -> AttachmentHashes:
+        """Fetch and decode one attachment and compute its hash set. No DB access.
+
+        Deliberately split out from storing the result: this does a network
+        fetch plus a sandboxed decode subprocess, both of which can take real
+        wall-clock time (multi-second on a loaded host) and must never run
+        while a DB write transaction is open -- SQLite holds an exclusive
+        file-level write lock for the full lifetime of the transaction, and a
+        review of a multi-image message previously ran every attachment's
+        fetch+decode one after another *inside* the same open transaction as
+        the DB writes, which could hold that lock far longer than any normal
+        query and starve concurrent writers into a "database is locked" error.
 
         Raises :class:`AttachmentHashError` (see
         :mod:`optimus.services.interactions.attachment_hash`) if the attachment
         cannot be fetched or decoded as an image; the caller decides how to
-        surface that (skip-and-continue for a multi-image review). If a hash
-        with the same id already exists for this guild (e.g. re-reviewing a
-        message, or an image an earlier detection already caught), returns the
-        existing row rather than raising -- adding a scam hash is idempotent.
+        surface that (skip-and-continue for a multi-image review).
+        """
+        ...
+
+    async def store_attachment_hash(
+        self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+    ) -> GuildHash:
+        """Store an already-computed attachment hash set as a guild hash.
+
+        DB-only -- no network or decode work happens here, so this is always
+        fast and holds the session's write lock only as long as one insert
+        takes. If a hash with the same id already exists for this guild (e.g.
+        re-reviewing a message, or an image an earlier detection already
+        caught), returns the existing row rather than raising -- adding a scam
+        hash is idempotent.
         """
         ...
 
@@ -212,6 +234,20 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     fetch/decode one attachment is skipped rather than aborting the whole
     review, since a message can carry several images and a moderator's intent
     is best served by processing every image that *can* be processed.
+
+    Runs in two passes deliberately: first every attachment is fetched and
+    hashed with no DB session/transaction involved at all, then (only once
+    all the slow network/decode work is done) each successfully hashed
+    attachment is stored and submitted in quick DB-only calls. The whole
+    handler still executes inside one caller-managed transaction (see
+    :meth:`InteractionService._run`), so interleaving a network fetch plus a
+    sandboxed decode subprocess for attachment N+1 with attachment N's writes
+    used to hold that transaction's SQLite write lock open for as long as an
+    entire multi-image review took -- multiple seconds per image, easily
+    exceeding the point another writer would report "database is locked".
+    Doing all the slow work up front means the transaction's write lock is
+    only ever held for the sum of the fast DB calls, not the fetch+decode
+    time too.
     """
     assert ctx.guild_id is not None  # guaranteed by _require (MANAGE_GUILD => guild-only)
     if not await deps.hash_rate_ok(ctx.user_id):
@@ -223,13 +259,15 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     if not attachments:
         return InteractionResponse("command.reviewmsg_no_images")
 
-    added_hash_ids: list[str] = []
+    # Pass 1: fetch + decode + hash every attachment. Pure computation plus
+    # network I/O -- deliberately kept outside any DB write below so the
+    # transaction the caller already has open never sits idle waiting on a
+    # CDN round-trip or a sandboxed decode subprocess.
+    computed: list[tuple[int, AttachmentHashes]] = []
     failed = 0
     for attachment_id, url in attachments:
         try:
-            stored = await deps.hash_and_store_attachment(
-                ctx.guild_id, attachment_id=attachment_id, url=url, added_by=ctx.user_id
-            )
+            hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
         except AttachmentHashError as exc:
             _log.warning(
                 "reviewmsg_attachment_hash_failed",
@@ -239,6 +277,14 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
             )
             failed += 1
             continue
+        computed.append((attachment_id, hashes))
+
+    # Pass 2: store + audit + submit. DB-only, no network/decode work, so
+    # each iteration is fast and the write lock is held for close to the
+    # minimum time actually needed.
+    added_hash_ids: list[str] = []
+    for attachment_id, hashes in computed:
+        stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
         added_hash_ids.append(stored.hash_id)
         await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
         await deps.submit_confirmed_scam(

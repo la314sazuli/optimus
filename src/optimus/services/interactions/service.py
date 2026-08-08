@@ -46,7 +46,11 @@ from optimus.db.repositories import (
 from optimus.globaldb.service import GlobalHashService
 from optimus.i18n import translate
 from optimus.ingest.fetcher import FetchedImage, fetch_image
-from optimus.services.interactions.attachment_hash import FetchFn, hash_attachment
+from optimus.services.interactions.attachment_hash import (
+    AttachmentHashes,
+    FetchFn,
+    hash_attachment,
+)
 from optimus.services.interactions.handlers import (
     InteractionContext,
     InteractionResponse,
@@ -286,10 +290,15 @@ class DbDeps:
             signing_public_key_b64=self._settings.global_signing_public_key,
         )
 
-    async def hash_and_store_attachment(
-        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
+    async def compute_attachment_hashes(self, *, attachment_id: int, url: str) -> AttachmentHashes:
+        # No DB access here on purpose -- see the docstring on the protocol
+        # method in handlers.InteractionDeps for why this must stay decoupled
+        # from any open transaction.
+        return await hash_attachment(self._fetch, attachment_id=attachment_id, url=url)
+
+    async def store_attachment_hash(
+        self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
     ) -> GuildHash:
-        hashes = await hash_attachment(self._fetch, attachment_id=attachment_id, url=url)
         hash_id = f"{hashes.phash:016x}"
         repo = GuildHashRepository(self._session, guild_id)
         existing = await repo.get(hash_id)

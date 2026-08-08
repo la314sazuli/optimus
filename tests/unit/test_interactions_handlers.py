@@ -8,7 +8,10 @@ import pytest
 
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
-from optimus.services.interactions.attachment_hash import AttachmentHashError
+from optimus.services.interactions.attachment_hash import (
+    AttachmentHashError,
+    AttachmentHashes,
+)
 from optimus.services.interactions.handlers import (
     _CONFIG_VIEW_ORDER,
     InteractionContext,
@@ -124,25 +127,44 @@ class FakeDeps:
     def global_service(self) -> GlobalHashService:
         return self._global_service  # type: ignore[return-value]
 
-    async def hash_and_store_attachment(
-        self, guild_id: int, *, attachment_id: int, url: str, added_by: int
-    ) -> GuildHash:
+    async def compute_attachment_hashes(self, *, attachment_id: int, url: str) -> AttachmentHashes:
         outcome = self._attachment_outcomes.get(attachment_id, f"{attachment_id:016x}")
         if isinstance(outcome, Exception):
             raise outcome
-        existing = self.hashes.get(outcome)
-        if existing is not None:
-            return existing
-        gh = GuildHash(
-            hash_id=outcome,
-            phash=attachment_id,
+        # phash is the only field _review_message's downstream store call
+        # derives an id from (`f"{hashes.phash:016x}"`); stash the intended
+        # hash_id string in phash's hex digits so store_attachment_hash below
+        # reproduces it exactly, matching the pre-split fake's behavior.
+        return AttachmentHashes(
+            attachment_id=attachment_id,
+            url=url,
+            phash=int(outcome, 16),
             dhash=attachment_id,
             whash=attachment_id,
             ahash=0,
+            mphash=0,
+            mdhash=0,
+            mwhash=0,
+            mahash=0,
+        )
+
+    async def store_attachment_hash(
+        self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+    ) -> GuildHash:
+        hash_id = f"{hashes.phash:016x}"
+        existing = self.hashes.get(hash_id)
+        if existing is not None:
+            return existing
+        gh = GuildHash(
+            hash_id=hash_id,
+            phash=hashes.phash,
+            dhash=hashes.dhash,
+            whash=hashes.whash,
+            ahash=hashes.ahash,
             source="reviewmsg",
             added_by=added_by,
         )
-        self.hashes[outcome] = gh
+        self.hashes[hash_id] = gh
         return gh
 
     async def submit_confirmed_scam(
@@ -796,7 +818,7 @@ async def test_reviewmsg_all_attachments_fail() -> None:
 @pytest.mark.asyncio
 async def test_reviewmsg_duplicate_hash_is_idempotent() -> None:
     """Re-reviewing a message (or an image already hashed by another path)
-    must not raise -- ``hash_and_store_attachment`` returns the existing row."""
+    must not raise -- ``store_attachment_hash`` returns the existing row."""
     deps = FakeDeps()
     existing = GuildHash(hash_id=f"{1:016x}", phash=1, dhash=1, whash=1, ahash=0, source="local")
     deps.hashes[existing.hash_id] = existing
@@ -805,6 +827,61 @@ async def test_reviewmsg_duplicate_hash_is_idempotent() -> None:
     assert resp.params["added"] == 1
     assert len(deps.confirmed_scams) == 1
     assert deps.confirmed_scams[0]["matched_hash_id"] == existing.hash_id
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_computes_all_hashes_before_storing_any() -> None:
+    """All ``compute_attachment_hashes`` calls (network fetch + decode -- no DB)
+    must happen before any ``store_attachment_hash``/``audit``/
+    ``submit_confirmed_scam`` call (DB writes).
+
+    This is the actual behavioral guarantee behind splitting
+    ``hash_and_store_attachment`` into a compute phase and a store phase: a
+    multi-image review must never interleave a slow network+decode call for
+    one attachment with a DB write for another, because the whole handler
+    runs inside one caller-managed transaction (see
+    :meth:`InteractionService._run`) and a SQLite write transaction holds an
+    exclusive file-level lock for as long as it stays open. Interleaving used
+    to hold that lock open for the sum of every attachment's fetch+decode
+    time plus every write, which could starve a concurrent writer into a
+    "database is locked" error well past any reasonable retry budget.
+    """
+    calls: list[str] = []
+
+    class OrderTrackingDeps(FakeDeps):
+        async def compute_attachment_hashes(
+            self, *, attachment_id: int, url: str
+        ) -> AttachmentHashes:
+            calls.append(f"compute:{attachment_id}")
+            return await super().compute_attachment_hashes(attachment_id=attachment_id, url=url)
+
+        async def store_attachment_hash(
+            self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+        ) -> GuildHash:
+            calls.append(f"store:{hashes.attachment_id}")
+            return await super().store_attachment_hash(guild_id, hashes=hashes, added_by=added_by)
+
+        async def audit(
+            self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
+        ) -> None:
+            calls.append("audit")
+            await super().audit(guild_id, actor_id, action, target=target)
+
+        async def submit_confirmed_scam(self, guild_id: int, **kwargs: Any) -> None:
+            calls.append(f"submit:{kwargs['attachment_id']}")
+            await super().submit_confirmed_scam(guild_id, **kwargs)
+
+    deps = OrderTrackingDeps()
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+
+    assert resp.params["added"] == 3
+    compute_calls = [c for c in calls if c.startswith("compute:")]
+    other_calls = [c for c in calls if not c.startswith("compute:")]
+    assert compute_calls == ["compute:1", "compute:2", "compute:3"]
+    assert calls.index(other_calls[0]) > calls.index(compute_calls[-1]), (
+        "a store/audit/submit call happened before all attachments were computed"
+    )
 
 
 @pytest.mark.asyncio
