@@ -266,6 +266,47 @@ async def test_evidence_cleanup_deletes_expired(scope: SessionScope) -> None:
     assert len(remaining) == 1
 
 
+async def test_evidence_cleanup_holds_no_transaction_during_object_delete(
+    scope: SessionScope,
+) -> None:
+    """``delete_object`` must run with no DB transaction open.
+
+    Regression guard for the same anti-pattern fixed in the reviewmsg
+    attachment path (see ``test_reviewmsg_lock_isolation.py``): looping a
+    slow/network ``delete_object`` call inside one open ``scope()`` block
+    would hold SQLite's write lock for the whole batch and starve every
+    other writer in the process. This proves a concurrent writer succeeds
+    *while* ``delete_object`` is in flight, which is only possible if
+    ``cleanup_evidence`` has already closed its listing transaction by then.
+    """
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    await _add_guild(scope, 1)
+    det_id = await _add_detection(scope, 1, key="e", created=now)
+    async with scope() as s:
+        s.add(
+            Evidence(
+                detection_id=det_id,
+                object_key="evidence/1/9",
+                expires_at=now - timedelta(hours=2),
+            )
+        )
+
+    concurrent_write_succeeded = False
+
+    async def delete_object(key: str) -> None:
+        nonlocal concurrent_write_succeeded
+        # If cleanup_evidence still held its listing session/transaction
+        # open here, this concurrent write would hang or raise
+        # "database is locked" against the shared in-memory connection.
+        async with scope() as s:
+            s.add(Guild(guild_id=999, retention_days=30))
+        concurrent_write_succeeded = True
+
+    removed = await tasks.cleanup_evidence(scope, delete_object=delete_object, now=now)
+    assert removed == 1
+    assert concurrent_write_succeeded
+
+
 class _FakeBus:
     """Captures published (subject, event) pairs."""
 

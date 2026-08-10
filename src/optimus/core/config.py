@@ -130,11 +130,20 @@ class Settings(BaseSettings):
     #: detection, moderation) plus interaction handlers as concurrent writers
     #: against one file; SQLite serialises writers, so without a generous busy
     #: timeout a writer that collides with another in-flight write fails
-    #: immediately. WAL (set alongside this) lets readers proceed during a write;
-    #: the timeout absorbs writer-vs-writer overlaps under sustained load. 30s is
-    #: well above the longest observed write burst while still bounding a genuine
-    #: deadlock.
-    sqlite_busy_timeout_ms: int = Field(default=30_000, ge=0)
+    #: immediately. WAL (set alongside this) lets readers proceed during a write.
+    #:
+    #: Deliberately shorter than earlier (was 30s): production evidence
+    #: (2026-08-10) showed an external, non-pool lock holder occasionally
+    #: stalling a single attempt for the *entire* busy_timeout window, with
+    #: this process's own pool idle (checkedout: 0) throughout. One 30s
+    #: window per attempt gave very few independent chances for a transient
+    #: external holder to release the lock. A shorter per-attempt timeout
+    #: paired with more retries at the call site
+    #: (``InteractionService._LOCK_RETRY_BACKOFF``) spreads the same
+    #: order-of-magnitude total wait across more, shorter windows -- more
+    #: opportunities to observe the lock released -- while still comfortably
+    #: covering any normal writer-vs-writer overlap under this app's own load.
+    sqlite_busy_timeout_ms: int = Field(default=5_000, ge=0)
 
     # Database connection pool (SQLAlchemy async engine, QueuePool).
     #: Persistent connections kept open per engine (i.e. per process/replica).

@@ -100,16 +100,31 @@ async def cleanup_evidence(
 
     ``delete_object`` is an async callable ``(object_key) -> None``. Returns the
     number of evidence rows removed.
+
+    Deliberately split into three phases -- list, then delete-from-object-
+    storage, then delete-rows -- rather than looping the network
+    ``delete_object`` call inside one open transaction. ``delete_object`` is a
+    real network call once wired to actual object storage (this job is a
+    no-op today only because simple mode passes a no-op ``delete_object``);
+    holding a SQLite write transaction open across N sequential network calls
+    would block every other writer in the process for as long as that loop
+    takes, exactly the anti-pattern fixed for the reviewmsg attachment path
+    (see ``compute_attachment_hashes``/``store_attachment_hash`` in
+    ``services/interactions``). Object-storage deletes here run with no
+    transaction open at all; each row's DB delete is its own short
+    transaction, so a mid-loop failure only leaves that one object
+    undeleted-but-already-removed-from-storage rather than rolling back
+    unrelated rows or holding a lock for the whole batch.
     """
     moment = now or datetime.now(UTC)
-    removed = 0
     async with scope() as session:
-        repo = EvidenceRepository(session)
-        expired = list(await repo.list_expired(moment))
-        for row in expired:
-            await delete_object(row.object_key)  # type: ignore[operator]
-            await repo.delete(row.id)
-            removed += 1
+        expired = list(await EvidenceRepository(session).list_expired(moment))
+
+    removed = 0
+    for row in expired:
+        await delete_object(row.object_key)  # type: ignore[operator]
+        async with scope() as session:
+            removed += await EvidenceRepository(session).delete(row.id)
     return removed
 
 

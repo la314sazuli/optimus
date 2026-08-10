@@ -396,12 +396,27 @@ class InteractionService:
     #: -shm/-wal files even for readers, and a busy Railway volume can stall
     #: that past the point a single attempt tolerates); it only keeps a rare,
     #: transient lock from surfacing as a failed Discord interaction.
+    #:
+    #: Production evidence (2026-08-10): three attempts each burned the full
+    #: 30s ``sqlite_busy_timeout_ms`` before raising, all with
+    #: ``checkedout: 0`` on this process's own pool -- proving the lock
+    #: holder is external to this connection pool (not a leaked/stuck
+    #: transaction in this process). A single busy_timeout window that long
+    #: gives very few *independent* chances for an external, presumably
+    #: transient holder to release the lock between attempts: 3 attempts at
+    #: 30s each is ~90s of wall time but only 3 windows. Spreading the same
+    #: order-of-magnitude wall-clock budget across more, shorter windows
+    #: (see ``sqlite_busy_timeout_ms``, lowered accordingly) gives more
+    #: opportunities to catch the lock released, and Discord tolerates up to
+    #: 15 minutes between deferring and editing the initial response, so
+    #: there is ample budget for this without risking "interaction expired".
     _LOCK_RETRY_BACKOFF: ClassVar[BackoffPolicy] = BackoffPolicy(
-        base=0.05, multiplier=2.0, max_delay=1.0, max_attempts=3
+        base=0.5, multiplier=2.0, max_delay=8.0, max_attempts=6
     )
 
     async def _run(self, call: Any) -> InteractionResponse:
         attempt = 0
+        retry_history: list[dict[str, int | str]] = []
 
         async def attempt_once() -> InteractionResponse:
             nonlocal attempt
@@ -419,11 +434,13 @@ class InteractionService:
             except OperationalError as exc:
                 if not _is_sqlite_lock_error(exc):
                     raise _NonRetryableDbError from exc
+                diagnostics = _pool_diagnostics(session)
+                retry_history.append({"attempt": attempt, **diagnostics})
                 _log.warning(
                     "interaction_db_locked_retry",
                     attempt=attempt,
                     max_attempts=self._LOCK_RETRY_BACKOFF.max_attempts,
-                    **_pool_diagnostics(session),
+                    **diagnostics,
                 )
                 raise
 
@@ -434,6 +451,16 @@ class InteractionService:
         except _NonRetryableDbError as exc:
             assert exc.__cause__ is not None
             raise exc.__cause__ from None
+        except OperationalError as exc:
+            # All retries exhausted on a genuine (external) lock. Stamp the
+            # full attempt history onto the exception so the caller's
+            # top-level `_log.exception("interaction_failed")` -- an
+            # error-severity log most log viewers surface by default,
+            # unlike the warning-level `interaction_db_locked_retry` lines
+            # above -- carries enough context to diagnose the incident
+            # without having to separately dig up the warning logs.
+            exc.add_note(f"lock_retry_history={retry_history!r}")
+            raise
 
 
 class _NonRetryableDbError(Exception):
