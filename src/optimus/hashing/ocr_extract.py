@@ -9,8 +9,6 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
-_log_domain = __name__
-
 # Official domains of major AI companies — used for lookalike detection.
 OFFICIAL_AI_DOMAINS: frozenset[str] = frozenset(
     {
