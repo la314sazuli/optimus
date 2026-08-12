@@ -9,7 +9,7 @@ def _ctx(command="scamhash", sub="explain", options=None, guild_id=100, user_id=
     return InteractionContext(
         command=command,
         subcommand=sub,
-        options=options or {"detection_id": 42},
+        options=options if options is not None else {"detection_id": 42},
         guild_id=guild_id,
         user_id=user_id,
         member_permissions=0x20,
@@ -67,7 +67,7 @@ async def test_undo_with_detection():
 
 
 async def test_undo_nothing():
-    ctx = _ctx(sub="undo")
+    ctx = _ctx(sub="undo", options={})
     deps = _deps()
     deps.last_detection.return_value = None
     resp = await handle_command(ctx, deps)

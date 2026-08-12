@@ -16,7 +16,7 @@ wiring that produces an :class:`InteractionContext` and renders an
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from optimus.core.logging import get_logger
@@ -45,6 +45,12 @@ from optimus.services.moderation.review import ParsedCustomId, ReviewAction
 
 _log = get_logger(__name__)
 
+# Discord embed colors (0xRRGGBB).
+COLOR_RED = 0xE74C3C  # errors, actions taken
+COLOR_YELLOW = 0xF1C40F  # warnings, intel found, preview
+COLOR_GREEN = 0x2ECC71  # success, undo, safe
+COLOR_GRAY = 0x95A5A6  # info, config, help, explain
+
 
 @dataclass(frozen=True, slots=True)
 class InteractionContext:
@@ -68,6 +74,9 @@ class InteractionResponse:
     params: dict[str, Any] = field(default_factory=dict)
     #: Optional opaque payload (e.g. an export file body) for the glue layer.
     attachment: str | None = None
+    #: Discord embed color (0xRRGGBB). When set, the response is rendered
+    #: as a colored embed instead of plain text.
+    color: int | None = None
 
 
 class InteractionDeps(Protocol):
@@ -83,6 +92,7 @@ class InteractionDeps(Protocol):
     async def opt_out_user(self, user_id: int) -> int: ...
     async def purge_guild(self, guild_id: int) -> int: ...
     async def recent_detection_for(self, guild_id: int, user_id: int) -> int | None: ...
+    async def recent_detections(self, guild_id: int, limit: int = 10) -> list[dict[str, Any]]: ...
     async def detection_detail(self, guild_id: int, detection_id: int) -> dict[str, Any] | None: ...
     async def last_detection(self, guild_id: int) -> dict[str, Any] | None: ...
     async def detection_belongs_to(
@@ -161,13 +171,60 @@ def _require(ctx: InteractionContext, permission: Permission | None) -> None:
         raise InteractionRejected(CommandError.NO_PERMISSION)
 
 
+#: Maps an i18n key to the embed color its rendered response should carry.
+#: Applied in :func:`handle_command` only when a handler did not set one
+#: explicitly; rejection paths are colored separately in the glue layer.
+_RESPONSE_COLORS: dict[str, int] = {
+    "command.hash_added": COLOR_GREEN,
+    "command.hash_removed": COLOR_GREEN,
+    "command.export_ok": COLOR_GREEN,
+    "command.undo_done": COLOR_GREEN,
+    "command.reviewmsg_result": COLOR_GREEN,
+    "command.submit_global_ok": COLOR_GREEN,
+    "command.forget_me_ok": COLOR_GREEN,
+    "command.appeal_opened": COLOR_GREEN,
+    "command.delete_server_ok": COLOR_GREEN,
+    "command.scanmsg_clean": COLOR_GREEN,
+    "command.reviewmsg_result_with_intel": COLOR_YELLOW,
+    "command.reviewmsg_no_images": COLOR_YELLOW,
+    "command.undo_nothing": COLOR_YELLOW,
+    "command.import_ok": COLOR_YELLOW,
+    "command.scanmsg_result": COLOR_YELLOW,
+    "command.scanmsg_no_images": COLOR_YELLOW,
+    "command.recent_empty": COLOR_YELLOW,
+    "command.hash_not_found": COLOR_RED,
+    "command.reviewmsg_all_failed": COLOR_RED,
+    "command.reviewmsg_not_found": COLOR_RED,
+    "command.reviewmsg_fetch_failed": COLOR_RED,
+    "command.explain_not_found": COLOR_RED,
+    "command.no_permission": COLOR_RED,
+    "command.guild_only": COLOR_RED,
+    "command.rate_limited": COLOR_RED,
+    "command.hash_list_empty": COLOR_GRAY,
+    "command.hash_list_header": COLOR_GRAY,
+    "command.explain_result": COLOR_GRAY,
+    "command.stats_header": COLOR_GRAY,
+    "command.stats_empty": COLOR_GRAY,
+    "command.config_view_header": COLOR_GRAY,
+    "command.config_set_ok": COLOR_GRAY,
+    "command.delete_server_confirm": COLOR_GRAY,
+    "command.help_text": COLOR_GRAY,
+    "command.recent_result": COLOR_GRAY,
+}
+
+
 async def handle_command(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
     """Dispatch a slash command to its handler after the auth gate."""
     _require(ctx, required_permission(ctx.command))
     handler = _COMMAND_HANDLERS.get(ctx.command)
     if handler is None:  # pragma: no cover - registration guarantees coverage
         raise InteractionRejected(CommandError.UNKNOWN_FIELD)
-    return await handler(ctx, deps)
+    response = await handler(ctx, deps)
+    if response.color is None:
+        color = _RESPONSE_COLORS.get(response.i18n_key)
+        if color is not None:
+            response = replace(response, color=color)
+    return response
 
 
 async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
@@ -207,6 +264,22 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         return InteractionResponse("command.export_ok", {"count": len(rows)}, attachment=body)
     if sub == "reviewmsg":
         return await _review_message(ctx, deps)
+    if sub == "scanmsg":
+        return await _scan_message(ctx, deps)
+    if sub == "recent":
+        events = await deps.recent_detections(ctx.guild_id)
+        if not events:
+            return InteractionResponse("command.recent_empty")
+        lines = [
+            f"#{r['detection_id']} \u2014 <@{r['uploader_id']}> \u2014 {r['verdict']} "
+            f"\u2014 {r['action_taken']} \u2014 <t:{r['created_ts']}:R>"
+            for r in events
+        ]
+        return InteractionResponse(
+            "command.recent_result", {"count": len(events), "entries": "\n".join(lines)}
+        )
+    if sub == "help":
+        return InteractionResponse("command.help_text")
     if sub == "explain":
         detection_id = int(ctx.options["detection_id"])
         detail = await deps.detection_detail(ctx.guild_id, detection_id)
@@ -214,7 +287,11 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
             return InteractionResponse("command.explain_not_found", {"detection_id": detection_id})
         return InteractionResponse("command.explain_result", detail)
     if sub == "undo":
-        detail = await deps.last_detection(ctx.guild_id)
+        undo_id = ctx.options.get("detection_id")
+        if undo_id is not None:
+            detail = await deps.detection_detail(ctx.guild_id, int(undo_id))
+        else:
+            detail = await deps.last_detection(ctx.guild_id)
         if detail is None:
             return InteractionResponse("command.undo_nothing")
         await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"])
@@ -272,12 +349,12 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     assert ctx.guild_id is not None  # guaranteed by _require (MANAGE_GUILD => guild-only)
     if not await deps.hash_rate_ok(ctx.user_id):
         raise InteractionRejected(CommandError.RATE_LIMITED)
+    resolved = _resolve_message(ctx, no_images_key="command.reviewmsg_no_images")
+    if isinstance(resolved, InteractionResponse):
+        return resolved
+    author_id, attachments = resolved
     channel_id = int(ctx.options["channel_id"])
     message_id = int(ctx.options["message_id"])
-    author_id = int(ctx.options["author_id"])
-    attachments: list[tuple[int, str]] = list(ctx.options["attachments"])
-    if not attachments:
-        return InteractionResponse("command.reviewmsg_no_images")
 
     # Pass 1: fetch + decode + hash every attachment. Pure computation plus
     # network I/O -- deliberately kept outside any DB write below so the
@@ -345,6 +422,71 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         "command.reviewmsg_result",
         {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
     )
+
+
+def _resolve_message(
+    ctx: InteractionContext, *, no_images_key: str
+) -> InteractionResponse | tuple[int, list[tuple[int, str]]]:
+    """Extract the glue-resolved message target from ``ctx.options``.
+
+    The glue layer resolves the typed message link/ID (for both
+    ``/scamhash reviewmsg`` and ``scanmsg``) into ``author_id`` and
+    ``attachments`` -- a list of ``(attachment_id, url)`` image pairs -- before
+    dispatch. Returns an error response (``no_images_key``) when the message
+    has no images, otherwise the ``(author_id, attachments)`` tuple shared by
+    review and scan.
+    """
+    author_id = int(ctx.options["author_id"])
+    attachments: list[tuple[int, str]] = list(ctx.options["attachments"])
+    if not attachments:
+        return InteractionResponse(no_images_key)
+    return author_id, attachments
+
+
+async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
+    """Preview mode: analyze a message's images without storing or acting.
+
+    Mirrors the fetch+decode+hash pass of :func:`_review_message` but performs
+    no DB writes, no audit, and no moderation action -- it only reports what
+    *would* be found (computed hashes, QR URLs, lookalike domains).
+    """
+    assert ctx.guild_id is not None  # guaranteed by _require (MANAGE_GUILD => guild-only)
+    resolved = _resolve_message(ctx, no_images_key="command.scanmsg_no_images")
+    if isinstance(resolved, InteractionResponse):
+        return resolved
+    attachments = resolved[1]
+
+    computed: list[AttachmentHashes] = []
+    failed = 0
+    for attachment_id, url in attachments:
+        try:
+            hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
+        except AttachmentHashError:
+            failed += 1
+            continue
+        computed.append(hashes)
+    if not computed:
+        return InteractionResponse("command.scanmsg_all_failed", {"failed": failed})
+
+    qr_urls: list[str] = []
+    lookalikes: list[dict[str, str]] = []
+    for hashes in computed:
+        qr_urls.extend(hashes.qr_urls)
+        lookalikes.extend(hashes.ocr_lookalikes)
+
+    parts = [f"Analyzed {len(computed)} image(s) ({failed} failed)."]
+    if qr_urls:
+        parts.append("\n**QR code(s) found:**\n" + "\n".join(qr_urls))
+    if lookalikes:
+        parts.append(
+            "\n**Lookalike domains:**\n"
+            + "\n".join(
+                f"`{lk['domain']}` impersonates `{lk['impersonating']}`" for lk in lookalikes
+            )
+        )
+    if not qr_urls and not lookalikes:
+        parts.append("No QR codes or lookalike domains detected.")
+    return InteractionResponse("command.scanmsg_result", {"summary": " ".join(parts)})
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
