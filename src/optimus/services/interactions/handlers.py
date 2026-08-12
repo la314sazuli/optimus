@@ -171,6 +171,14 @@ def _require(ctx: InteractionContext, permission: Permission | None) -> None:
         raise InteractionRejected(CommandError.NO_PERMISSION)
 
 
+_RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _worst_risk(current: str, candidate: str) -> str:
+    """Return the higher of two risk levels."""
+    return candidate if _RISK_ORDER.get(candidate, 0) > _RISK_ORDER.get(current, 0) else current
+
+
 #: Maps an i18n key to the embed color its rendered response should carry.
 #: Applied in :func:`handle_command` only when a handler did not set one
 #: explicitly; rejection paths are colored separately in the glue layer.
@@ -365,6 +373,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     qr_urls: list[str] = []
     lookalikes: list[dict[str, str]] = []
     signals: list[str] = []
+    risk_level = "none"
     for attachment_id, url in attachments:
         try:
             hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
@@ -381,6 +390,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         qr_urls.extend(hashes.qr_urls)
         lookalikes.extend(hashes.ocr_lookalikes)
         signals.extend(hashes.ocr_signals)
+        risk_level = _worst_risk(risk_level, hashes.ocr_risk_level)
 
     # Pass 2: store + audit + submit. DB-only, no network/decode work, so
     # each iteration is fast and the write lock is held for close to the
@@ -412,7 +422,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                 )
             )
         if signals:
-            parts.append("\n**Phishing signals:**\n" + ", ".join(signals))
+            parts.append(f"\n**Phishing signals ({risk_level} risk):**\n" + ", ".join(signals))
         return InteractionResponse(
             "command.reviewmsg_result_with_intel",
             {
@@ -475,10 +485,12 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
     qr_urls: list[str] = []
     lookalikes: list[dict[str, str]] = []
     signals: list[str] = []
+    risk_level = "none"
     for hashes in computed:
         qr_urls.extend(hashes.qr_urls)
         lookalikes.extend(hashes.ocr_lookalikes)
         signals.extend(hashes.ocr_signals)
+        risk_level = _worst_risk(risk_level, hashes.ocr_risk_level)
 
     parts = [f"Analyzed {len(computed)} image(s) ({failed} failed)."]
     if qr_urls:
@@ -491,7 +503,7 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
             )
         )
     if signals:
-        parts.append("\n**Phishing signals:**\n" + ", ".join(signals))
+        parts.append(f"\n**Phishing signals ({risk_level} risk):**\n" + ", ".join(signals))
     if not qr_urls and not lookalikes and not signals:
         parts.append("No threats detected.")
     return InteractionResponse("command.scanmsg_result", {"summary": " ".join(parts)})
