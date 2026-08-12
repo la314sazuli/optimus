@@ -8,7 +8,12 @@ import pytest
 
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.services.interactions.attachment_hash import (
+    AttachmentHashError,
+    AttachmentHashes,
+)
 from optimus.services.interactions.handlers import (
+    _CONFIG_VIEW_ORDER,
     InteractionContext,
     handle_command,
     handle_component,
@@ -47,6 +52,9 @@ class FakeDeps:
         self._next_appeal_id = 1
         self._global_service = _FakeGlobalService(flags.get("submit_error"))
         self.global_submitted: list[str] = []
+        #: attachment_id -> exception to raise, or a hash_id string to return.
+        self._attachment_outcomes: dict[int, Any] = flags.get("attachment_outcomes", {})
+        self.confirmed_scams: list[dict[str, Any]] = []
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         self.hashes[gh.hash_id] = gh
@@ -118,6 +126,67 @@ class FakeDeps:
 
     def global_service(self) -> GlobalHashService:
         return self._global_service  # type: ignore[return-value]
+
+    async def compute_attachment_hashes(self, *, attachment_id: int, url: str) -> AttachmentHashes:
+        outcome = self._attachment_outcomes.get(attachment_id, f"{attachment_id:016x}")
+        if isinstance(outcome, Exception):
+            raise outcome
+        # phash is the only field _review_message's downstream store call
+        # derives an id from (`f"{hashes.phash:016x}"`); stash the intended
+        # hash_id string in phash's hex digits so store_attachment_hash below
+        # reproduces it exactly, matching the pre-split fake's behavior.
+        return AttachmentHashes(
+            attachment_id=attachment_id,
+            url=url,
+            phash=int(outcome, 16),
+            dhash=attachment_id,
+            whash=attachment_id,
+            ahash=0,
+            mphash=0,
+            mdhash=0,
+            mwhash=0,
+            mahash=0,
+        )
+
+    async def store_attachment_hash(
+        self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+    ) -> GuildHash:
+        hash_id = f"{hashes.phash:016x}"
+        existing = self.hashes.get(hash_id)
+        if existing is not None:
+            return existing
+        gh = GuildHash(
+            hash_id=hash_id,
+            phash=hashes.phash,
+            dhash=hashes.dhash,
+            whash=hashes.whash,
+            ahash=hashes.ahash,
+            source="reviewmsg",
+            added_by=added_by,
+        )
+        self.hashes[hash_id] = gh
+        return gh
+
+    async def submit_confirmed_scam(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        message_id: int,
+        attachment_id: int,
+        uploader_id: int,
+        matched_hash_id: str,
+    ) -> None:
+        self.confirmed_scams.append(
+            {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "uploader_id": uploader_id,
+                "matched_hash_id": matched_hash_id,
+            }
+        )
 
 
 class _FakeGlobalService:
@@ -225,6 +294,34 @@ async def test_config_set_persists_and_audits() -> None:
     assert resp.i18n_key == "command.config_set_ok"
     assert deps.config_set == [("retention_days", 14)]
     assert deps.audits[0][2] == "config.set"
+
+
+@pytest.mark.asyncio
+async def test_config_set_review_channel_renders_as_mention() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _ctx(
+            "config",
+            subcommand="set",
+            field="review_channel",
+            value="<#1402357722430570498>",
+        ),
+        deps,
+    )
+    assert resp.i18n_key == "command.config_set_ok"
+    assert deps.config_set == [("review_channel", 1402357722430570498)]
+    assert resp.params["value"] == "<#1402357722430570498>"
+
+
+@pytest.mark.asyncio
+async def test_config_set_review_channel_clear_renders_as_none() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _ctx("config", subcommand="set", field="review_channel", value="none"), deps
+    )
+    assert resp.i18n_key == "command.config_set_ok"
+    assert deps.config_set == [("review_channel", None)]
+    assert resp.params["value"] == "none"
 
 
 # --- review button auth --------------------------------------------------------
@@ -443,6 +540,102 @@ async def test_scamhash_export_roundtrips() -> None:
 async def test_config_view() -> None:
     resp = await handle_command(_ctx("config", subcommand="view"), FakeDeps())
     assert resp.i18n_key == "command.config_view_header"
+    # FakeDeps.get_config's default {"locale": "en"} still renders a summary line.
+    assert "**locale**: `en`" in resp.params["summary"]
+
+
+@pytest.mark.asyncio
+async def test_config_view_renders_review_channel_as_mention() -> None:
+    deps = FakeDeps()
+    deps.get_config = _fake_get_config_with_channel  # type: ignore[method-assign]
+    resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "<#1402357722430570498>" in resp.params["summary"]
+
+
+async def _fake_get_config_with_channel(guild_id: int) -> dict[str, Any]:
+    return {"locale": "en", "review_channel": 1402357722430570498}
+
+
+@pytest.mark.asyncio
+async def test_config_view_no_row_shows_defaults_message() -> None:
+    deps = FakeDeps()
+    deps.get_config = _fake_get_config_empty  # type: ignore[method-assign]
+    resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "defaults are in effect" in resp.params["summary"]
+
+
+async def _fake_get_config_empty(guild_id: int) -> dict[str, Any]:
+    return {}
+
+
+@pytest.mark.parametrize("field", _CONFIG_VIEW_ORDER)
+def test_every_config_view_field_is_settable_under_the_same_name(field: str) -> None:
+    """Every field /config view can display must be settable via /config set
+    under that exact same name -- guards against the DB-column-name leak this
+    regressed as for "review_channel" (view said "review_channel_id").
+
+    Uses each field's already-valid value from FakeDeps' default config shape
+    so this only checks *name* recognition, not value validation (that's
+    covered by test_validate_config_set_valid/_invalid_value already).
+    """
+    from optimus.services.interactions.logic import validate_config_set
+
+    sample_values = {
+        "sensitivity": "balanced",
+        "action_policy": "report_only",
+        "mod_queue_threshold": "0.5",
+        "review_channel": "none",
+        "safe_mode": "false",
+        "retention_days": "30",
+        "locale": "en",
+        "optin_global_db": "false",
+        "optin_scan_bots": "false",
+        "optin_evidence_storage": "false",
+    }
+    assert field in sample_values, f"add a sample value for new config field {field!r}"
+    # Must not raise InteractionRejected(UNKNOWN_FIELD) -- i.e. the name itself
+    # is recognized. A ValueError here would mean the sample value is wrong,
+    # which is a test bug, not a production one.
+    validate_config_set(field, sample_values[field])
+
+
+@pytest.mark.asyncio
+async def test_config_set_field_name_matches_config_view_field_name() -> None:
+    """Regression test: /config set field:<X> and /config view must agree on
+    the name <X> for every field, so a name copied from one always works
+    verbatim in the other. This previously drifted for the review channel:
+    /config set accepted "review_channel" but /config view rendered it back
+    as "review_channel_id" (the raw DB column name), so a user reading
+    /config view's output and pasting it into /config set got an "Unknown
+    configuration field" rejection.
+    """
+    store: dict[str, Any] = {"locale": "en"}
+    deps = FakeDeps()
+
+    async def fake_get_config(guild_id: int) -> dict[str, Any]:
+        return dict(store)
+
+    async def fake_set_config_field(guild_id: int, field: str, value: Any) -> None:
+        store[field] = value
+        deps.config_set.append((field, value))
+
+    deps.get_config = fake_get_config  # type: ignore[method-assign]
+    deps.set_config_field = fake_set_config_field  # type: ignore[method-assign]
+
+    set_resp = await handle_command(
+        _ctx(
+            "config",
+            subcommand="set",
+            field="review_channel",
+            value="<#1402357722430570498>",
+        ),
+        deps,
+    )
+    assert set_resp.i18n_key == "command.config_set_ok"
+
+    view_resp = await handle_command(_ctx("config", subcommand="view"), deps)
+    assert "**review_channel**: `<#1402357722430570498>`" in view_resp.params["summary"]
+    assert "review_channel_id" not in view_resp.params["summary"]
 
 
 @pytest.mark.asyncio
@@ -515,3 +708,197 @@ async def test_review_button_actions_audit(action: ReviewAction, key: str) -> No
     resp = await handle_review_button(_ctx("", perms=MANAGE), parsed, deps)
     assert resp.i18n_key == key
     assert deps.audits[0][1] == 99
+
+
+# --- /scamhash reviewmsg and the "Review as scam" context-menu entry ----------
+
+
+def _review_ctx(
+    *,
+    command: str = "scamhash",
+    subcommand: str | None = "reviewmsg",
+    attachments: list[tuple[int, str]] | None = None,
+    channel_id: int = 111,
+    message_id: int = 222,
+    author_id: int = 333,
+    perms: int = MANAGE,
+) -> InteractionContext:
+    return InteractionContext(
+        guild_id=1,
+        user_id=99,
+        member_permissions=perms,
+        command=command,
+        subcommand=subcommand,
+        options={
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "author_id": author_id,
+            "attachments": attachments if attachments is not None else [(1, "https://x/1.png")],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_denied_without_manage_guild() -> None:
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(_review_ctx(perms=NONE), FakeDeps())
+    assert exc.value.reason is CommandError.NO_PERMISSION
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_rate_limited_rejected() -> None:
+    deps = FakeDeps(hash_rate_ok=False)
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(_review_ctx(), deps)
+    assert exc.value.reason is CommandError.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_no_images_short_circuits() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(_review_ctx(attachments=[]), deps)
+    assert resp.i18n_key == "command.reviewmsg_no_images"
+    assert deps.confirmed_scams == []
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_single_attachment_hashes_and_actions_author() -> None:
+    deps = FakeDeps()
+    resp = await handle_command(
+        _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
+    )
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params == {"added": 1, "failed": 0, "author_id": 333}
+    assert len(deps.confirmed_scams) == 1
+    assert deps.confirmed_scams[0]["uploader_id"] == 333
+    assert deps.confirmed_scams[0]["attachment_id"] == 1
+    assert len(deps.audits) == 1
+    assert deps.audits[0][2] == "scamhash.reviewmsg"
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_multiple_attachments_all_succeed() -> None:
+    deps = FakeDeps()
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 3
+    assert resp.params["failed"] == 0
+    assert len(deps.confirmed_scams) == 3
+    assert len(deps.hashes) == 3
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_some_attachments_fail_are_skipped() -> None:
+    deps = FakeDeps(attachment_outcomes={2: AttachmentHashError("bad image")})
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 2
+    assert resp.params["failed"] == 1
+    # The failed attachment never reaches the moderation pipeline.
+    assert {c["attachment_id"] for c in deps.confirmed_scams} == {1, 3}
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_all_attachments_fail() -> None:
+    deps = FakeDeps(
+        attachment_outcomes={
+            1: AttachmentHashError("bad"),
+            2: AttachmentHashError("bad"),
+        }
+    )
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.i18n_key == "command.reviewmsg_all_failed"
+    assert resp.params == {"failed": 2}
+    assert deps.confirmed_scams == []
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_duplicate_hash_is_idempotent() -> None:
+    """Re-reviewing a message (or an image already hashed by another path)
+    must not raise -- ``store_attachment_hash`` returns the existing row."""
+    deps = FakeDeps()
+    existing = GuildHash(hash_id=f"{1:016x}", phash=1, dhash=1, whash=1, ahash=0, source="local")
+    deps.hashes[existing.hash_id] = existing
+    resp = await handle_command(_review_ctx(attachments=[(1, "https://x/1.png")]), deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.params["added"] == 1
+    assert len(deps.confirmed_scams) == 1
+    assert deps.confirmed_scams[0]["matched_hash_id"] == existing.hash_id
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_computes_all_hashes_before_storing_any() -> None:
+    """All ``compute_attachment_hashes`` calls (network fetch + decode -- no DB)
+    must happen before any ``store_attachment_hash``/``audit``/
+    ``submit_confirmed_scam`` call (DB writes).
+
+    This is the actual behavioral guarantee behind splitting
+    ``hash_and_store_attachment`` into a compute phase and a store phase: a
+    multi-image review must never interleave a slow network+decode call for
+    one attachment with a DB write for another, because the whole handler
+    runs inside one caller-managed transaction (see
+    :meth:`InteractionService._run`) and a SQLite write transaction holds an
+    exclusive file-level lock for as long as it stays open. Interleaving used
+    to hold that lock open for the sum of every attachment's fetch+decode
+    time plus every write, which could starve a concurrent writer into a
+    "database is locked" error well past any reasonable retry budget.
+    """
+    calls: list[str] = []
+
+    class OrderTrackingDeps(FakeDeps):
+        async def compute_attachment_hashes(
+            self, *, attachment_id: int, url: str
+        ) -> AttachmentHashes:
+            calls.append(f"compute:{attachment_id}")
+            return await super().compute_attachment_hashes(attachment_id=attachment_id, url=url)
+
+        async def store_attachment_hash(
+            self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+        ) -> GuildHash:
+            calls.append(f"store:{hashes.attachment_id}")
+            return await super().store_attachment_hash(guild_id, hashes=hashes, added_by=added_by)
+
+        async def audit(
+            self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
+        ) -> None:
+            calls.append("audit")
+            await super().audit(guild_id, actor_id, action, target=target)
+
+        async def submit_confirmed_scam(self, guild_id: int, **kwargs: Any) -> None:
+            calls.append(f"submit:{kwargs['attachment_id']}")
+            await super().submit_confirmed_scam(guild_id, **kwargs)
+
+    deps = OrderTrackingDeps()
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+
+    assert resp.params["added"] == 3
+    compute_calls = [c for c in calls if c.startswith("compute:")]
+    other_calls = [c for c in calls if not c.startswith("compute:")]
+    assert compute_calls == ["compute:1", "compute:2", "compute:3"]
+    assert calls.index(other_calls[0]) > calls.index(compute_calls[-1]), (
+        "a store/audit/submit call happened before all attachments were computed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_menu_review_message_routes_to_shared_core() -> None:
+    """The context-menu entry point (``review_message``) shares ``_review_message``
+    with the slash command -- both are gated by the same permission and both
+    read the glue-resolved options in the same shape."""
+    deps = FakeDeps()
+    ctx = _review_ctx(command="review_message", subcommand=None)
+    resp = await handle_command(ctx, deps)
+    assert resp.i18n_key == "command.reviewmsg_result"
+    assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
+async def test_context_menu_review_message_denied_without_manage_guild() -> None:
+    ctx = _review_ctx(command="review_message", subcommand=None, perms=NONE)
+    with pytest.raises(InteractionRejected) as exc:
+        await handle_command(ctx, FakeDeps())
+    assert exc.value.reason is CommandError.NO_PERMISSION

@@ -129,6 +129,22 @@ class DetectionService:
             idempotency_key=v.idempotency_key,
         )
 
+    async def submit_confirmed_match(self, verdict: VerdictEvent) -> None:
+        """Persist and publish a verdict that is already known to be a match.
+
+        For moderator-confirmed reviews of historical messages (e.g. a message
+        content command that hashes an attachment already known to be a scam
+        and adds it to the guild's hash list): the normal path -- decode,
+        hash, compare against the cached index -- is unnecessary and would
+        also miss a hash added in the same request, since :class:`IndexManager`
+        caches the guild's index until explicitly invalidated. This method
+        skips straight to persistence + publish with the caller-supplied
+        verdict, going through :meth:`_persist`'s same idempotent-insert
+        savepoint so a redelivered/duplicate submission is still a safe no-op.
+        """
+        await self._persist(DetectionResult(verdict=verdict))
+        await self._bus.publish(SUBJECT_VERDICT, verdict, msg_id=verdict.idempotency_key)
+
     async def _persist(self, result: DetectionResult) -> None:
         v = result.verdict
         async with self._scope(v.guild_id) as session:
