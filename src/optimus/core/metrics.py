@@ -19,12 +19,8 @@ DETECTION_LATENCY = Histogram(
     ["guild_id"],
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
 )
-DECODE_FAILURES = Counter(
-    "optimus_decode_failures_total", "Image decode failures.", ["reason"]
-)
-DB_LOCK_RETRIES = Counter(
-    "optimus_db_lock_retries_total", "DB lock retries.", ["service"]
-)
+DECODE_FAILURES = Counter("optimus_decode_failures_total", "Image decode failures.", ["reason"])
+DB_LOCK_RETRIES = Counter("optimus_db_lock_retries_total", "DB lock retries.", ["service"])
 DISCORD_API_ERRORS = Counter(
     "optimus_discord_api_errors_total", "Discord API errors.", ["error_type"]
 )
