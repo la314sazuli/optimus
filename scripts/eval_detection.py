@@ -126,8 +126,10 @@ def eval_image(path: Path) -> ImageResult:
 
 
 def print_report(results: list[ImageResult]) -> None:
-    print(f"{'Transform':<18} {'TP':>4} {'FN':>4} {'Rate':>6}  "
-          f"{'ahash':>6} {'dhash':>6} {'phash':>6} {'whash':>6}")
+    print(
+        f"{'Transform':<18} {'TP':>4} {'FN':>4} {'Rate':>6}  "
+        f"{'ahash':>6} {'dhash':>6} {'phash':>6} {'whash':>6}"
+    )
     print("-" * 68)
     for tname in TRANSFORMS:
         total = 0
@@ -144,26 +146,30 @@ def print_report(results: list[ImageResult]) -> None:
         fn = total - tp
         rate = tp / total * 100 if total else 0
         avgs = {a: sums[a] / total if total else 0 for a in THRESHOLDS}
-        print(f"{tname:<18} {tp:>4} {fn:>4} {rate:>5.1f}%  "
-              f"{avgs['ahash']:>6.1f} {avgs['dhash']:>6.1f} "
-              f"{avgs['phash']:>6.1f} {avgs['whash']:>6.1f}")
+        print(
+            f"{tname:<18} {tp:>4} {fn:>4} {rate:>5.1f}%  "
+            f"{avgs['ahash']:>6.1f} {avgs['dhash']:>6.1f} "
+            f"{avgs['phash']:>6.1f} {avgs['whash']:>6.1f}"
+        )
 
     total_variants = sum(len(r.variants) for r in results)
     total_tp = sum(1 for r in results for v in r.variants if v.matched)
     print("-" * 68)
-    print(f"{'TOTAL':<18} {total_tp:>4} {total_variants - total_tp:>4} "
-          f"{total_tp / total_variants * 100 if total_variants else 0:>5.1f}%")
+    print(
+        f"{'TOTAL':<18} {total_tp:>4} {total_variants - total_tp:>4} "
+        f"{total_tp / total_variants * 100 if total_variants else 0:>5.1f}%"
+    )
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--images-dir", type=Path, required=True,
-                    help="Directory of known scam images")
+    ap.add_argument("--images-dir", type=Path, required=True, help="Directory of known scam images")
     ap.add_argument("--json", action="store_true", help="Output as JSON")
     args = ap.parse_args()
 
     images = sorted(
-        p for p in args.images_dir.iterdir()
+        p
+        for p in args.images_dir.iterdir()
         if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif")
     )
     if not images:
