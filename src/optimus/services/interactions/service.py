@@ -28,6 +28,7 @@ from optimus.contracts.events import Verdict, VerdictEvent
 from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.config import Settings
 from optimus.core.logging import correlation_context, get_correlation_id, get_logger
+from optimus.core.metrics import record_db_lock_retry
 from optimus.core.ratelimit import RateLimit, RateLimiter
 from optimus.db.engine import SessionScope
 from optimus.db.models import Guild, GuildHash, GuildWhitelist
@@ -476,6 +477,7 @@ class InteractionService:
                     max_attempts=self._LOCK_RETRY_BACKOFF.max_attempts,
                     **diagnostics,
                 )
+                record_db_lock_retry("interactions")
                 raise
 
         try:
