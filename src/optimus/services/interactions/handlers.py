@@ -302,8 +302,12 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     if qr_urls:
         return InteractionResponse(
             "command.reviewmsg_result_with_qr",
-            {"added": len(added_hash_ids), "failed": failed,
-             "author_id": author_id, "qr_urls": qr_urls},
+            {
+                "added": len(added_hash_ids),
+                "failed": failed,
+                "author_id": author_id,
+                "qr_urls": qr_urls,
+            },
         )
     return InteractionResponse(
         "command.reviewmsg_result",
