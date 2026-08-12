@@ -47,6 +47,7 @@ class AttachmentHashes:
     qr_urls: list[str] = field(default_factory=list)
     ocr_lookalikes: list[dict[str, str]] = field(default_factory=list)
     ocr_signals: list[str] = field(default_factory=list)
+    ocr_risk_level: str = "none"
 
 
 #: Matches IngestWorker.FetchFn: an async URL -> FetchedImage fetch, already
@@ -100,4 +101,5 @@ async def hash_attachment(
         qr_urls=extract_qr_urls(fetched.data),
         ocr_lookalikes=analysis["lookalikes"],
         ocr_signals=analysis["signals"],
+        ocr_risk_level=analysis["risk_level"],
     )

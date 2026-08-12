@@ -34,39 +34,39 @@ def test_repair_urls_plain_text_unchanged():
 
 
 def test_phishing_signals_free_offer():
-    signals = find_phishing_signals("Claim your FREE Pro account now!")
+    signals, _, _ = find_phishing_signals("Claim your FREE Pro account now!")
     assert "free_offer" in signals
     assert "claim" in signals
 
 
 def test_phishing_signals_urgency():
-    signals = find_phishing_signals("Limited time! Expires in 1 hour. Act now!")
+    signals, _, _ = find_phishing_signals("Limited time! Expires in 1 hour. Act now!")
     assert "urgency" in signals
 
 
 def test_phishing_signals_credentials():
-    signals = find_phishing_signals("Please verify your account and login")
+    signals, _, _ = find_phishing_signals("Please verify your account and login")
     assert "credentials" in signals
 
 
 def test_phishing_signals_ai_community():
-    signals = find_phishing_signals("Get free Sora access and GPT-5 beta!")
+    signals, _, _ = find_phishing_signals("Get free Sora access and GPT-5 beta!")
     assert "ai_community" in signals
     assert "free_offer" in signals
 
 
 def test_phishing_signals_impersonation():
-    signals = find_phishing_signals("Official support team message")
+    signals, _, _ = find_phishing_signals("Official support team message")
     assert "impersonation" in signals
 
 
 def test_phishing_signals_clean_text():
-    signals = find_phishing_signals("Hello, how are you today?")
+    signals, _, _ = find_phishing_signals("Hello, how are you today?")
     assert signals == []
 
 
 def test_phishing_signals_multiple_categories():
-    signals = find_phishing_signals(
+    signals, _, _ = find_phishing_signals(
         "FREE airdrop! Limited time! Connect wallet to claim your reward. Official admin support."
     )
     assert "free_offer" in signals
@@ -76,7 +76,10 @@ def test_phishing_signals_multiple_categories():
 
 
 def test_phishing_signals_empty_text():
-    assert find_phishing_signals("") == []
+    signals, score, level = find_phishing_signals("")
+    assert signals == []
+    assert score == 0
+    assert level == "none"
 
 
 def test_preprocess_variants_returns_multiple():

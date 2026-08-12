@@ -35,25 +35,74 @@ OFFICIAL_AI_DOMAINS: frozenset[str] = frozenset(
     }
 )
 
-# Phishing signal patterns — keyword groups common in scam images.
-# Each tuple: (category, regex). Matched category is surfaced to moderators.
-_PHISHING_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("free_offer", re.compile(r"\b(free|airdrop|giveaway|reward|bonus)\b", re.I)),
-    ("claim", re.compile(r"\b(claim|redeem|collect|get\s+your)\b", re.I)),
-    ("urgency", re.compile(r"\b(limited|expires?|act\s+now|last\s+chance|hurry)\b", re.I)),
+# Phishing signal engine — weighted rules with risk scoring.
+# Each rule: (category, weight, regex). Higher weight = stronger signal.
+# Weight reflects how indicative the signal is of a scam.
+_SIGNAL_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
+    # Weak signals (1 pt) — common in marketing, low alone
+    ("free_offer", 1, re.compile(r"\b(free|airdrop|giveaway|reward|bonus|gift)\b", re.I)),
     (
-        "credentials",
-        re.compile(
-            r"\b(login|sign\s+in|password|api\s+key|connect\s+wallet|verify\s+account)\b", re.I
-        ),
+        "urgency",
+        1,
+        re.compile(r"\b(limited|expires?|act\s+now|last\s+chance|hurry|deadline)\b", re.I),
     ),
+    (
+        "impersonation",
+        1,
+        re.compile(r"\b(official|support|admin|staff|team|moderator|helper)\b", re.I),
+    ),
+    # Medium signals (2 pts) — intent to collect/claim
+    ("claim", 2, re.compile(r"\b(claim|redeem|collect|get\s+your|receive\s+your)\b", re.I)),
     (
         "ai_community",
+        2,
         re.compile(
-            r"\b(sora|gpt-?5|claude\s+beta|free\s+pro|perplexity\s+pro|midjourney\s+free)\b", re.I
+            r"\b(sora|gpt-?5|claude\s+beta|free\s+pro|perplexity\s+pro|midjourney\s+free|openai\s+credit)\b",
+            re.I,
         ),
     ),
-    ("impersonation", re.compile(r"\b(official|support|admin|staff|team|moderator)\b", re.I)),
+    # Strong signals (3 pts) — credential/wallet exfiltration
+    (
+        "credentials",
+        3,
+        re.compile(
+            r"\b(login|sign\s+in|password|api\s+key|connect\s+wallet|verify\s+account|authorize\s+app|oauth)\b",
+            re.I,
+        ),
+    ),
+    (
+        "wallet",
+        3,
+        re.compile(
+            r"\b(seed\s+phrase|private\s+key|recovery\s+phrase|wallet\s+address|send\s+to\s+this\s+address)\b",
+            re.I,
+        ),
+    ),
+    # Critical signals (4 pts) — direct crypto exfiltration
+    ("crypto_address", 4, re.compile(r"\b0x[a-fA-F0-9]{40}\b")),
+)
+
+# Multi-word scam phrases — strong co-occurrence patterns.
+# Each: (category, weight, regex). Matched in addition to keyword rules.
+_PHRASE_RULES: tuple[tuple[str, int, re.Pattern[str]], ...] = (
+    ("scam_phrase", 3, re.compile(r"claim\s+your\s+free", re.I)),
+    ("scam_phrase", 3, re.compile(r"you\s+have\s+been\s+selected", re.I)),
+    ("scam_phrase", 3, re.compile(r"click\s+here\s+to\s+(verify|claim|connect)", re.I)),
+    ("scam_phrase", 3, re.compile(r"limited\s+time\s+offer", re.I)),
+    ("scam_phrase", 3, re.compile(r"exclusive\s+(beta|early)\s+access", re.I)),
+    ("scam_phrase", 3, re.compile(r"scan\s+(the\s+)?qr\s+to\s+claim", re.I)),
+    ("scam_phrase", 3, re.compile(r"official\s+support\s+team", re.I)),
+    ("scam_phrase", 3, re.compile(r"free\s+(nitro|boosts?)", re.I)),
+    ("scam_phrase", 3, re.compile(r"steam\s+giveaway", re.I)),
+    ("scam_phrase", 3, re.compile(r"connect\s+your\s+wallet", re.I)),
+)
+
+# Risk level thresholds based on total score.
+_RISK_THRESHOLDS: tuple[tuple[int, str], ...] = (
+    (7, "critical"),
+    (4, "high"),
+    (2, "medium"),
+    (1, "low"),
 )
 
 _URL_RE = re.compile(
@@ -188,15 +237,51 @@ def _repair_urls(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def find_phishing_signals(text: str) -> list[str]:
-    """Scan OCR text for common scam keyword patterns. Returns matched categories."""
+def find_phishing_signals(
+    text: str, *, urls: list[str] | None = None, lookalikes: list[dict[str, str]] | None = None
+) -> tuple[list[str], int, str]:
+    """Scan text for scam patterns. Returns (matched_categories, score, risk_level).
+
+    Risk scoring:
+    - 1 pt per weak signal (free_offer, urgency, impersonation)
+    - 2 pts per medium signal (claim, ai_community)
+    - 3 pts per strong signal (credentials, wallet, scam_phrase)
+    - 4 pts for crypto addresses
+    - +3 if signals co-occur with a URL (scam text + link = high risk)
+    - +3 if signals co-occur with a lookalike domain
+    """
+    if not text:
+        return [], 0, "none"
+
     matched: list[str] = []
     seen: set[str] = set()
-    for category, pattern in _PHISHING_SIGNALS:
+    score = 0
+
+    for category, weight, pattern in _SIGNAL_RULES:
         if pattern.search(text) and category not in seen:
             seen.add(category)
             matched.append(category)
-    return matched
+            score += weight
+
+    for category, weight, pattern in _PHRASE_RULES:
+        if pattern.search(text) and category not in seen:
+            seen.add(category)
+            matched.append(category)
+            score += weight
+
+    # URL-signal correlation: scam text + URL = much higher risk.
+    if matched and urls:
+        score += 3
+    if matched and lookalikes:
+        score += 3
+
+    risk_level = "none"
+    for threshold, level in _RISK_THRESHOLDS:
+        if score >= threshold:
+            risk_level = level
+            break
+
+    return matched, score, risk_level
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +361,7 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
 
     Returns:
         {"text": str, "urls": list[str], "lookalikes": list[dict[str, str]],
-         "signals": list[str]}
+         "signals": list[str], "risk_score": int, "risk_level": str}
     """
     text = extract_text(image_bytes)
     repaired = _repair_urls(text)
@@ -289,10 +374,12 @@ def analyze_image(image_bytes: bytes) -> dict[str, Any]:
         target = is_lookalike(domain)
         if target:
             lookalikes.append({"domain": domain, "impersonating": target, "url": url})
-    signals = find_phishing_signals(text)
+    signals, score, risk_level = find_phishing_signals(text, urls=urls, lookalikes=lookalikes)
     return {
         "text": text,
         "urls": urls,
         "lookalikes": lookalikes,
         "signals": signals,
+        "risk_score": score,
+        "risk_level": risk_level,
     }
