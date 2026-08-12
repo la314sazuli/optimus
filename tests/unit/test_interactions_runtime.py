@@ -27,11 +27,13 @@ async def test_interaction_is_deferred_before_dispatch_then_edited(
         side_effect=lambda *args, **kwargs: events.append("edit")
     )
 
-    async def run_interaction(service: object, received_interaction: object) -> str:
+    async def run_interaction(
+        service: object, received_interaction: object
+    ) -> tuple[str, int | None]:
         assert events == ["defer"]
         assert received_interaction is interaction
         events.append("dispatch")
-        return RESPONSE_MESSAGE
+        return RESPONSE_MESSAGE, None
 
     monkeypatch.setattr(interaction_service, "run_interaction", run_interaction)
 

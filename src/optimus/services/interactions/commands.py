@@ -109,7 +109,11 @@ COMMANDS: tuple[Command, ...] = (
                     ),
                 ),
             ),
-            SubCommand(name="undo", description="Undo the last moderation action in this server."),
+            SubCommand(
+                name="undo",
+                description="Undo a moderation action. Without args, undoes the last one.",
+                options=(Option("detection_id", "Specific detection to undo.", OPT_INTEGER),),
+            ),
             SubCommand(
                 name="reviewmsg",
                 description=(
@@ -124,6 +128,21 @@ COMMANDS: tuple[Command, ...] = (
                         required=True,
                     ),
                 ),
+            ),
+            SubCommand(
+                name="scanmsg",
+                description="Preview: analyze a message's images without storing or acting.",
+                options=(
+                    Option("message", "A message link or ID to scan.", OPT_STRING, required=True),
+                ),
+            ),
+            SubCommand(
+                name="recent",
+                description="Show recent moderation events in this server.",
+            ),
+            SubCommand(
+                name="help",
+                description="Show a quick reference for moderators.",
             ),
         ),
     ),

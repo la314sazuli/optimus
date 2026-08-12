@@ -54,6 +54,7 @@ from optimus.services.interactions.attachment_hash import (
     hash_attachment,
 )
 from optimus.services.interactions.handlers import (
+    COLOR_RED,
     InteractionContext,
     InteractionResponse,
     handle_command,
@@ -225,6 +226,19 @@ class DbDeps:
             if detection.uploader_id == user_id:
                 return detection.id
         return None
+
+    async def recent_detections(self, guild_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        recent = await DetectionRepository(self._session, guild_id).list_recent(limit=limit)
+        return [
+            {
+                "detection_id": d.id,
+                "uploader_id": d.uploader_id,
+                "verdict": d.verdict,
+                "action_taken": d.action_taken or "none",
+                "created_ts": int(d.created_at.timestamp()) if d.created_at else 0,
+            }
+            for d in recent
+        ]
 
     async def detection_belongs_to(self, guild_id: int, detection_id: int, user_id: int) -> bool:
         return await DetectionRepository(self._session, guild_id).belongs_to(detection_id, user_id)
@@ -617,10 +631,10 @@ def _context_menu_context(interaction: Any) -> InteractionContext:
     )
 
 
-async def _resolve_reviewmsg_options(
+async def _resolve_message_options(
     ctx: InteractionContext, interaction: Any, *, rest: Any
 ) -> InteractionContext:
-    """Resolve ``/scamhash reviewmsg message:<link-or-id>`` via REST.
+    """Resolve ``/scamhash reviewmsg|scanmsg message:<link-or-id>`` via REST.
 
     Unlike the context-menu entry point, a slash command only carries the
     moderator-typed string -- the target message must be fetched explicitly.
@@ -705,8 +719,8 @@ def to_context(interaction: Any) -> InteractionContext:
 
 async def run_interaction(  # pragma: no cover - hikari glue
     service: InteractionService, interaction: Any
-) -> str:
-    """Handle one interaction end-to-end and return the ephemeral message."""
+) -> tuple[str, int | None]:
+    """Handle one interaction end-to-end and return (content, embed_color)."""
     import hikari
 
     with correlation_context():
@@ -714,8 +728,8 @@ async def run_interaction(  # pragma: no cover - hikari glue
             if isinstance(interaction, hikari.CommandInteraction):
                 ctx = to_context(interaction)
                 locale = ctx.locale
-                if ctx.command == "scamhash" and ctx.subcommand == "reviewmsg":
-                    ctx = await _resolve_reviewmsg_options(
+                if ctx.command == "scamhash" and ctx.subcommand in ("reviewmsg", "scanmsg"):
+                    ctx = await _resolve_message_options(
                         ctx, interaction, rest=interaction.app.rest
                     )
                 response = await service.dispatch_command(ctx)
@@ -724,13 +738,13 @@ async def run_interaction(  # pragma: no cover - hikari glue
                 locale = ctx.locale
                 response = await service.dispatch_button(ctx, interaction.custom_id)
             else:
-                return ""
+                return "", None
         except InteractionRejected as rejected:
-            return error_message(rejected.reason, locale)
+            return error_message(rejected.reason, locale), COLOR_RED
         except Exception:
             _log.exception("interaction_failed")
-            return translate("button.expired", locale)
-        return render(response, locale)
+            return translate("button.expired", locale), None
+        return render(response, locale), response.color
 
 
 async def respond_to_interaction(service: InteractionService, interaction: Any) -> None:
@@ -750,11 +764,15 @@ async def respond_to_interaction(service: InteractionService, interaction: Any) 
         _log.exception("interaction_defer_failed", **log_context)
         return
 
-    message = await run_interaction(service, interaction)
+    message, color = await run_interaction(service, interaction)
     if not message:
         return
     try:
-        await interaction.edit_initial_response(message)
+        if color is not None:
+            embed = hikari.Embed(description=message, color=color)
+            await interaction.edit_initial_response(embed=embed)
+        else:
+            await interaction.edit_initial_response(message)
     except Exception:
         _log.exception("interaction_edit_failed", **log_context)
 
