@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 from optimus.hashing import perceptual
 from optimus.hashing.decoder import DecodeLimits, decode
+from optimus.hashing.ocr_extract import analyze_image
 from optimus.hashing.qr_extract import extract_qr_urls
 from optimus.ingest.fetcher import FetchedImage, FetchError
 from optimus.ingest.ssrf import SSRFError
@@ -44,6 +45,7 @@ class AttachmentHashes:
     mwhash: int
     mahash: int
     qr_urls: list[str] = field(default_factory=list)
+    ocr_lookalikes: list[dict[str, str]] = field(default_factory=list)
 
 
 #: Matches IngestWorker.FetchFn: an async URL -> FetchedImage fetch, already
@@ -94,4 +96,5 @@ async def hash_attachment(
         mwhash=mirror["whash"],
         mahash=mirror["ahash"],
         qr_urls=extract_qr_urls(fetched.data),
+        ocr_lookalikes=analyze_image(fetched.data)["lookalikes"],
     )

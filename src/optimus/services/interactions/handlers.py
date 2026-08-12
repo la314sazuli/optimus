@@ -286,6 +286,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     computed: list[tuple[int, AttachmentHashes]] = []
     failed = 0
     qr_urls: list[str] = []
+    lookalikes: list[dict[str, str]] = []
     for attachment_id, url in attachments:
         try:
             hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
@@ -300,6 +301,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
             continue
         computed.append((attachment_id, hashes))
         qr_urls.extend(hashes.qr_urls)
+        lookalikes.extend(hashes.ocr_lookalikes)
 
     # Pass 2: store + audit + submit. DB-only, no network/decode work, so
     # each iteration is fast and the write lock is held for close to the
@@ -319,14 +321,24 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
-    if qr_urls:
+    if qr_urls or lookalikes:
+        parts = []
+        if qr_urls:
+            parts.append("\n**QR code(s) found:**\n" + "\n".join(qr_urls))
+        if lookalikes:
+            parts.append(
+                "\n**Lookalike domains:**\n"
+                + "\n".join(
+                    f"`{lk['domain']}` impersonates `{lk['impersonating']}`" for lk in lookalikes
+                )
+            )
         return InteractionResponse(
-            "command.reviewmsg_result_with_qr",
+            "command.reviewmsg_result_with_intel",
             {
                 "added": len(added_hash_ids),
                 "failed": failed,
                 "author_id": author_id,
-                "qr_urls": qr_urls,
+                "intel": "\n".join(parts),
             },
         )
     return InteractionResponse(
