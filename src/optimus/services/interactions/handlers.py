@@ -364,6 +364,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     failed = 0
     qr_urls: list[str] = []
     lookalikes: list[dict[str, str]] = []
+    signals: list[str] = []
     for attachment_id, url in attachments:
         try:
             hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
@@ -379,6 +380,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         computed.append((attachment_id, hashes))
         qr_urls.extend(hashes.qr_urls)
         lookalikes.extend(hashes.ocr_lookalikes)
+        signals.extend(hashes.ocr_signals)
 
     # Pass 2: store + audit + submit. DB-only, no network/decode work, so
     # each iteration is fast and the write lock is held for close to the
@@ -398,7 +400,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
-    if qr_urls or lookalikes:
+    if qr_urls or lookalikes or signals:
         parts = []
         if qr_urls:
             parts.append("\n**QR code(s) found:**\n" + "\n".join(qr_urls))
@@ -409,6 +411,8 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                     f"`{lk['domain']}` impersonates `{lk['impersonating']}`" for lk in lookalikes
                 )
             )
+        if signals:
+            parts.append("\n**Phishing signals:**\n" + ", ".join(signals))
         return InteractionResponse(
             "command.reviewmsg_result_with_intel",
             {
@@ -470,9 +474,11 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
 
     qr_urls: list[str] = []
     lookalikes: list[dict[str, str]] = []
+    signals: list[str] = []
     for hashes in computed:
         qr_urls.extend(hashes.qr_urls)
         lookalikes.extend(hashes.ocr_lookalikes)
+        signals.extend(hashes.ocr_signals)
 
     parts = [f"Analyzed {len(computed)} image(s) ({failed} failed)."]
     if qr_urls:
@@ -484,8 +490,10 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
                 f"`{lk['domain']}` impersonates `{lk['impersonating']}`" for lk in lookalikes
             )
         )
-    if not qr_urls and not lookalikes:
-        parts.append("No QR codes or lookalike domains detected.")
+    if signals:
+        parts.append("\n**Phishing signals:**\n" + ", ".join(signals))
+    if not qr_urls and not lookalikes and not signals:
+        parts.append("No threats detected.")
     return InteractionResponse("command.scanmsg_result", {"summary": " ".join(parts)})
 
 

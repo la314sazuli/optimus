@@ -270,7 +270,7 @@ async def test_scamhash_scanmsg_clean_when_no_intel() -> None:
     deps = MockDeps()
     resp = await handle_command(_scan_ctx([(1, "https://x/1.png")]), deps)
     assert resp.i18n_key == "command.scanmsg_result"
-    assert "No QR codes or lookalike domains detected." in resp.params["summary"]
+    assert "No threats detected." in resp.params["summary"]
     assert deps.stored_hashes == []
 
 
