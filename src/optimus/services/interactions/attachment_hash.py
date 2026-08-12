@@ -46,6 +46,7 @@ class AttachmentHashes:
     mahash: int
     qr_urls: list[str] = field(default_factory=list)
     ocr_lookalikes: list[dict[str, str]] = field(default_factory=list)
+    ocr_signals: list[str] = field(default_factory=list)
 
 
 #: Matches IngestWorker.FetchFn: an async URL -> FetchedImage fetch, already
@@ -84,6 +85,7 @@ async def hash_attachment(
     direct = perceptual.compute_all(frame)
     mirror = perceptual.compute_all_mirror(frame)
 
+    analysis = analyze_image(fetched.data)
     return AttachmentHashes(
         attachment_id=attachment_id,
         url=url,
@@ -96,5 +98,6 @@ async def hash_attachment(
         mwhash=mirror["whash"],
         mahash=mirror["ahash"],
         qr_urls=extract_qr_urls(fetched.data),
-        ocr_lookalikes=analyze_image(fetched.data)["lookalikes"],
+        ocr_lookalikes=analysis["lookalikes"],
+        ocr_signals=analysis["signals"],
     )
