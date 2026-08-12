@@ -18,7 +18,10 @@ import hikari
 
 from optimus.core.config import get_settings
 from optimus.core.logging import configure_logging, get_logger
-from optimus.services.interactions.commands import build_command_builders
+from optimus.services.interactions.commands import (
+    build_command_builders,
+    build_context_menu_command_builders,
+)
 
 _log = get_logger(__name__)
 
@@ -33,7 +36,7 @@ async def _register(guild_id: int | None) -> None:
     try:
         async with rest_app.acquire(settings.discord_token, hikari.TokenType.BOT) as rest:
             application = hikari.Snowflake(int(settings.discord_client_id))
-            builders = build_command_builders()
+            builders = build_command_builders() + build_context_menu_command_builders()
             await rest.set_application_commands(
                 application,
                 builders,  # type: ignore[arg-type]

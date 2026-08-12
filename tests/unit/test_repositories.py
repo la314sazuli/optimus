@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.db.models import (
@@ -41,10 +40,29 @@ async def test_guild_upsert_and_safe_mode(session: AsyncSession) -> None:
     assert refreshed is not None and refreshed.safe_mode is True
 
 
-async def test_set_safe_mode_unknown_guild_raises(session: AsyncSession) -> None:
+async def test_set_safe_mode_unknown_guild_auto_provisions(session: AsyncSession) -> None:
     repo = GuildRepository(session)
-    with pytest.raises(KeyError):
-        await repo.set_safe_mode(999, True)
+    await repo.set_safe_mode(999, True)
+    guild = await repo.get(999)
+    assert guild is not None
+    assert guild.safe_mode is True
+
+
+async def test_get_or_create_returns_existing_row_unchanged(session: AsyncSession) -> None:
+    repo = GuildRepository(session)
+    await repo.upsert(Guild(guild_id=1, sensitivity="strict"))
+    guild = await repo.get_or_create(1)
+    assert guild.sensitivity == "strict"
+
+
+async def test_get_or_create_provisions_default_row_when_missing(session: AsyncSession) -> None:
+    repo = GuildRepository(session)
+    assert await repo.get(42) is None
+    guild = await repo.get_or_create(42)
+    assert guild.guild_id == 42
+    assert guild.sensitivity == "balanced"
+    persisted = await repo.get(42)
+    assert persisted is not None
 
 
 async def test_guild_hash_repo_scopes_to_guild(session: AsyncSession) -> None:

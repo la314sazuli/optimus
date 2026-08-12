@@ -19,8 +19,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from optimus.core.logging import get_logger
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.services.interactions.attachment_hash import (
+    AttachmentHashError,
+    AttachmentHashes,
+)
 from optimus.services.interactions.commands import required_permission
 from optimus.services.interactions.logic import (
     CommandError,
@@ -37,6 +42,8 @@ from optimus.services.interactions.logic import (
     ImportHash as _ImportHash,
 )
 from optimus.services.moderation.review import ParsedCustomId, ReviewAction
+
+_log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +98,57 @@ class InteractionDeps(Protocol):
         self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
     ) -> None: ...
     def global_service(self) -> GlobalHashService: ...
+    async def compute_attachment_hashes(self, *, attachment_id: int, url: str) -> AttachmentHashes:
+        """Fetch and decode one attachment and compute its hash set. No DB access.
+
+        Deliberately split out from storing the result: this does a network
+        fetch plus a sandboxed decode subprocess, both of which can take real
+        wall-clock time (multi-second on a loaded host) and must never run
+        while a DB write transaction is open -- SQLite holds an exclusive
+        file-level write lock for the full lifetime of the transaction, and a
+        review of a multi-image message previously ran every attachment's
+        fetch+decode one after another *inside* the same open transaction as
+        the DB writes, which could hold that lock far longer than any normal
+        query and starve concurrent writers into a "database is locked" error.
+
+        Raises :class:`AttachmentHashError` (see
+        :mod:`optimus.services.interactions.attachment_hash`) if the attachment
+        cannot be fetched or decoded as an image; the caller decides how to
+        surface that (skip-and-continue for a multi-image review).
+        """
+        ...
+
+    async def store_attachment_hash(
+        self, guild_id: int, *, hashes: AttachmentHashes, added_by: int
+    ) -> GuildHash:
+        """Store an already-computed attachment hash set as a guild hash.
+
+        DB-only -- no network or decode work happens here, so this is always
+        fast and holds the session's write lock only as long as one insert
+        takes. If a hash with the same id already exists for this guild (e.g.
+        re-reviewing a message, or an image an earlier detection already
+        caught), returns the existing row rather than raising -- adding a scam
+        hash is idempotent.
+        """
+        ...
+
+    async def submit_confirmed_scam(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        message_id: int,
+        attachment_id: int,
+        uploader_id: int,
+        matched_hash_id: str,
+    ) -> None:
+        """Record a moderator-confirmed scam match and run the moderation pipeline.
+
+        Feeds the same ``verdict.v1`` path a live detection would, so the
+        guild's configured ``action_policy`` (e.g. delete + ban) is applied
+        exactly as it would be for a message caught in real time.
+        """
+        ...
 
 
 def _require(ctx: InteractionContext, permission: Permission | None) -> None:
@@ -145,20 +203,174 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
             [_ImportHash(phash=r.phash, dhash=r.dhash, whash=r.whash) for r in rows]
         )
         return InteractionResponse("command.export_ok", {"count": len(rows)}, attachment=body)
+    if sub == "reviewmsg":
+        return await _review_message(ctx, deps)
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
+
+
+async def _cmd_review_message(
+    ctx: InteractionContext, deps: InteractionDeps
+) -> InteractionResponse:
+    """Entry point for the "Review as scam" message context-menu command.
+
+    ``required_permission("review_message")`` gates this the same as
+    ``/scamhash reviewmsg`` (``MANAGE_GUILD``); the glue layer has already
+    resolved the target message's attachments/author into ``ctx.options``
+    since a context-menu command carries no typed options of its own.
+    """
+    return await _review_message(ctx, deps)
+
+
+async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
+    """Shared core for both the ``/scamhash reviewmsg`` and context-menu entry points.
+
+    Expects the glue layer to have pre-resolved the target message into
+    ``ctx.options``: ``channel_id``, ``message_id``, ``author_id`` (all ints),
+    and ``attachments`` (a list of ``(attachment_id, url)`` pairs already
+    filtered to image content types). Hashes every attachment, adds each as a
+    new guild hash, and -- for each one successfully hashed -- feeds a
+    confirmed-scam verdict into the moderation pipeline so the configured
+    action policy (e.g. delete + ban) is applied. A REST-level failure to
+    fetch/decode one attachment is skipped rather than aborting the whole
+    review, since a message can carry several images and a moderator's intent
+    is best served by processing every image that *can* be processed.
+
+    Runs in two passes deliberately: first every attachment is fetched and
+    hashed with no DB session/transaction involved at all, then (only once
+    all the slow network/decode work is done) each successfully hashed
+    attachment is stored and submitted in quick DB-only calls. The whole
+    handler still executes inside one caller-managed transaction (see
+    :meth:`InteractionService._run`), so interleaving a network fetch plus a
+    sandboxed decode subprocess for attachment N+1 with attachment N's writes
+    used to hold that transaction's SQLite write lock open for as long as an
+    entire multi-image review took -- multiple seconds per image, easily
+    exceeding the point another writer would report "database is locked".
+    Doing all the slow work up front means the transaction's write lock is
+    only ever held for the sum of the fast DB calls, not the fetch+decode
+    time too.
+    """
+    assert ctx.guild_id is not None  # guaranteed by _require (MANAGE_GUILD => guild-only)
+    if not await deps.hash_rate_ok(ctx.user_id):
+        raise InteractionRejected(CommandError.RATE_LIMITED)
+    channel_id = int(ctx.options["channel_id"])
+    message_id = int(ctx.options["message_id"])
+    author_id = int(ctx.options["author_id"])
+    attachments: list[tuple[int, str]] = list(ctx.options["attachments"])
+    if not attachments:
+        return InteractionResponse("command.reviewmsg_no_images")
+
+    # Pass 1: fetch + decode + hash every attachment. Pure computation plus
+    # network I/O -- deliberately kept outside any DB write below so the
+    # transaction the caller already has open never sits idle waiting on a
+    # CDN round-trip or a sandboxed decode subprocess.
+    computed: list[tuple[int, AttachmentHashes]] = []
+    failed = 0
+    for attachment_id, url in attachments:
+        try:
+            hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
+        except AttachmentHashError as exc:
+            _log.warning(
+                "reviewmsg_attachment_hash_failed",
+                guild_id=ctx.guild_id,
+                attachment_id=attachment_id,
+                reason=str(exc),
+            )
+            failed += 1
+            continue
+        computed.append((attachment_id, hashes))
+
+    # Pass 2: store + audit + submit. DB-only, no network/decode work, so
+    # each iteration is fast and the write lock is held for close to the
+    # minimum time actually needed.
+    added_hash_ids: list[str] = []
+    for attachment_id, hashes in computed:
+        stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
+        added_hash_ids.append(stored.hash_id)
+        await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
+        await deps.submit_confirmed_scam(
+            ctx.guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            attachment_id=attachment_id,
+            uploader_id=author_id,
+            matched_hash_id=stored.hash_id,
+        )
+    if not added_hash_ids:
+        return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
+    return InteractionResponse(
+        "command.reviewmsg_result",
+        {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
+    )
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
     assert ctx.guild_id is not None
     if ctx.subcommand == "view":
-        await deps.get_config(ctx.guild_id)
-        return InteractionResponse("command.config_view_header")
+        current = await deps.get_config(ctx.guild_id)
+        return InteractionResponse(
+            "command.config_view_header", {"summary": _render_config_summary(current)}
+        )
     change = validate_config_set(str(ctx.options["field"]), str(ctx.options["value"]))
     await deps.set_config_field(ctx.guild_id, change.field, change.value)
     await deps.audit(ctx.guild_id, ctx.user_id, "config.set", target=change.field)
     return InteractionResponse(
-        "command.config_set_ok", {"field": change.field, "value": change.value}
+        "command.config_set_ok",
+        {"field": change.field, "value": _render_config_value(change.field, change.value)},
     )
+
+
+#: Display order for /config view; keeps related settings grouped together.
+#: These keys must exactly match both the dict keys returned by
+#: InteractionDeps.get_config() and the field names validate_config_set()
+#: accepts for /config set -- i.e. "review_channel", never the DB column's
+#: "review_channel_id" -- so a field name copied from /config view always
+#: works verbatim in /config set and vice versa.
+_CONFIG_VIEW_ORDER = (
+    "sensitivity",
+    "action_policy",
+    "mod_queue_threshold",
+    "review_channel",
+    "safe_mode",
+    "retention_days",
+    "locale",
+    "optin_global_db",
+    "optin_scan_bots",
+    "optin_evidence_storage",
+)
+
+
+def _render_config_summary(current: dict[str, Any]) -> str:
+    """Render a guild's config dict (from ``get_config``) as a display block.
+
+    Empty (no row yet / guild never configured) renders a single explanatory
+    line rather than an empty list. ``review_channel`` renders as a real
+    channel mention (or "not set") to match ``_render_config_value``.
+    """
+    if not current:
+        return "_No configuration set yet \u2014 defaults are in effect._"
+    lines = []
+    for config_field in _CONFIG_VIEW_ORDER:
+        if config_field not in current:
+            continue
+        value = current[config_field]
+        if config_field == "review_channel":
+            rendered = f"<#{value}>" if value is not None else "not set"
+        else:
+            rendered = str(value)
+        lines.append(f"**{config_field}**: `{rendered}`")
+    return "\n".join(lines)
+
+
+def _render_config_value(field: str, value: Any) -> str:
+    """Render a validated config value for the ``config_set_ok`` confirmation.
+
+    ``review_channel`` stores a raw channel id (or ``None`` when cleared); show
+    it as a real channel mention (or "none") instead of a bare integer/"None".
+    Every other field renders as-is.
+    """
+    if field == "review_channel":
+        return f"<#{value}>" if value is not None else "none"
+    return str(value)
 
 
 async def _cmd_stats(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
@@ -231,6 +443,7 @@ _COMMAND_HANDLERS: dict[str, _CommandHandler] = {
     "delete_server_data": _cmd_delete_server_data,
     "forget_me": _cmd_forget_me,
     "appeal": _cmd_appeal,
+    "review_message": _cmd_review_message,
 }
 
 
