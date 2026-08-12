@@ -18,20 +18,24 @@ def _ctx(command="scamhash", sub="explain", options=None, guild_id=100, user_id=
 
 def _deps():
     deps = MagicMock()
-    deps.detection_detail = AsyncMock(return_value={
-        "detection_id": 42,
-        "verdict": "scam",
-        "distance": 5,
-        "action": "delete",
-        "created_at": "2026-08-12T00:00:00",
-    })
-    deps.last_detection = AsyncMock(return_value={
-        "detection_id": 42,
-        "verdict": "scam",
-        "distance": 5,
-        "action": "delete",
-        "created_at": "2026-08-12T00:00:00",
-    })
+    deps.detection_detail = AsyncMock(
+        return_value={
+            "detection_id": 42,
+            "verdict": "scam",
+            "distance": 5,
+            "action": "delete",
+            "created_at": "2026-08-12T00:00:00",
+        }
+    )
+    deps.last_detection = AsyncMock(
+        return_value={
+            "detection_id": 42,
+            "verdict": "scam",
+            "distance": 5,
+            "action": "delete",
+            "created_at": "2026-08-12T00:00:00",
+        }
+    )
     deps.reverse_detection_action = AsyncMock(return_value=None)
     deps.audit = AsyncMock(return_value=None)
     return deps

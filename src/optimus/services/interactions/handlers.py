@@ -211,9 +211,7 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         detection_id = int(ctx.options["detection_id"])
         detail = await deps.detection_detail(ctx.guild_id, detection_id)
         if detail is None:
-            return InteractionResponse(
-                "command.explain_not_found", {"detection_id": detection_id}
-            )
+            return InteractionResponse("command.explain_not_found", {"detection_id": detection_id})
         return InteractionResponse("command.explain_result", detail)
     if sub == "undo":
         detail = await deps.last_detection(ctx.guild_id)
@@ -221,7 +219,9 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
             return InteractionResponse("command.undo_nothing")
         await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"])
         await deps.audit(
-            ctx.guild_id, ctx.user_id, "scamhash.undo",
+            ctx.guild_id,
+            ctx.user_id,
+            "scamhash.undo",
             target=str(detail["detection_id"]),
         )
         return InteractionResponse("command.undo_done", detail)
