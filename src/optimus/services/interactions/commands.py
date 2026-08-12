@@ -98,6 +98,19 @@ COMMANDS: tuple[Command, ...] = (
             ),
             SubCommand(name="export", description="Export this server's scam hashes as JSON."),
             SubCommand(
+                name="explain",
+                description="Show why a detection was flagged.",
+                options=(
+                    Option(
+                        "detection_id",
+                        "The detection ID to explain.",
+                        OPT_INTEGER,
+                        required=True,
+                    ),
+                ),
+            ),
+            SubCommand(name="undo", description="Undo the last moderation action in this server."),
+            SubCommand(
                 name="reviewmsg",
                 description=(
                     "Hash images on a past message, add as scam hashes, "
