@@ -39,6 +39,7 @@
     "reviewmsg_no_images": "Ta poruka nema priloge sa slikama za pregled.",
     "reviewmsg_all_failed": "Nije moguće preuzeti ili dekodirati nijednu od {failed} slika na toj poruci.",
     "reviewmsg_result": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>.",
+    "reviewmsg_result_with_qr": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>.\n\n**QR kod(ovi) pronađeni:**\n{qr_urls}",
     "reviewmsg_not_found": "Poruka nije pronađena. Proverite link/ID i da li bot ima pristup kanalu.",
     "reviewmsg_fetch_failed": "Preuzimanje te poruke sa Discorda nije uspelo. Pokušajte ponovo.",
     "config_view_header": "Konfiguracija za ovaj server:\n{summary}",

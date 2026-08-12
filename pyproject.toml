@@ -46,6 +46,7 @@ dev = [
     "mypy>=2.3.0",
     "pre-commit>=4.6.1",
     "types-redis",
+    "qrcode>=7.4",
 ]
 
 [build-system]

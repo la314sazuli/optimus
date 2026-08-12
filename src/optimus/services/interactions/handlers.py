@@ -265,6 +265,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     # CDN round-trip or a sandboxed decode subprocess.
     computed: list[tuple[int, AttachmentHashes]] = []
     failed = 0
+    qr_urls: list[str] = []
     for attachment_id, url in attachments:
         try:
             hashes = await deps.compute_attachment_hashes(attachment_id=attachment_id, url=url)
@@ -278,6 +279,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
             failed += 1
             continue
         computed.append((attachment_id, hashes))
+        qr_urls.extend(hashes.qr_urls)
 
     # Pass 2: store + audit + submit. DB-only, no network/decode work, so
     # each iteration is fast and the write lock is held for close to the
@@ -297,6 +299,12 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
+    if qr_urls:
+        return InteractionResponse(
+            "command.reviewmsg_result_with_qr",
+            {"added": len(added_hash_ids), "failed": failed,
+             "author_id": author_id, "qr_urls": qr_urls},
+        )
     return InteractionResponse(
         "command.reviewmsg_result",
         {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
