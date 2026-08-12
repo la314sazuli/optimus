@@ -1,19 +1,17 @@
 """Tests for QR code extraction."""
 
-import io
-
 import cv2
 import numpy as np
-import qrcode
 
 from optimus.hashing.qr_extract import extract_qr_urls
 
 
 def _make_qr_image(data: str) -> bytes:
-    img = qrcode.make(data)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    encoder = cv2.QRCodeEncoder.create()
+    img = encoder.encode(data)
+    ok, buf = cv2.imencode(".png", img)
+    assert ok
+    return buf.tobytes()
 
 
 def test_extract_single_qr():
