@@ -39,7 +39,7 @@ def test_normalize_domain_handles_bare_domain():
     assert normalize_domain("perplexity.ai") == "perplexity.ai"
 
 
-def test_lookalite_exact_match_is_safe():
+def test_lookalike_exact_match_is_safe():
     assert is_lookalike("openai.com") is None
     assert is_lookalike("perplexity.ai") is None
 
