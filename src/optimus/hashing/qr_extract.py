@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-import cv2  # type: ignore[import-not-found]
+import cv2
 import numpy as np
 
 _log = logging.getLogger(__name__)
