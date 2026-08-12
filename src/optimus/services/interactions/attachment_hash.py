@@ -16,10 +16,11 @@ already-configured fetch function, matching the pattern used by
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from optimus.hashing import perceptual
 from optimus.hashing.decoder import DecodeLimits, decode
+from optimus.hashing.qr_extract import extract_qr_urls
 from optimus.ingest.fetcher import FetchedImage, FetchError
 from optimus.ingest.ssrf import SSRFError
 
@@ -42,6 +43,7 @@ class AttachmentHashes:
     mdhash: int
     mwhash: int
     mahash: int
+    qr_urls: list[str] = field(default_factory=list)
 
 
 #: Matches IngestWorker.FetchFn: an async URL -> FetchedImage fetch, already
@@ -91,4 +93,5 @@ async def hash_attachment(
         mdhash=mirror["dhash"],
         mwhash=mirror["whash"],
         mahash=mirror["ahash"],
+        qr_urls=extract_qr_urls(fetched.data),
     )
