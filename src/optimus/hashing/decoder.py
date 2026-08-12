@@ -28,6 +28,7 @@ import numpy as np
 import numpy.typing as npt
 
 from optimus.core.logging import get_logger
+from optimus.core.metrics import record_decode_failure
 
 _log = get_logger(__name__)
 
@@ -216,6 +217,7 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
         )
     except subprocess.TimeoutExpired:
         _log.warning("decode_timeout")
+        record_decode_failure("timeout")
         return None
     except subprocess.CalledProcessError as exc:
         # Surface the child's stderr (e.g. a numpy MemoryError, a Pillow
@@ -225,9 +227,11 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
         # per-image corruption.
         stderr_tail = (exc.stderr or b"").decode("utf-8", errors="replace")[-500:]
         _log.warning("decode_failed", returncode=exc.returncode, stderr=stderr_tail)
+        record_decode_failure("failed")
         return None
     except Exception as exc:
         _log.warning("decode_error", reason=str(exc))
+        record_decode_failure("error")
         return None
 
     try:
@@ -239,6 +243,7 @@ def decode(data: bytes, limits: DecodeLimits | None = None) -> DecodedImage | No
             frames.append(arr)
     except Exception as exc:
         _log.warning("decode_unpack_failed", reason=str(exc))
+        record_decode_failure("unpack_failed")
         return None
 
     if not frames:

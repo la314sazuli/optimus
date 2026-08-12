@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
 
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +31,7 @@ from optimus.core.health import HealthServer
 from optimus.core.idempotency import IdempotencyGuard
 from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
+from optimus.core.metrics import record_detection
 from optimus.core.readiness import db_check, nats_check, redis_check
 from optimus.db.engine import (
     SessionScope,
@@ -95,6 +97,7 @@ class DetectionService:
         # that follows a nak. Release it so the redelivery can re-run the work;
         # the DB unique constraint on idempotency_key remains the real authority
         # against a genuine duplicate.
+        t0 = time.monotonic()
         try:
             if self._use_outbox:
                 await self._persist_and_enqueue(result)
@@ -110,6 +113,10 @@ class DetectionService:
                 with contextlib.suppress(Exception):
                     await self._release(event.idempotency_key)
             raise
+        record_detection(
+            result.verdict.guild_id,
+            time.monotonic() - t0,
+        )
 
     async def on_invalidate(self, event: IndexInvalidateEvent) -> None:
         """Reload an index in response to a control-plane invalidation."""
