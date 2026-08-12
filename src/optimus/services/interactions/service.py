@@ -228,6 +228,33 @@ class DbDeps:
     async def detection_belongs_to(self, guild_id: int, detection_id: int, user_id: int) -> bool:
         return await DetectionRepository(self._session, guild_id).belongs_to(detection_id, user_id)
 
+    async def detection_detail(self, guild_id: int, detection_id: int) -> dict[str, Any] | None:
+        d = await DetectionRepository(self._session, guild_id).get_by_id(detection_id)
+        if d is None:
+            return None
+        min_dist = min(d.distances.values()) if d.distances else None
+        return {
+            "detection_id": d.id,
+            "verdict": d.verdict,
+            "distance": min_dist,
+            "action": d.action_taken or "none",
+            "created_at": d.created_at.isoformat() if d.created_at else "unknown",
+        }
+
+    async def last_detection(self, guild_id: int) -> dict[str, Any] | None:
+        recent = await DetectionRepository(self._session, guild_id).list_recent(limit=1)
+        if not recent:
+            return None
+        d = recent[0]
+        min_dist = min(d.distances.values()) if d.distances else None
+        return {
+            "detection_id": d.id,
+            "verdict": d.verdict,
+            "distance": min_dist,
+            "action": d.action_taken or "none",
+            "created_at": d.created_at.isoformat() if d.created_at else "unknown",
+        }
+
     async def open_appeal(self, guild_id: int, detection_id: int, user_id: int) -> int:
         appeal = await AppealRepository(self._session, guild_id).open(
             detection_id=detection_id, user_id=user_id

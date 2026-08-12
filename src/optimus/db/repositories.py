@@ -282,6 +282,13 @@ class DetectionRepository:
         )
         return (await self._session.execute(stmt)).scalars().all()
 
+    async def get_by_id(self, detection_id: int) -> Detection | None:
+        """Return a detection by ID, scoped to this guild."""
+        stmt = select(Detection).where(
+            Detection.guild_id == self._guild_id, Detection.id == detection_id
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
     async def belongs_to(self, detection_id: int, user_id: int) -> bool:
         """Whether ``detection_id`` exists in this guild and ``user_id`` uploaded it."""
         stmt = select(func.count()).where(
