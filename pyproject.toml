@@ -29,6 +29,7 @@ dependencies = [
     "aiohttp>=3.14.3",
     "aiosqlite>=0.22.1",
     "opencv-python-headless>=4.10.0",
+    "pytesseract>=0.3.13",
 ]
 
 [project.scripts]
@@ -75,7 +76,7 @@ files = ["src/optimus", "benchmarks"]
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["pywt.*", "onnxruntime.*", "nats", "nats.*", "PIL.*", "aioboto3.*", "botocore.*"]
+module = ["pywt.*", "onnxruntime.*", "nats", "nats.*", "PIL.*", "aioboto3.*", "botocore.*", "pytesseract"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -52,7 +52,7 @@ FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
 # intentionally unpinned so apt pulls current security patches.
 # hadolint ignore=DL3008
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y curl tini gosu \
+    && apt-get install --no-install-recommends -y curl tini gosu tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user; the app lives under /app owned by that user.
