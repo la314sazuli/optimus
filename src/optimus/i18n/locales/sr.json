@@ -38,8 +38,8 @@
     "export_ok": "Izvezeno {count} heševa.",
     "reviewmsg_no_images": "Ta poruka nema priloge sa slikama za pregled.",
     "reviewmsg_all_failed": "Nije moguće preuzeti ili dekodirati nijednu od {failed} slika na toj poruci.",
-    "reviewmsg_result": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>.",
-    "reviewmsg_result_with_intel": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>.{intel}",
+    "reviewmsg_result": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>. {campaign}",
+    "reviewmsg_result_with_intel": "Dodato {added} heševa ({failed} neuspešno) i preduzeta akcija nad <@{author_id}>. {campaign}{intel}",
     "reviewmsg_not_found": "Poruka nije pronađena. Proverite link/ID i da li bot ima pristup kanalu.",
     "reviewmsg_fetch_failed": "Preuzimanje te poruke sa Discorda nije uspelo. Pokušajte ponovo.",
     "config_view_header": "Konfiguracija za ovaj server:\n{summary}",
@@ -56,7 +56,9 @@
     "undo_done": "Opozvana akcija za otkrivanje #{detection_id} (presuda: {verdict}).",
     "recent_empty": "Nema zabeleženih moderation događaja za ovaj server.",
     "recent_result": "Poslednjih {count} moderation događaja:\n{entries}",
-    "help_text": "**Brza referenca za moderatore**\n\n**Neko je postavio scam sliku:**\nDesni klik na poruku → Apps → \"Review as scam\"\nIli koristite `/scamhash reviewmsg message:<link>`\n\n**Proverite šta je Optimus detektovao:**\n`/scamhash explain detection_id:<id>`\n`/scamhash recent` — poslednjih 10 događaja\n\n**Optimus je napravio grešku:**\n`/scamhash undo` — poništava poslednju akciju\n\n**Pregled bez akcije:**\n`/scamhash scanmsg message:<link>` — analizira ali ne preduzima akciju\n\n**Upravljanje scam heševima:**\n`/scamhash add` — dodaj heš iz slike\n`/scamhash list` — prikaži heševe\n`/scamhash export` — izvezi kao JSON",
+    "help_text": "**Brza referenca za moderatore**\n\n**Neko je postavio scam sliku:**\nDesni klik na poruku → Apps → \"Review as scam\"\nIli koristite `/scamhash reviewmsg message:<link>`\n\n**Proverite šta je Optimus detektovao:**\n`/scamhash explain detection_id:<id>`\n`/scamhash recent` — poslednjih 10 događaja\n`/scamhash campaigns` — aktivne scam kampanje\n\n**Optimus je napravio grešku:**\n`/scamhash undo` — poništava poslednju akciju\n\n**Pregled bez akcije:**\n`/scamhash scanmsg message:<link>` — analizira ali ne preduzima akciju\n\n**Upravljanje scam heševima:**\n`/scamhash add` — dodaj heš iz slike\n`/scamhash list` — prikaži heševe\n`/scamhash export` — izvezi kao JSON",
+    "campaigns_empty": "Nema aktivnih scam kampanja na ovom serveru.",
+    "campaigns_result": "**{count} aktivna kampanja/e:**\n{entries}",
     "scanmsg_no_images": "Ta poruka nema priloge sa slikama za skeniranje.",
     "scanmsg_all_failed": "Nije moguće preuzeti ili dekodirati nijednu od {failed} slika na toj poruci.",
     "scanmsg_result": "{summary}",
@@ -83,6 +85,7 @@
     "appeal_approved": "Žalba je odobrena i mera je poništena.",
     "appeal_denied": "Žalba je odbijena.",
     "expired": "Ova interakcija više nije važeća.",
-    "not_permitted": "Nemate dozvolu za to."
+    "not_permitted": "Nemate dozvolu za to.",
+    "dismissed": "Odbaceno."
   }
 }

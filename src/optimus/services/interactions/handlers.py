@@ -22,6 +22,12 @@ from typing import Any, Protocol
 from optimus.core.logging import get_logger
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.hashing.campaign import (
+    campaign_color,
+    find_campaign,
+    new_campaign_id,
+    summarize_campaigns,
+)
 from optimus.services.interactions.attachment_hash import (
     AttachmentHashError,
     AttachmentHashes,
@@ -31,8 +37,11 @@ from optimus.services.interactions.logic import (
     CommandError,
     ComponentAction,
     InteractionRejected,
+    ModAction,
+    ParsedModId,
     Permission,
     build_export,
+    encode_mod_id,
     has_permission,
     parse_hash_hex,
     validate_config_set,
@@ -50,6 +59,11 @@ COLOR_RED = 0xE74C3C  # errors, actions taken
 COLOR_YELLOW = 0xF1C40F  # warnings, intel found, preview
 COLOR_GREEN = 0x2ECC71  # success, undo, safe
 COLOR_GRAY = 0x95A5A6  # info, config, help, explain
+
+# hikari.ButtonStyle values (kept as ints so handlers stay hikari-free).
+BTN_SUCCESS = 3
+BTN_SECONDARY = 2
+BTN_DANGER = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +91,17 @@ class InteractionResponse:
     #: Discord embed color (0xRRGGBB). When set, the response is rendered
     #: as a colored embed instead of plain text.
     color: int | None = None
+    #: Moderator action buttons attached to the response.
+    components: tuple[ButtonDef, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ButtonDef:
+    """A hikari-free button description for the glue layer to render."""
+
+    label: str
+    style: int  # hikari.ButtonStyle
+    custom_id: str
 
 
 class InteractionDeps(Protocol):
@@ -101,7 +126,7 @@ class InteractionDeps(Protocol):
     async def open_appeal(self, guild_id: int, detection_id: int, user_id: int) -> int: ...
     async def get_appeal(self, guild_id: int, appeal_id: int) -> dict[str, Any] | None: ...
     async def resolve_appeal(self, guild_id: int, appeal_id: int, *, approved: bool) -> None: ...
-    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> None: ...
+    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> bool: ...
     async def disable_safe_mode(self, guild_id: int) -> None: ...
     async def local_hash(self, guild_id: int, hash_id: str) -> GuildHash | None: ...
     async def hash_rate_ok(self, user_id: int) -> bool: ...
@@ -153,13 +178,25 @@ class InteractionDeps(Protocol):
         attachment_id: int,
         uploader_id: int,
         matched_hash_id: str,
-    ) -> None:
+    ) -> int:
         """Record a moderator-confirmed scam match and run the moderation pipeline.
 
         Feeds the same ``verdict.v1`` path a live detection would, so the
         guild's configured ``action_policy`` (e.g. delete + ban) is applied
         exactly as it would be for a message caught in real time.
         """
+        ...
+
+    async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
+        """Associate a hash with a campaign."""
+        ...
+
+    async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
+        """Return (campaign_id, member_count) for active campaigns with 2+ members."""
+        ...
+
+    async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
+        """Return (campaign_id, phash) for all active hashes with a campaign_id."""
         ...
 
 
@@ -288,6 +325,16 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         )
     if sub == "help":
         return InteractionResponse("command.help_text")
+    if sub == "campaigns":
+        campaigns = await deps.list_campaigns(ctx.guild_id)
+        if not campaigns:
+            return InteractionResponse("command.campaigns_empty")
+        lines = summarize_campaigns(campaigns)
+        return InteractionResponse(
+            "command.campaigns_result",
+            {"count": len(campaigns), "entries": "\n".join(lines)},
+            color=campaign_color(campaigns[0][1]),
+        )
     if sub == "explain":
         detection_id = int(ctx.options["detection_id"])
         detail = await deps.detection_detail(ctx.guild_id, detection_id)
@@ -396,17 +443,28 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     # each iteration is fast and the write lock is held for close to the
     # minimum time actually needed.
     added_hash_ids: list[str] = []
+    detection_ids: list[int] = []
+    campaign_note = ""
     for attachment_id, hashes in computed:
         stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
         added_hash_ids.append(stored.hash_id)
+        # Campaign detection: check if this hash is a variant of an existing scam.
+        existing = await deps.list_campaign_hashes(ctx.guild_id)
+        campaign_id = find_campaign(hashes.phash, existing) if existing else None
+        if campaign_id is None:
+            campaign_id = new_campaign_id()
+        await deps.link_campaign(ctx.guild_id, stored.hash_id, campaign_id)
+        campaign_note = f"Part of campaign `{campaign_id}`."
         await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
-        await deps.submit_confirmed_scam(
-            ctx.guild_id,
-            channel_id=channel_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-            uploader_id=author_id,
-            matched_hash_id=stored.hash_id,
+        detection_ids.append(
+            await deps.submit_confirmed_scam(
+                ctx.guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                attachment_id=attachment_id,
+                uploader_id=author_id,
+                matched_hash_id=stored.hash_id,
+            )
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
@@ -430,11 +488,18 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                 "failed": failed,
                 "author_id": author_id,
                 "intel": "\n".join(parts),
+                "campaign": campaign_note,
             },
+            components=_review_intel_buttons(detection_ids[-1]),
         )
     return InteractionResponse(
         "command.reviewmsg_result",
-        {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
+        {
+            "added": len(added_hash_ids),
+            "failed": failed,
+            "author_id": author_id,
+            "campaign": campaign_note,
+        },
     )
 
 
@@ -506,7 +571,11 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         parts.append(f"\n**Phishing signals ({risk_level} risk):**\n" + ", ".join(signals))
     if not qr_urls and not lookalikes and not signals:
         parts.append("No threats detected.")
-    return InteractionResponse("command.scanmsg_result", {"summary": " ".join(parts)})
+    return InteractionResponse(
+        "command.scanmsg_result",
+        {"summary": " ".join(parts)},
+        components=_scan_buttons(ctx),
+    )
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
@@ -808,5 +877,63 @@ async def handle_component(
         # would be immediately deleted; the purge is the audited event itself.
         await deps.purge_guild(ctx.guild_id)
         return InteractionResponse("command.delete_server_ok")
+
+    raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
+
+
+# --- Moderator action buttons (scanmsg / reviewmsg follow-ups) ---
+
+
+def _scan_buttons(ctx: InteractionContext) -> tuple[ButtonDef, ...]:
+    """Buttons for scanmsg preview results: promote to scam or dismiss."""
+    channel_id = int(ctx.options["channel_id"])
+    message_id = int(ctx.options["message_id"])
+    return (
+        ButtonDef(
+            "Add as scam", BTN_SUCCESS, encode_mod_id(ModAction.ADD_SCAM, channel_id, message_id)
+        ),
+        ButtonDef("Dismiss", BTN_SECONDARY, encode_mod_id(ModAction.DISMISS, 0, 0)),
+    )
+
+
+def _review_intel_buttons(detection_id: int) -> tuple[ButtonDef, ...]:
+    """Buttons for reviewmsg results that found intel: undo or dismiss."""
+    return (
+        ButtonDef("Undo", BTN_DANGER, encode_mod_id(ModAction.UNDO, detection_id, 0)),
+        ButtonDef("Dismiss", BTN_SECONDARY, encode_mod_id(ModAction.DISMISS, 0, 0)),
+    )
+
+
+async def handle_mod_button(
+    ctx: InteractionContext, parsed: ParsedModId, deps: InteractionDeps
+) -> InteractionResponse:
+    """Handle a moderator action button press (undo / dismiss).
+
+    ``ADD_SCAM`` is handled in the glue layer (``run_interaction``) because it
+    needs REST access to re-fetch the target message; this handler only covers
+    the pure-DB actions.
+    """
+    _require(ctx, Permission.MANAGE_GUILD)
+    assert ctx.guild_id is not None
+
+    if parsed.action is ModAction.DISMISS:
+        return InteractionResponse("button.dismissed")
+
+    if parsed.action is ModAction.UNDO:
+        # For UNDO, channel_id carries the detection id and message_id is zero.
+        # Resolve it in this guild before mutation: a delayed or forged click
+        # can never fall back to undoing an unrelated latest detection.
+        detail = await deps.detection_detail(ctx.guild_id, parsed.channel_id)
+        if detail is None:
+            return InteractionResponse("command.undo_nothing")
+        if not await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"]):
+            return InteractionResponse("command.undo_nothing")
+        await deps.audit(
+            ctx.guild_id,
+            ctx.user_id,
+            "scamhash.undo",
+            target=str(detail["detection_id"]),
+        )
+        return InteractionResponse("command.undo_done", detail)
 
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
