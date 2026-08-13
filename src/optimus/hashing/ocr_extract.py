@@ -306,12 +306,15 @@ def normalize_domain(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "http://" + url
     try:
-        netloc = urlparse(url).netloc.lower()
-    except Exception:
+        domain = urlparse(url).hostname
+        if domain is None:
+            return ""
+        domain = domain.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
         return ""
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-    return netloc.encode("idna").decode("ascii") if netloc else ""
 
 
 def is_lookalike(domain: str, official: frozenset[str] = OFFICIAL_AI_DOMAINS) -> str | None:
