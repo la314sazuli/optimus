@@ -13,6 +13,7 @@ import contextlib
 import time
 from collections.abc import Awaitable, Callable
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from optimus.bus import Bus
@@ -136,7 +137,7 @@ class DetectionService:
             idempotency_key=v.idempotency_key,
         )
 
-    async def submit_confirmed_match(self, verdict: VerdictEvent) -> None:
+    async def submit_confirmed_match(self, verdict: VerdictEvent) -> int:
         """Persist and publish a verdict that is already known to be a match.
 
         For moderator-confirmed reviews of historical messages (e.g. a message
@@ -149,15 +150,17 @@ class DetectionService:
         verdict, going through :meth:`_persist`'s same idempotent-insert
         savepoint so a redelivered/duplicate submission is still a safe no-op.
         """
-        await self._persist(DetectionResult(verdict=verdict))
+        detection_id = await self._persist(DetectionResult(verdict=verdict))
         await self._bus.publish(SUBJECT_VERDICT, verdict, msg_id=verdict.idempotency_key)
+        return detection_id
 
-    async def _persist(self, result: DetectionResult) -> None:
+    async def _persist(self, result: DetectionResult) -> int:
         v = result.verdict
         async with self._scope(v.guild_id) as session:
             repo = DetectionRepository(session, v.guild_id)
-            if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
-                return
+            existing = await repo.get_by_idempotency_key(v.idempotency_key)
+            if existing is not None:
+                return existing.id
             # The insert runs in a savepoint so a unique-constraint loss only
             # rolls back the failed row, not the surrounding transaction.
             # Concurrent redelivery can race two replicas past the read-check;
@@ -166,9 +169,16 @@ class DetectionService:
             # would redeliver a message whose row already exists, forever).
             try:
                 async with session.begin_nested():
-                    await repo.record(self._row(v))
+                    detection = await repo.record(self._row(v))
             except IntegrityError:
-                pass
+                # Another replica won the idempotency race. Read its row so
+                # callers can still bind an action to the exact detection.
+                detection = (
+                    await session.execute(
+                        select(Detection).where(Detection.idempotency_key == v.idempotency_key)
+                    )
+                ).scalar_one()
+            return detection.id
 
     async def _persist_and_enqueue(self, result: DetectionResult) -> None:
         """Persist the detection and stage its bus messages in one transaction.

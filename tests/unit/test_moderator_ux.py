@@ -74,8 +74,14 @@ class MockDeps:
     async def last_detection(self, guild_id: int) -> dict[str, Any] | None:
         return self._last
 
-    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> None:
+    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> bool:
+        detail = self._detail
+        if detail is not None and detail["detection_id"] == detection_id:
+            if detail.get("action") == "reversed":
+                return False
+            detail["action"] = "reversed"
         self.reversed.append(detection_id)
+        return True
 
     async def audit(
         self, guild_id: int, actor_id: int, action: str, *, target: str | None = None
@@ -117,8 +123,9 @@ class MockDeps:
         self.hashes[gh.hash_id] = gh
         return gh
 
-    async def submit_confirmed_scam(self, guild_id: int, **kwargs: Any) -> None:
+    async def submit_confirmed_scam(self, guild_id: int, **kwargs: Any) -> int:
         self.confirmed_scams.append({"guild_id": guild_id, **kwargs})
+        return 42
 
     async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
         pass
@@ -338,6 +345,7 @@ async def test_reviewmsg_with_intel_attaches_undo_and_dismiss_buttons() -> None:
     assert resp.i18n_key == "command.reviewmsg_result_with_intel"
     assert len(resp.components) == 2
     assert resp.components[0].label == "Undo"
+    assert resp.components[0].custom_id == "om:mod:undo:42:0"
     assert resp.components[1].label == "Dismiss"
 
 
@@ -357,10 +365,34 @@ async def test_mod_button_undo_reverses_last_detection() -> None:
     from optimus.services.interactions.handlers import handle_mod_button
     from optimus.services.interactions.logic import ModAction, ParsedModId
 
-    deps = MockDeps(last={"detection_id": 42, "verdict": "scam", "action_taken": "delete"})
+    deps = MockDeps(
+        detail={"detection_id": 42, "verdict": "scam", "action": "delete"},
+        last={"detection_id": 999, "verdict": "scam", "action": "delete"},
+    )
     ctx = _ctx(sub="", command="")
-    parsed = ParsedModId(action=ModAction.UNDO, channel_id=0, message_id=0)
+    parsed = ParsedModId(action=ModAction.UNDO, channel_id=42, message_id=0)
     resp = await handle_mod_button(ctx, parsed, deps)
     assert resp.i18n_key == "command.undo_done"
+    assert deps.reversed == [42]
+    assert len(deps.audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_mod_button_undo_is_message_bound_and_idempotent() -> None:
+    from optimus.services.interactions.handlers import handle_mod_button
+    from optimus.services.interactions.logic import ModAction, ParsedModId
+
+    deps = MockDeps(
+        detail={"detection_id": 42, "verdict": "scam", "action": "delete"},
+        last={"detection_id": 999, "verdict": "scam", "action": "delete"},
+    )
+    ctx = _ctx(sub="", command="")
+    parsed = ParsedModId(action=ModAction.UNDO, channel_id=42, message_id=0)
+
+    first = await handle_mod_button(ctx, parsed, deps)
+    second = await handle_mod_button(ctx, parsed, deps)
+
+    assert first.i18n_key == "command.undo_done"
+    assert second.i18n_key == "command.undo_nothing"
     assert deps.reversed == [42]
     assert len(deps.audits) == 1
