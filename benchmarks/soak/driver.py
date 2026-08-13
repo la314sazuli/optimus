@@ -559,7 +559,6 @@ class SoakDriver:
 
     async def run(self) -> SoakSummary:
         tracemalloc.start(25)
-        self._start = time.perf_counter()
         db_path = Path(tempfile.gettempdir()) / "optimus_soak.db"
         for p in (db_path, db_path.with_suffix(".db-wal"), db_path.with_suffix(".db-shm")):
             with suppress(OSError):
@@ -603,6 +602,10 @@ class SoakDriver:
             await self._scan_image(interactions, data, content_type, hostile=True)
             self.hostile_sent += 1
 
+        # OCR/QR hostile preflight is deliberately serial and CPU-heavy.  It
+        # validates fixture safety before the run, but is not sustained traffic;
+        # start the run clock only once the mixed lanes are ready.
+        self._start = time.perf_counter()
         stop = asyncio.Event()
         lanes = [
             asyncio.create_task(self._traffic_lane(app, stop)),

@@ -297,6 +297,12 @@ class InProcessBus:
                 try:
                     await consumer.handler(delivery.event)
                 except Exception:
+                    _log.exception(
+                        "bus_handler_failed",
+                        subject=subject,
+                        durable=consumer.durable,
+                        deliveries=delivery.deliveries,
+                    )
                     return self._on_handler_failure(consumer, delivery)
             MESSAGES_ACKED.labels(subject=subject).inc()
             return False
@@ -316,5 +322,5 @@ class InProcessBus:
                 deliveries=delivery.deliveries,
             )
             return False
-        _log.warning("bus_handler_failed", subject=subject, deliveries=delivery.deliveries)
+        _log.warning("bus_handler_redelivering", subject=subject, deliveries=delivery.deliveries)
         return True
