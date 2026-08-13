@@ -311,6 +311,23 @@ class DetectionRepository:
         await self._session.flush()
         return cast("CursorResult[Any]", result).rowcount or 0
 
+    async def reverse_action_once(self, detection_id: int) -> bool:
+        """Mark a detection reversed once; reject duplicate undo clicks."""
+        from sqlalchemy import update
+
+        stmt = (
+            update(Detection)
+            .where(
+                Detection.guild_id == self._guild_id,
+                Detection.id == detection_id,
+                Detection.action_taken != "reversed",
+            )
+            .values(action_taken="reversed")
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return (cast("CursorResult[Any]", result).rowcount or 0) == 1
+
     async def count_in_window(self, start: datetime, end: datetime) -> int:
         """Count detections created in ``[start, end)`` for this guild."""
         stmt = select(func.count()).where(

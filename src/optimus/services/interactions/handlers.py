@@ -120,7 +120,7 @@ class InteractionDeps(Protocol):
     async def open_appeal(self, guild_id: int, detection_id: int, user_id: int) -> int: ...
     async def get_appeal(self, guild_id: int, appeal_id: int) -> dict[str, Any] | None: ...
     async def resolve_appeal(self, guild_id: int, appeal_id: int, *, approved: bool) -> None: ...
-    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> None: ...
+    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> bool: ...
     async def disable_safe_mode(self, guild_id: int) -> None: ...
     async def local_hash(self, guild_id: int, hash_id: str) -> GuildHash | None: ...
     async def hash_rate_ok(self, user_id: int) -> bool: ...
@@ -172,7 +172,7 @@ class InteractionDeps(Protocol):
         attachment_id: int,
         uploader_id: int,
         matched_hash_id: str,
-    ) -> None:
+    ) -> int:
         """Record a moderator-confirmed scam match and run the moderation pipeline.
 
         Feeds the same ``verdict.v1`` path a live detection would, so the
@@ -415,17 +415,20 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     # each iteration is fast and the write lock is held for close to the
     # minimum time actually needed.
     added_hash_ids: list[str] = []
+    detection_ids: list[int] = []
     for attachment_id, hashes in computed:
         stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
         added_hash_ids.append(stored.hash_id)
         await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
-        await deps.submit_confirmed_scam(
-            ctx.guild_id,
-            channel_id=channel_id,
-            message_id=message_id,
-            attachment_id=attachment_id,
-            uploader_id=author_id,
-            matched_hash_id=stored.hash_id,
+        detection_ids.append(
+            await deps.submit_confirmed_scam(
+                ctx.guild_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                attachment_id=attachment_id,
+                uploader_id=author_id,
+                matched_hash_id=stored.hash_id,
+            )
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
@@ -450,7 +453,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                 "author_id": author_id,
                 "intel": "\n".join(parts),
             },
-            components=_review_intel_buttons(),
+            components=_review_intel_buttons(detection_ids[-1]),
         )
     return InteractionResponse(
         "command.reviewmsg_result",
@@ -851,10 +854,10 @@ def _scan_buttons(ctx: InteractionContext) -> tuple[ButtonDef, ...]:
     )
 
 
-def _review_intel_buttons() -> tuple[ButtonDef, ...]:
+def _review_intel_buttons(detection_id: int) -> tuple[ButtonDef, ...]:
     """Buttons for reviewmsg results that found intel: undo or dismiss."""
     return (
-        ButtonDef("Undo", BTN_DANGER, encode_mod_id(ModAction.UNDO, 0, 0)),
+        ButtonDef("Undo", BTN_DANGER, encode_mod_id(ModAction.UNDO, detection_id, 0)),
         ButtonDef("Dismiss", BTN_SECONDARY, encode_mod_id(ModAction.DISMISS, 0, 0)),
     )
 
@@ -875,10 +878,14 @@ async def handle_mod_button(
         return InteractionResponse("button.dismissed")
 
     if parsed.action is ModAction.UNDO:
-        detail = await deps.last_detection(ctx.guild_id)
+        # For UNDO, channel_id carries the detection id and message_id is zero.
+        # Resolve it in this guild before mutation: a delayed or forged click
+        # can never fall back to undoing an unrelated latest detection.
+        detail = await deps.detection_detail(ctx.guild_id, parsed.channel_id)
         if detail is None:
             return InteractionResponse("command.undo_nothing")
-        await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"])
+        if not await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"]):
+            return InteractionResponse("command.undo_nothing")
         await deps.audit(
             ctx.guild_id,
             ctx.user_id,

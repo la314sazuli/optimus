@@ -268,6 +268,10 @@ class DbDeps:
         if not recent:
             return None
         d = recent[0]
+        return self._detection_dict(d)
+
+    @staticmethod
+    def _detection_dict(d: Any) -> dict[str, Any]:
         min_dist = min(d.distances.values()) if d.distances else None
         return {
             "detection_id": d.id,
@@ -306,9 +310,9 @@ class DbDeps:
         row.status = "approved" if approved else "denied"
         await self._session.flush()
 
-    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> None:
+    async def reverse_detection_action(self, guild_id: int, detection_id: int) -> bool:
         repo = DetectionRepository(self._session, guild_id)
-        await repo.set_action_taken(detection_id, "reversed")
+        return await repo.reverse_action_once(detection_id)
 
     async def disable_safe_mode(self, guild_id: int) -> None:
         await GuildRepository(self._session).set_safe_mode(guild_id, False)
@@ -398,10 +402,10 @@ class DbDeps:
         attachment_id: int,
         uploader_id: int,
         matched_hash_id: str,
-    ) -> None:
+    ) -> int:
         if self._detection is None:  # pragma: no cover - always wired at app startup
             _log.warning("reviewmsg_no_detection_service", guild_id=guild_id)
-            return
+            return 0
         idempotency_key = f"reviewmsg:{guild_id}:{message_id}:{attachment_id}"
         verdict = VerdictEvent(
             correlation_id=get_correlation_id() or idempotency_key,
@@ -416,7 +420,7 @@ class DbDeps:
             confidence=1.0,
             matched_hash_id=matched_hash_id,
         )
-        await self._detection.submit_confirmed_match(verdict)
+        return await self._detection.submit_confirmed_match(verdict)
 
 
 class InteractionService:
@@ -813,6 +817,9 @@ async def _resolve_mod_button_message(
         message = await rest.fetch_message(mod.channel_id, mod.message_id)
     except Exception as exc:
         raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND) from exc
+    message_guild_id = getattr(message, "guild_id", None)
+    if ctx.guild_id is None or message_guild_id is None or int(message_guild_id) != ctx.guild_id:
+        raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND)
     return replace(
         ctx,
         command="scamhash",
