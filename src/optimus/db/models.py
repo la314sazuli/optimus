@@ -143,6 +143,7 @@ class GuildHash(Base):
     source: Mapped[str] = mapped_column(String(32), default="local", nullable=False)
     added_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    campaign_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[datetime] = _ts()
 
 

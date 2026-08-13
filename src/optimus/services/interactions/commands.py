@@ -144,6 +144,10 @@ COMMANDS: tuple[Command, ...] = (
                 name="help",
                 description="Show a quick reference for moderators.",
             ),
+            SubCommand(
+                name="campaigns",
+                description="Show active scam campaigns (groups of similar image variants).",
+            ),
         ),
     ),
     Command(

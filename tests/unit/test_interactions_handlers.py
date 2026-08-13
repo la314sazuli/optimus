@@ -188,6 +188,15 @@ class FakeDeps:
             }
         )
 
+    async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
+        pass
+
+    async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
+        return []
+
+    async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
+        return []
+
 
 class _FakeGlobalService:
     """Minimal stand-in for :class:`GlobalHashService` used by submit_global."""
@@ -768,7 +777,10 @@ async def test_reviewmsg_single_attachment_hashes_and_actions_author() -> None:
         _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
     )
     assert resp.i18n_key == "command.reviewmsg_result"
-    assert resp.params == {"added": 1, "failed": 0, "author_id": 333}
+    assert resp.params["added"] == 1
+    assert resp.params["failed"] == 0
+    assert resp.params["author_id"] == 333
+    assert "campaign" in resp.params
     assert len(deps.confirmed_scams) == 1
     assert deps.confirmed_scams[0]["uploader_id"] == 333
     assert deps.confirmed_scams[0]["attachment_id"] == 1
