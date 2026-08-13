@@ -6,6 +6,7 @@ import asyncio
 import random
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from optimus.services.scheduler.service import jittered_interval, run_periodic
 
@@ -64,3 +65,18 @@ async def test_run_periodic_exits_immediately_when_prestopped() -> None:
 
     await run_periodic("t", 100.0, job, stop=stop, jitter_fraction=0.0)
     assert runs["n"] == 0
+
+
+async def test_run_periodic_retries_a_transient_sqlite_lock() -> None:
+    stop = asyncio.Event()
+    runs = {"n": 0}
+
+    async def job() -> int:
+        runs["n"] += 1
+        if runs["n"] == 1:
+            raise OperationalError("DELETE", {}, Exception("database is locked"))
+        stop.set()
+        return 0
+
+    await run_periodic("t", 0.001, job, stop=stop, jitter_fraction=0.0)
+    assert runs["n"] == 2

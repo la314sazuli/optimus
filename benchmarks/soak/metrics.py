@@ -34,6 +34,9 @@ CSV_COLUMNS = [
     "q_verdict",
     "images_sent",
     "images_acked",
+    "intel_sent",
+    "intel_safe",
+    "hostile_safe",
     "p50_ms",
     "p95_ms",
     "p99_ms",
@@ -103,6 +106,9 @@ class Sample:
     q_verdict: int
     images_sent: int
     images_acked: int
+    intel_sent: int
+    intel_safe: int
+    hostile_safe: int
     p50_ms: float
     p95_ms: float
     p99_ms: float
@@ -129,6 +135,9 @@ class Sample:
             str(self.q_verdict),
             str(self.images_sent),
             str(self.images_acked),
+            str(self.intel_sent),
+            str(self.intel_safe),
+            str(self.hostile_safe),
             f"{self.p50_ms:.3f}",
             f"{self.p95_ms:.3f}",
             f"{self.p99_ms:.3f}",

@@ -3,7 +3,9 @@ the message-review command."""
 
 from __future__ import annotations
 
+import asyncio
 import io
+import time
 
 import numpy as np
 import pytest
@@ -89,3 +91,34 @@ async def test_hash_attachment_rejects_undecodable_data() -> None:
         await hash_attachment(
             _fetch_ok(b"not an image at all"), attachment_id=1, url="https://x/i.png"
         )
+
+
+@pytest.mark.asyncio
+async def test_hash_attachment_offloads_ocr_and_qr_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Slow image intelligence must not stall the asyncio event loop."""
+    import optimus.services.interactions.attachment_hash as attachment_hash
+
+    data = _png_bytes(np.zeros((64, 64, 3), dtype=np.uint8))
+
+    def _slow_analysis(_: bytes) -> dict[str, object]:
+        time.sleep(0.2)
+        return {
+            "lookalikes": [],
+            "signals": [],
+            "risk_level": "none",
+        }
+
+    def _slow_qr(_: bytes) -> list[str]:
+        time.sleep(0.2)
+        return []
+
+    monkeypatch.setattr(attachment_hash, "analyze_image", _slow_analysis)
+    monkeypatch.setattr(attachment_hash, "extract_qr_urls", _slow_qr)
+
+    task = asyncio.create_task(
+        hash_attachment(_fetch_ok(data), attachment_id=1, url="https://x/i.png")
+    )
+    started = time.perf_counter()
+    await asyncio.sleep(0.02)
+    assert time.perf_counter() - started < 0.1
+    await task

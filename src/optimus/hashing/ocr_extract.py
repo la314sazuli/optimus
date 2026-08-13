@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -127,7 +128,10 @@ _DEFANG_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-_MAX_OCR_DIM = 4000  # skip OCR on absurdly large images
+# OCR is a moderator-preview aid, so keeping it responsive matters more than
+# preserving full-resolution detail.  This bounds the amount of work passed to
+# each Tesseract invocation even for a valid (but hostile) large image.
+_MAX_OCR_DIM = 1600
 
 
 def _preprocess_variants(img: np.ndarray) -> list[np.ndarray]:
@@ -165,14 +169,18 @@ def _preprocess_variants(img: np.ndarray) -> list[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 _MIN_CONFIDENCE = 50  # drop tokens below this confidence
+_OCR_TOTAL_TIMEOUT_SECONDS = 3.0
 
 
-def _ocr_confident_text(img: np.ndarray) -> str:
+def _ocr_confident_text(img: np.ndarray, *, timeout: float) -> str:
     """Run OCR with per-word confidence filtering via image_to_data."""
     import pytesseract
 
     data = pytesseract.image_to_data(
-        img, output_type=pytesseract.Output.DICT, config="--oem 3 --psm 6"
+        img,
+        output_type=pytesseract.Output.DICT,
+        config="--oem 3 --psm 6",
+        timeout=timeout,
     )
     lines: dict[int, list[str]] = {}
     for i, conf in enumerate(data["conf"]):
@@ -182,11 +190,11 @@ def _ocr_confident_text(img: np.ndarray) -> str:
     return "\n".join(" ".join(words) for words in lines.values()).strip()
 
 
-def _ocr_simple(img: np.ndarray) -> str:
+def _ocr_simple(img: np.ndarray, *, timeout: float) -> str:
     """Fallback: plain image_to_string without confidence data."""
     import pytesseract
 
-    return str(pytesseract.image_to_string(img, config="--oem 3 --psm 11")).strip()
+    return str(pytesseract.image_to_string(img, config="--oem 3 --psm 11", timeout=timeout)).strip()
 
 
 def extract_text(image_bytes: bytes) -> str:
@@ -196,6 +204,7 @@ def extract_text(image_bytes: bytes) -> str:
     low-confidence tokens. Returns empty on any failure.
     """
     try:
+        started = time.monotonic()
         arr = np.frombuffer(image_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
@@ -204,10 +213,16 @@ def extract_text(image_bytes: bytes) -> str:
         seen: set[str] = set()
         combined: list[str] = []
         for v in variants:
+            remaining = _OCR_TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started)
+            if remaining <= 0:
+                break
             try:
-                text = _ocr_confident_text(v)
+                text = _ocr_confident_text(v, timeout=remaining)
             except Exception:
-                text = _ocr_simple(v)
+                remaining = _OCR_TOTAL_TIMEOUT_SECONDS - (time.monotonic() - started)
+                if remaining <= 0:
+                    break
+                text = _ocr_simple(v, timeout=remaining)
             if text and text not in seen:
                 seen.add(text)
                 combined.append(text)
