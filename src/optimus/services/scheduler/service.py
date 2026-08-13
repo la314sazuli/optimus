@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from prometheus_client import Counter, Gauge
+from sqlalchemy.exc import OperationalError
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.elements import TextClause
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
 from optimus.contracts.events import SUBJECT_INDEX_INVALIDATE, IndexInvalidateEvent
+from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.lifecycle import install_signal_handlers
@@ -52,6 +54,29 @@ LAST_RUN = Gauge(
     "Unix timestamp of the last successful run per task.",
     ["task"],
 )
+_SQLITE_LOCK_RETRY = BackoffPolicy(base=0.05, multiplier=2.0, max_delay=0.5, max_attempts=5)
+
+
+class _NonRetryableDbError(Exception):
+    """Sentinel to keep the retry helper from retrying unrelated DB failures."""
+
+
+async def _retry_transient_lock(job: Callable[[], Awaitable[int]]) -> int:
+    """Retry SQLite's transient writer collision, not unrelated DB failures."""
+
+    async def attempt() -> int:
+        try:
+            return await job()
+        except OperationalError as exc:
+            if "database is locked" not in str(exc.orig).lower():
+                raise _NonRetryableDbError from exc
+            raise
+
+    try:
+        return await retry_async(attempt, _SQLITE_LOCK_RETRY, retry_on=(OperationalError,))
+    except _NonRetryableDbError as exc:
+        assert exc.__cause__ is not None
+        raise exc.__cause__ from None
 
 
 def jittered_interval(base: float, fraction: float, rng: random.Random | None = None) -> float:
@@ -86,7 +111,7 @@ async def run_periodic(
         if stop.is_set():
             break
         try:
-            affected = await job()
+            affected = await _retry_transient_lock(job)
         except Exception:
             TASK_RUNS.labels(task=name, outcome="error").inc()
             _log.exception("scheduler_task_failed", task=name)

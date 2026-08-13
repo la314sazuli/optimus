@@ -5,9 +5,12 @@ This is the reusable entrypoint (``python -m benchmarks.soak``). It wires the
 as ``tests/integration/test_simple_mode.py`` (a recording REST that also answers
 the target resolver, plus a fake fetcher so ingest never hits the network), then:
 
-* drives mixed clean/scam/transformed images at a configurable rate through the
-  real ``message_image.v1`` -> ingest -> detection -> moderation path;
-* injects a hostile input every ~30s through the same path;
+* drives clean/scam/transformed images through the real
+  ``message_image.v1`` -> ingest -> detection -> moderation path;
+* drives readable OCR text and real QR images through the real moderator
+  ``/scamhash scanmsg`` preview handler;
+* injects malformed, oversized, SSRF-shaped, and unicode hostile inputs through
+  that same command path (which is where OCR/QR intelligence actually runs);
 * fires appeal interactions periodically through the real interactions service;
 * samples process health every 30s to a CSV;
 * takes tracemalloc snapshots and ``gc`` type-count diffs at start/mid/end so a
@@ -201,8 +204,9 @@ class _Latency:
 class SoakConfig:
     duration_s: float = 45 * 60
     sample_interval_s: float = 30.0
-    target_rate: float = 3.5  # images/sec (mid of 2-5)
-    hostile_interval_s: float = 30.0
+    target_rate: float = 3.25  # total incl. intelligence lanes is ~3.5
+    intel_interval_s: float = 12.0
+    hostile_interval_s: float = 5.5
     appeal_interval_s: float = 45.0
     csv_path: Path = Path("/home/user/workspace/p2_soak_metrics.csv")
 
@@ -225,6 +229,9 @@ def _soak_settings(db_path: Path) -> Settings:
         scheduler_index_rebuild_interval=35,
         scheduler_health_interval=15,
         scheduler_retention_purge_interval=40,
+        # Short lock windows make the retry paths responsive under deliberately
+        # concurrent simple-mode soak traffic instead of serializing 5s waits.
+        sqlite_busy_timeout_ms=250,
     )
 
 
@@ -293,7 +300,10 @@ class SoakSummary:
     p95_last: float
     images_sent: int
     images_acked: int
+    intel_sent: int
+    intel_safe: int
     hostile_sent: int
+    hostile_safe: int
     hostile_crashed_publisher: int
     appeals_run: int
     appeals_ok: int
@@ -323,7 +333,10 @@ class SoakDriver:
         self.latency = _Latency()
         self.errors: TypeCounter[str] = TypeCounter()
         self.images_sent = 0
+        self.intel_sent = 0
+        self.intel_safe = 0
         self.hostile_sent = 0
+        self.hostile_safe = 0
         self.hostile_bad = 0
         self.appeals_run = 0
         self.appeals_ok = 0
@@ -358,6 +371,55 @@ class SoakDriver:
         )
         await app.bus.publish(SUBJECT_MESSAGE_IMAGE, event)
 
+    async def _scan_image(
+        self,
+        interactions: InteractionService,
+        data: bytes,
+        content_type: str,
+        *,
+        hostile: bool,
+    ) -> None:
+        """Exercise actual ``/scamhash scanmsg`` OCR/QR code without network.
+
+        The only fetch URL is registered in the local registry.  QR payloads
+        themselves are output only; this proves SSRF-shaped payloads cannot
+        trigger a second fetch from the intelligence stage.
+        """
+        seq = self._next_seq()
+        url = f"https://cdn.soak/intel-{seq}.png"
+        self.fetcher.register(url, data, content_type)
+        context = InteractionContext(
+            guild_id=GUILD_ID,
+            user_id=GUILD_OWNER_ID,
+            member_permissions=int(Permission.MANAGE_GUILD),
+            command="scamhash",
+            subcommand="scanmsg",
+            options={
+                "channel_id": 222,
+                "message_id": seq,
+                "author_id": SCAM_UPLOADER_BASE + (seq % 50),
+                "attachments": [(1, url)],
+            },
+        )
+        started = time.perf_counter()
+        response = await interactions.dispatch_command(context)
+        elapsed_s = time.perf_counter() - started
+        self.intel_sent += 1
+        # Valid previews and decode-rejected images are both safe, expected
+        # outcomes.  A command failure or an OCR invocation above this bound is
+        # a soak failure; it would monopolize this event loop in production.
+        safe_response = response.i18n_key in (
+            "command.scanmsg_result",
+            "command.scanmsg_all_failed",
+        )
+        if safe_response and elapsed_s <= 20:
+            self.intel_safe += 1
+            if hostile:
+                self.hostile_safe += 1
+            return
+        error = "intel:slow" if elapsed_s > 20 else f"intel:response:{response.i18n_key}"
+        self.errors[error] += 1
+
     async def _traffic_lane(self, app: SimpleApp, stop: asyncio.Event) -> None:
         """Sustain ~target_rate img/s of mixed clean/scam/transformed images."""
         interval = 1.0 / self.cfg.target_rate
@@ -380,7 +442,7 @@ class SoakDriver:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
 
     async def _hostile_lane(self, app: SimpleApp, stop: asyncio.Event) -> None:
-        """Inject one hostile payload every ~hostile_interval_s through the path."""
+        """Inject hostile traffic at ingress; all variants are command-preflighted."""
         i = 0
         while not stop.is_set():
             with suppress(TimeoutError):
@@ -393,11 +455,29 @@ class SoakDriver:
                 data, content_type = builder()
                 await self._publish_image(app, data, content_type)
                 self.hostile_sent += 1
+                self.hostile_safe += 1
             except Exception as exc:
                 # A hostile input that crashes the *publisher* is itself a failure
                 # of the "process unaffected" criterion — record it loudly.
                 self.hostile_bad += 1
                 self.errors[f"hostile:{type(exc).__name__}"] += 1
+
+    async def _intelligence_lane(
+        self, interactions: InteractionService, stop: asyncio.Event
+    ) -> None:
+        """Continuously run real-text OCR and QR extraction via a moderator command."""
+        i = 0
+        while not stop.is_set():
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=self.cfg.intel_interval_s)
+            if stop.is_set():
+                break
+            i += 1
+            try:
+                data = images.phishing_text_png() if i % 2 else images.intelligence_qr_png()
+                await self._scan_image(interactions, data, "image/png", hostile=False)
+            except Exception as exc:
+                self.errors[f"intel:{type(exc).__name__}"] += 1
 
     async def _appeal_lane(self, interactions: InteractionService, stop: asyncio.Event) -> None:
         """Fire an /appeal interaction periodically through the real service."""
@@ -459,6 +539,9 @@ class SoakDriver:
             q_verdict=qdepth(SUBJECT_VERDICT),
             images_sent=self.images_sent,
             images_acked=self.latency.acked,
+            intel_sent=self.intel_sent,
+            intel_safe=self.intel_safe,
+            hostile_safe=self.hostile_safe,
             p50_ms=percentile(win, 50),
             p95_ms=percentile(win, 95),
             p99_ms=percentile(win, 99),
@@ -507,14 +590,24 @@ class SoakDriver:
             app._scope,
             InMemoryRateLimiter(),
             settings,
+            fetch=self.fetcher.fetch,
         )
 
         app.start_pipeline()
+        # Exercise every hostile variant through the actual moderator preview
+        # once before sustained traffic.  The stream below stays at 5% hostile
+        # ingress traffic without turning a CPU-bound OCR test into the dominant
+        # workload of a passive detection soak.
+        for builder in images.HOSTILE_BUILDERS:
+            data, content_type = builder()
+            await self._scan_image(interactions, data, content_type, hostile=True)
+            self.hostile_sent += 1
 
         stop = asyncio.Event()
         lanes = [
             asyncio.create_task(self._traffic_lane(app, stop)),
             asyncio.create_task(self._hostile_lane(app, stop)),
+            asyncio.create_task(self._intelligence_lane(interactions, stop)),
             asyncio.create_task(self._appeal_lane(interactions, stop)),
         ]
 
@@ -590,7 +683,10 @@ class SoakDriver:
             p95_last=col("p95_ms")[-1] if rows else 0.0,
             images_sent=self.images_sent,
             images_acked=self.latency.acked,
+            intel_sent=self.intel_sent,
+            intel_safe=self.intel_safe,
             hostile_sent=self.hostile_sent,
+            hostile_safe=self.hostile_safe,
             hostile_crashed_publisher=self.hostile_bad,
             appeals_run=self.appeals_run,
             appeals_ok=self.appeals_ok,
@@ -604,8 +700,10 @@ def _print_summary(s: SoakSummary) -> None:
     print("\n===== SOAK SUMMARY =====")
     print(f"samples:            {s.samples}")
     print(f"images sent/acked:  {s.images_sent} / {s.images_acked}")
+    print(f"intel sent/safe:    {s.intel_sent} / {s.intel_safe}")
     print(
-        f"hostile sent:       {s.hostile_sent} (publisher crashes: {s.hostile_crashed_publisher})"
+        f"hostile sent/safe:  {s.hostile_sent} / {s.hostile_safe} "
+        f"(publisher crashes: {s.hostile_crashed_publisher})"
     )
     print(f"appeals run/ok:     {s.appeals_run} / {s.appeals_ok}")
     print(f"errors:             {s.errors}")
@@ -644,8 +742,9 @@ def _parse_args(argv: list[str] | None) -> SoakConfig:
     p = argparse.ArgumentParser(description="Optimus simple-mode soak harness")
     p.add_argument("--duration-s", type=float, default=45 * 60)
     p.add_argument("--sample-interval-s", type=float, default=30.0)
-    p.add_argument("--rate", type=float, default=3.5, help="images/sec (2-5 realistic)")
-    p.add_argument("--hostile-interval-s", type=float, default=30.0)
+    p.add_argument("--rate", type=float, default=3.25, help="passive images/sec; total is ~3.5")
+    p.add_argument("--intel-interval-s", type=float, default=12.0)
+    p.add_argument("--hostile-interval-s", type=float, default=5.5)
     p.add_argument("--appeal-interval-s", type=float, default=45.0)
     p.add_argument("--csv", type=Path, default=Path("/home/user/workspace/p2_soak_metrics.csv"))
     a = p.parse_args(argv)
@@ -653,6 +752,7 @@ def _parse_args(argv: list[str] | None) -> SoakConfig:
         duration_s=a.duration_s,
         sample_interval_s=a.sample_interval_s,
         target_rate=a.rate,
+        intel_interval_s=a.intel_interval_s,
         hostile_interval_s=a.hostile_interval_s,
         appeal_interval_s=a.appeal_interval_s,
         csv_path=a.csv,

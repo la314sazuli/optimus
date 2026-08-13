@@ -15,6 +15,7 @@ already-configured fetch function, matching the pattern used by
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -77,16 +78,32 @@ async def hash_attachment(
         fetched = await fetch(url)
     except (SSRFError, FetchError) as exc:
         raise AttachmentHashError(f"could not fetch attachment: {exc}") from exc
+    return await asyncio.to_thread(
+        _hash_fetched_attachment,
+        fetched.data,
+        attachment_id=attachment_id,
+        url=url,
+        limits=limits,
+    )
 
-    decoded = decode(fetched.data, limits)
+
+def _hash_fetched_attachment(
+    data: bytes,
+    *,
+    attachment_id: int,
+    url: str,
+    limits: DecodeLimits | None,
+) -> AttachmentHashes:
+    """CPU/subprocess image intelligence performed outside the event loop."""
+    decoded = decode(data, limits)
     if decoded is None or not decoded.frames:
         raise AttachmentHashError("attachment could not be decoded as a supported image")
 
     frame = decoded.frames[0]
     direct = perceptual.compute_all(frame)
     mirror = perceptual.compute_all_mirror(frame)
-
-    analysis = analyze_image(fetched.data)
+    analysis = analyze_image(data)
+    qr_urls = extract_qr_urls(data)
     return AttachmentHashes(
         attachment_id=attachment_id,
         url=url,
@@ -98,7 +115,7 @@ async def hash_attachment(
         mdhash=mirror["dhash"],
         mwhash=mirror["whash"],
         mahash=mirror["ahash"],
-        qr_urls=extract_qr_urls(fetched.data),
+        qr_urls=qr_urls,
         ocr_lookalikes=analysis["lookalikes"],
         ocr_signals=analysis["signals"],
         ocr_risk_level=analysis["risk_level"],
