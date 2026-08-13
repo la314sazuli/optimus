@@ -127,6 +127,15 @@ class MockDeps:
         self.confirmed_scams.append({"guild_id": guild_id, **kwargs})
         return 42
 
+    async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
+        pass
+
+    async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
+        return []
+
+    async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
+        return []
+
 
 # --- color mapping -----------------------------------------------------------
 

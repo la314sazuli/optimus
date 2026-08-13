@@ -422,6 +422,25 @@ class DbDeps:
         )
         return await self._detection.submit_confirmed_match(verdict)
 
+    async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
+        repo = GuildHashRepository(self._session, guild_id)
+        await repo.set_campaign_id(hash_id, campaign_id)
+
+    async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
+        repo = GuildHashRepository(self._session, guild_id)
+        return list(await repo.list_campaigns())
+
+    async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
+        from sqlalchemy import select
+
+        stmt = select(GuildHash.campaign_id, GuildHash.phash).where(
+            GuildHash.guild_id == guild_id,
+            GuildHash.campaign_id.is_not(None),
+            GuildHash.status == "active",
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [(r[0], r[1]) for r in rows]
+
 
 class InteractionService:
     """Routes hikari interactions through the pure handlers within a DB scope."""

@@ -22,6 +22,12 @@ from typing import Any, Protocol
 from optimus.core.logging import get_logger
 from optimus.db.models import GuildHash, GuildWhitelist
 from optimus.globaldb.service import GlobalHashService, SubmissionDenied
+from optimus.hashing.campaign import (
+    campaign_color,
+    find_campaign,
+    new_campaign_id,
+    summarize_campaigns,
+)
 from optimus.services.interactions.attachment_hash import (
     AttachmentHashError,
     AttachmentHashes,
@@ -181,6 +187,18 @@ class InteractionDeps(Protocol):
         """
         ...
 
+    async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
+        """Associate a hash with a campaign."""
+        ...
+
+    async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
+        """Return (campaign_id, member_count) for active campaigns with 2+ members."""
+        ...
+
+    async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
+        """Return (campaign_id, phash) for all active hashes with a campaign_id."""
+        ...
+
 
 def _require(ctx: InteractionContext, permission: Permission | None) -> None:
     """Enforce guild-only + server-side permission, raising on failure."""
@@ -307,6 +325,16 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         )
     if sub == "help":
         return InteractionResponse("command.help_text")
+    if sub == "campaigns":
+        campaigns = await deps.list_campaigns(ctx.guild_id)
+        if not campaigns:
+            return InteractionResponse("command.campaigns_empty")
+        lines = summarize_campaigns(campaigns)
+        return InteractionResponse(
+            "command.campaigns_result",
+            {"count": len(campaigns), "entries": "\n".join(lines)},
+            color=campaign_color(campaigns[0][1]),
+        )
     if sub == "explain":
         detection_id = int(ctx.options["detection_id"])
         detail = await deps.detection_detail(ctx.guild_id, detection_id)
@@ -416,9 +444,17 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     # minimum time actually needed.
     added_hash_ids: list[str] = []
     detection_ids: list[int] = []
+    campaign_note = ""
     for attachment_id, hashes in computed:
         stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
         added_hash_ids.append(stored.hash_id)
+        # Campaign detection: check if this hash is a variant of an existing scam.
+        existing = await deps.list_campaign_hashes(ctx.guild_id)
+        campaign_id = find_campaign(hashes.phash, existing) if existing else None
+        if campaign_id is None:
+            campaign_id = new_campaign_id()
+        await deps.link_campaign(ctx.guild_id, stored.hash_id, campaign_id)
+        campaign_note = f"Part of campaign `{campaign_id}`."
         await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
         detection_ids.append(
             await deps.submit_confirmed_scam(
@@ -452,12 +488,18 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                 "failed": failed,
                 "author_id": author_id,
                 "intel": "\n".join(parts),
+                "campaign": campaign_note,
             },
             components=_review_intel_buttons(detection_ids[-1]),
         )
     return InteractionResponse(
         "command.reviewmsg_result",
-        {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
+        {
+            "added": len(added_hash_ids),
+            "failed": failed,
+            "author_id": author_id,
+            "campaign": campaign_note,
+        },
     )
 
 

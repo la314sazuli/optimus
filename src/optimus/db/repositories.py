@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, delete, func, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.db.models import (
@@ -109,6 +110,32 @@ class GuildHashRepository:
         result = await self._session.execute(stmt)
         await self._session.flush()
         return cast("CursorResult[Any]", result).rowcount or 0
+
+    async def set_campaign_id(self, hash_id: str, campaign_id: str) -> None:
+        """Link a hash to a campaign."""
+        stmt = (
+            sa_update(GuildHash)
+            .where(GuildHash.guild_id == self._guild_id, GuildHash.hash_id == hash_id)
+            .values(campaign_id=campaign_id)
+        )
+        await self._session.execute(stmt)
+        await self._session.flush()
+
+    async def list_campaigns(self) -> Sequence[tuple[str, int]]:
+        """Return (campaign_id, member_count) for campaigns with 2+ members."""
+        stmt = (
+            select(GuildHash.campaign_id, func.count().label("n"))
+            .where(
+                GuildHash.guild_id == self._guild_id,
+                GuildHash.campaign_id.is_not(None),
+                GuildHash.status == "active",
+            )
+            .group_by(GuildHash.campaign_id)
+            .having(func.count() >= 2)
+            .order_by(func.count().desc())
+        )
+        rows = (await self._session.execute(stmt)).all()
+        return [(r[0], r[1]) for r in rows]
 
 
 class WhitelistRepository:
