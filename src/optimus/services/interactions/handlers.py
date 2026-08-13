@@ -31,8 +31,11 @@ from optimus.services.interactions.logic import (
     CommandError,
     ComponentAction,
     InteractionRejected,
+    ModAction,
+    ParsedModId,
     Permission,
     build_export,
+    encode_mod_id,
     has_permission,
     parse_hash_hex,
     validate_config_set,
@@ -50,6 +53,11 @@ COLOR_RED = 0xE74C3C  # errors, actions taken
 COLOR_YELLOW = 0xF1C40F  # warnings, intel found, preview
 COLOR_GREEN = 0x2ECC71  # success, undo, safe
 COLOR_GRAY = 0x95A5A6  # info, config, help, explain
+
+# hikari.ButtonStyle values (kept as ints so handlers stay hikari-free).
+BTN_SUCCESS = 3
+BTN_SECONDARY = 2
+BTN_DANGER = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +85,17 @@ class InteractionResponse:
     #: Discord embed color (0xRRGGBB). When set, the response is rendered
     #: as a colored embed instead of plain text.
     color: int | None = None
+    #: Moderator action buttons attached to the response.
+    components: tuple[ButtonDef, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ButtonDef:
+    """A hikari-free button description for the glue layer to render."""
+
+    label: str
+    style: int  # hikari.ButtonStyle
+    custom_id: str
 
 
 class InteractionDeps(Protocol):
@@ -431,6 +450,7 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
                 "author_id": author_id,
                 "intel": "\n".join(parts),
             },
+            components=_review_intel_buttons(),
         )
     return InteractionResponse(
         "command.reviewmsg_result",
@@ -506,7 +526,11 @@ async def _scan_message(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         parts.append(f"\n**Phishing signals ({risk_level} risk):**\n" + ", ".join(signals))
     if not qr_urls and not lookalikes and not signals:
         parts.append("No threats detected.")
-    return InteractionResponse("command.scanmsg_result", {"summary": " ".join(parts)})
+    return InteractionResponse(
+        "command.scanmsg_result",
+        {"summary": " ".join(parts)},
+        components=_scan_buttons(ctx),
+    )
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
@@ -808,5 +832,59 @@ async def handle_component(
         # would be immediately deleted; the purge is the audited event itself.
         await deps.purge_guild(ctx.guild_id)
         return InteractionResponse("command.delete_server_ok")
+
+    raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
+
+
+# --- Moderator action buttons (scanmsg / reviewmsg follow-ups) ---
+
+
+def _scan_buttons(ctx: InteractionContext) -> tuple[ButtonDef, ...]:
+    """Buttons for scanmsg preview results: promote to scam or dismiss."""
+    channel_id = int(ctx.options["channel_id"])
+    message_id = int(ctx.options["message_id"])
+    return (
+        ButtonDef(
+            "Add as scam", BTN_SUCCESS, encode_mod_id(ModAction.ADD_SCAM, channel_id, message_id)
+        ),
+        ButtonDef("Dismiss", BTN_SECONDARY, encode_mod_id(ModAction.DISMISS, 0, 0)),
+    )
+
+
+def _review_intel_buttons() -> tuple[ButtonDef, ...]:
+    """Buttons for reviewmsg results that found intel: undo or dismiss."""
+    return (
+        ButtonDef("Undo", BTN_DANGER, encode_mod_id(ModAction.UNDO, 0, 0)),
+        ButtonDef("Dismiss", BTN_SECONDARY, encode_mod_id(ModAction.DISMISS, 0, 0)),
+    )
+
+
+async def handle_mod_button(
+    ctx: InteractionContext, parsed: ParsedModId, deps: InteractionDeps
+) -> InteractionResponse:
+    """Handle a moderator action button press (undo / dismiss).
+
+    ``ADD_SCAM`` is handled in the glue layer (``run_interaction``) because it
+    needs REST access to re-fetch the target message; this handler only covers
+    the pure-DB actions.
+    """
+    _require(ctx, Permission.MANAGE_GUILD)
+    assert ctx.guild_id is not None
+
+    if parsed.action is ModAction.DISMISS:
+        return InteractionResponse("button.dismissed")
+
+    if parsed.action is ModAction.UNDO:
+        detail = await deps.last_detection(ctx.guild_id)
+        if detail is None:
+            return InteractionResponse("command.undo_nothing")
+        await deps.reverse_detection_action(ctx.guild_id, detail["detection_id"])
+        await deps.audit(
+            ctx.guild_id,
+            ctx.user_id,
+            "scamhash.undo",
+            target=str(detail["detection_id"]),
+        )
+        return InteractionResponse("command.undo_done", detail)
 
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover

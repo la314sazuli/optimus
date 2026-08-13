@@ -83,6 +83,7 @@
     "appeal_approved": "Žalba je odobrena i mera je poništena.",
     "appeal_denied": "Žalba je odbijena.",
     "expired": "Ova interakcija više nije važeća.",
-    "not_permitted": "Nemate dozvolu za to."
+    "not_permitted": "Nemate dozvolu za to.",
+    "dismissed": "Odbaceno."
   }
 }

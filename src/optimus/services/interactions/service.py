@@ -18,6 +18,7 @@ handler failure rolls back cleanly and never leaks a half-applied state change.
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -54,17 +55,23 @@ from optimus.services.interactions.attachment_hash import (
     hash_attachment,
 )
 from optimus.services.interactions.handlers import (
+    BTN_DANGER,
+    BTN_SECONDARY,
+    BTN_SUCCESS,
     COLOR_RED,
     InteractionContext,
     InteractionResponse,
     handle_command,
     handle_component,
+    handle_mod_button,
     handle_review_button,
 )
 from optimus.services.interactions.logic import (
     CommandError,
     InteractionRejected,
+    ModAction,
     decode_component_id,
+    decode_mod_id,
 )
 from optimus.services.moderation.review import decode_custom_id
 
@@ -454,6 +461,9 @@ class InteractionService:
                 ctx.guild_id,
                 lambda deps: handle_component(ctx, component.action, component.ref_id, deps),
             )
+        mod = decode_mod_id(custom_id)
+        if mod is not None:
+            return await self._run(ctx.guild_id, lambda deps: handle_mod_button(ctx, mod, deps))
         return InteractionResponse("button.expired")
 
     #: Bounded retry budget for interactions that hit a transient SQLite
@@ -719,8 +729,8 @@ def to_context(interaction: Any) -> InteractionContext:
 
 async def run_interaction(  # pragma: no cover - hikari glue
     service: InteractionService, interaction: Any
-) -> tuple[str, int | None]:
-    """Handle one interaction end-to-end and return (content, embed_color)."""
+) -> tuple[str, int | None, list[object]]:
+    """Handle one interaction end-to-end and return (content, embed_color, components)."""
     import hikari
 
     with correlation_context():
@@ -736,15 +746,21 @@ async def run_interaction(  # pragma: no cover - hikari glue
             elif isinstance(interaction, hikari.ComponentInteraction):
                 ctx = _component_context(interaction)
                 locale = ctx.locale
-                response = await service.dispatch_button(ctx, interaction.custom_id)
+                mod = decode_mod_id(interaction.custom_id)
+                if mod is not None and mod.action is ModAction.ADD_SCAM:
+                    ctx = await _resolve_mod_button_message(ctx, mod, interaction.app.rest)
+                    ctx = replace(ctx, command="scamhash", subcommand="reviewmsg")
+                    response = await service.dispatch_command(ctx)
+                else:
+                    response = await service.dispatch_button(ctx, interaction.custom_id)
             else:
-                return "", None
+                return "", None, []
         except InteractionRejected as rejected:
-            return error_message(rejected.reason, locale), COLOR_RED
+            return error_message(rejected.reason, locale), COLOR_RED, []
         except Exception:
             _log.exception("interaction_failed")
-            return translate("button.expired", locale), None
-        return render(response, locale), response.color
+            return translate("button.expired", locale), None, []
+    return render(response, locale), response.color, _build_component_rows(response.components)
 
 
 async def respond_to_interaction(service: InteractionService, interaction: Any) -> None:
@@ -764,15 +780,15 @@ async def respond_to_interaction(service: InteractionService, interaction: Any) 
         _log.exception("interaction_defer_failed", **log_context)
         return
 
-    message, color = await run_interaction(service, interaction)
+    message, color, components = await run_interaction(service, interaction)
     if not message:
         return
     try:
         if color is not None:
             embed = hikari.Embed(description=message, color=color)
-            await interaction.edit_initial_response(embed=embed)
+            await interaction.edit_initial_response(embed=embed, components=components or None)
         else:
-            await interaction.edit_initial_response(message)
+            await interaction.edit_initial_response(message, components=components or None)
     except Exception:
         _log.exception("interaction_edit_failed", **log_context)
 
@@ -787,6 +803,48 @@ def _component_context(interaction: Any) -> InteractionContext:  # pragma: no co
         command="",
         locale=str(getattr(interaction, "locale", "en") or "en"),
     )
+
+
+async def _resolve_mod_button_message(
+    ctx: InteractionContext, mod: Any, rest: Any
+) -> InteractionContext:  # pragma: no cover - hikari glue
+    """Fetch the target message for an ``ADD_SCAM`` mod button press."""
+    try:
+        message = await rest.fetch_message(mod.channel_id, mod.message_id)
+    except Exception as exc:
+        raise InteractionRejected(CommandError.MESSAGE_NOT_FOUND) from exc
+    return replace(
+        ctx,
+        command="scamhash",
+        subcommand="reviewmsg",
+        options={
+            "channel_id": int(message.channel_id),
+            "message_id": int(message.id),
+            "author_id": int(message.author.id),
+            "attachments": _image_attachments(message.attachments),
+        },
+    )
+
+
+_STYLE_MAP = {BTN_SUCCESS: 3, BTN_SECONDARY: 2, BTN_DANGER: 4}
+
+
+def _build_component_rows(buttons: tuple[Any, ...]) -> list[object]:
+    """Convert ``ButtonDef`` tuples into hikari action rows."""
+    if not buttons:
+        return []
+    import hikari
+
+    row = hikari.impl.MessageActionRowBuilder()
+    for btn in buttons:
+        style = hikari.ButtonStyle(_STYLE_MAP.get(btn.style, 2))
+        if style == hikari.ButtonStyle.SUCCESS:
+            row.add_interactive_button(hikari.ButtonStyle.SUCCESS, btn.custom_id, label=btn.label)
+        elif style == hikari.ButtonStyle.DANGER:
+            row.add_interactive_button(hikari.ButtonStyle.DANGER, btn.custom_id, label=btn.label)
+        else:
+            row.add_interactive_button(hikari.ButtonStyle.SECONDARY, btn.custom_id, label=btn.label)
+    return [row]
 
 
 def build_rate_limiter(settings: Settings, redis: object | None) -> RateLimiter:

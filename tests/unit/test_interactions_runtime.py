@@ -29,11 +29,11 @@ async def test_interaction_is_deferred_before_dispatch_then_edited(
 
     async def run_interaction(
         service: object, received_interaction: object
-    ) -> tuple[str, int | None]:
+    ) -> tuple[str, int | None, list[object]]:
         assert events == ["defer"]
         assert received_interaction is interaction
         events.append("dispatch")
-        return RESPONSE_MESSAGE, None
+        return RESPONSE_MESSAGE, None, []
 
     monkeypatch.setattr(interaction_service, "run_interaction", run_interaction)
 
@@ -44,4 +44,4 @@ async def test_interaction_is_deferred_before_dispatch_then_edited(
         hikari.ResponseType.DEFERRED_MESSAGE_CREATE,
         flags=hikari.MessageFlag.EPHEMERAL,
     )
-    interaction.edit_initial_response.assert_awaited_once_with(RESPONSE_MESSAGE)
+    interaction.edit_initial_response.assert_awaited_once_with(RESPONSE_MESSAGE, components=None)

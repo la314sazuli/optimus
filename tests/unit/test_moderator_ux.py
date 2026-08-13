@@ -54,6 +54,10 @@ class MockDeps:
         self._last: dict[str, Any] | None = flags.get("last")
         self._attachment_outcomes: dict[int, Any] = flags.get("attachment_outcomes", {})
         self.stored_hashes: list[AttachmentHashes] = []
+        self._hash_rate_ok = flags.get("hash_rate_ok", True)
+
+    async def hash_rate_ok(self, user_id: int) -> bool:
+        return self._hash_rate_ok
 
     async def list_guild_hashes(self, guild_id: int) -> list[GuildHash]:
         return list(self.hashes.values())
@@ -238,7 +242,7 @@ async def test_scamhash_undo_by_id_not_found_falls_back_to_nothing() -> None:
 def _scan_ctx(attachments: list[tuple[int, str]]) -> InteractionContext:
     return _ctx(
         sub="scanmsg",
-        options={"author_id": 333, "attachments": attachments},
+        options={"author_id": 333, "attachments": attachments, "channel_id": 99, "message_id": 88},
     )
 
 
@@ -293,3 +297,61 @@ async def test_scamhash_scanmsg_all_failed() -> None:
     assert resp.i18n_key == "command.scanmsg_all_failed"
     assert resp.params == {"failed": 2}
     assert deps.stored_hashes == []
+
+
+# --- moderator action buttons -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scanmsg_attaches_add_scam_and_dismiss_buttons() -> None:
+    deps = MockDeps()
+    resp = await handle_command(_scan_ctx([(1, "https://x/1.png")]), deps)
+    assert len(resp.components) == 2
+    assert resp.components[0].label == "Add as scam"
+    assert resp.components[1].label == "Dismiss"
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_with_intel_attaches_undo_and_dismiss_buttons() -> None:
+    deps = MockDeps(
+        attachment_outcomes={1: {"qr_urls": ["https://evil.example"], "lookalikes": []}}
+    )
+    ctx = _ctx(
+        sub="reviewmsg",
+        options={
+            "author_id": 333,
+            "attachments": [(1, "https://x/1.png")],
+            "channel_id": 99,
+            "message_id": 88,
+        },
+    )
+    resp = await handle_command(ctx, deps)
+    assert resp.i18n_key == "command.reviewmsg_result_with_intel"
+    assert len(resp.components) == 2
+    assert resp.components[0].label == "Undo"
+    assert resp.components[1].label == "Dismiss"
+
+
+@pytest.mark.asyncio
+async def test_mod_button_dismiss_returns_acknowledgment() -> None:
+    from optimus.services.interactions.handlers import handle_mod_button
+    from optimus.services.interactions.logic import ModAction, ParsedModId
+
+    ctx = _ctx(sub="", command="")
+    parsed = ParsedModId(action=ModAction.DISMISS, channel_id=0, message_id=0)
+    resp = await handle_mod_button(ctx, parsed, MockDeps())
+    assert resp.i18n_key == "button.dismissed"
+
+
+@pytest.mark.asyncio
+async def test_mod_button_undo_reverses_last_detection() -> None:
+    from optimus.services.interactions.handlers import handle_mod_button
+    from optimus.services.interactions.logic import ModAction, ParsedModId
+
+    deps = MockDeps(last={"detection_id": 42, "verdict": "scam", "action_taken": "delete"})
+    ctx = _ctx(sub="", command="")
+    parsed = ParsedModId(action=ModAction.UNDO, channel_id=0, message_id=0)
+    resp = await handle_mod_button(ctx, parsed, deps)
+    assert resp.i18n_key == "command.undo_done"
+    assert deps.reversed == [42]
+    assert len(deps.audits) == 1
