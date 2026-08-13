@@ -144,6 +144,15 @@ class DbDeps:
         self._appeal_cooldown = appeal_cooldown_seconds
         self._fetch = fetch or _default_fetch(settings)
         self._detection = detection
+        #: Confirmed-scam verdicts persisted in this request's transaction but
+        #: not yet published to the moderation bus. :meth:`InteractionService._run`
+        #: publishes these only after the transaction commits -- publishing
+        #: earlier would let the moderation consumer (which opens its own DB
+        #: session) act on -- and write audit rows for -- a verdict whose row
+        #: can still roll back, and its writes would block on this
+        #: transaction's SQLite write lock exactly like the self-deadlock this
+        #: design removes.
+        self.pending_verdicts: list[VerdictEvent] = []
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         return await GuildHashRepository(self._session, guild_id).add(gh)
@@ -347,7 +356,14 @@ class DbDeps:
             confidence=1.0,
             matched_hash_id=matched_hash_id,
         )
-        await self._detection.submit_confirmed_match(verdict)
+        # Persist through THIS request's session -- the transaction already
+        # holds SQLite's write lock (store_attachment_hash flushed an INSERT
+        # moments ago), so `submit_confirmed_match`, which opens a second
+        # session, would block on our own lock until busy_timeout and raise
+        # "database is locked": a self-deadlock every retry reproduces
+        # identically. The bus publish is deferred until after commit.
+        await self._detection.persist_confirmed_match(self._session, verdict)
+        self.pending_verdicts.append(verdict)
 
 
 class InteractionService:
@@ -430,7 +446,7 @@ class InteractionService:
                         fetch=self._fetch,
                         detection=self._detection,
                     )
-                    return await call(deps)  # type: ignore[no-any-return]
+                    response: InteractionResponse = await call(deps)
             except OperationalError as exc:
                 if not _is_sqlite_lock_error(exc):
                     raise _NonRetryableDbError from exc
@@ -443,6 +459,18 @@ class InteractionService:
                     **diagnostics,
                 )
                 raise
+            # The scope has exited: the transaction is committed and its write
+            # lock released. Only now is it safe to hand confirmed-scam
+            # verdicts to the moderation consumer -- it opens its own DB
+            # sessions, whose writes would have contended with (and under
+            # SQLite's single-writer lock, deadlocked against) the transaction
+            # above. A failed attempt never reaches this line, so a rolled
+            # -back attempt's verdicts are discarded with its deps; the
+            # retry's fresh attempt re-persists them idempotently.
+            if self._detection is not None:
+                for verdict in deps.pending_verdicts:
+                    await self._detection.publish_confirmed_match(verdict)
+            return response
 
         try:
             return await retry_async(

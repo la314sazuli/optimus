@@ -24,7 +24,9 @@ from optimus.core.config import Settings
 from optimus.core.guild_config import GuildConfigCache
 from optimus.core.logging import get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter
+from optimus.core.readiness import shards_check
 from optimus.services.gateway.bot import GATEWAY_INTENTS, GatewayService, shard_start_kwargs
+from optimus.services.gateway.watchdog import GatewayWatchdog
 from optimus.services.interactions.service import InteractionService, respond_to_interaction
 
 if TYPE_CHECKING:
@@ -51,6 +53,17 @@ async def run_discord_edges(  # pragma: no cover - requires a live gateway
 
     bot = hikari.GatewayBot(token=settings.discord_token, intents=GATEWAY_INTENTS)
 
+    # Readiness should track the gateway, not just the DB: a wedged gateway
+    # session (the "commands all time out" incident) previously left /readyz
+    # green because only the database check was registered in simple mode.
+    app.health.add_readiness_check(shards_check(bot), name="shards")
+    watchdog = GatewayWatchdog(
+        bot,
+        app.health,
+        interval_seconds=settings.gateway_watchdog_interval_seconds,
+        stale_exit_seconds=settings.gateway_stale_exit_seconds,
+    )
+
     @bot.listen(hikari.GuildMessageCreateEvent)
     async def _on_message(event: hikari.GuildMessageCreateEvent) -> None:
         await gateway.on_message(event)
@@ -68,8 +81,10 @@ async def run_discord_edges(  # pragma: no cover - requires a live gateway
 
     try:
         await bot.start(**shard_start_kwargs(settings))  # type: ignore[arg-type]
+        watchdog.start()
         await bot.join()
     finally:
+        await watchdog.stop()
         await gateway.drain()
         with contextlib.suppress(Exception):
             await bot.close()

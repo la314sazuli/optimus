@@ -55,6 +55,9 @@ class FakeDeps:
         #: attachment_id -> exception to raise, or a hash_id string to return.
         self._attachment_outcomes: dict[int, Any] = flags.get("attachment_outcomes", {})
         self.confirmed_scams: list[dict[str, Any]] = []
+        #: Extra get_config fields (e.g. action_policy/safe_mode) so reviewmsg
+        #: outcome-reporting tests can drive each policy branch.
+        self.config: dict[str, Any] = {"locale": "en", **flags.get("config", {})}
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         self.hashes[gh.hash_id] = gh
@@ -70,7 +73,7 @@ class FakeDeps:
         return entry
 
     async def get_config(self, guild_id: int) -> dict[str, Any]:
-        return {"locale": "en"}
+        return dict(self.config)
 
     async def set_config_field(self, guild_id: int, field: str, value: Any) -> None:
         self.config_set.append((field, value))
@@ -767,8 +770,8 @@ async def test_reviewmsg_single_attachment_hashes_and_actions_author() -> None:
     resp = await handle_command(
         _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
     )
-    assert resp.i18n_key == "command.reviewmsg_result"
-    assert resp.params == {"added": 1, "failed": 0, "author_id": 333}
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
+    assert resp.params == {"added": 1, "failed": 0, "author_id": 333, "action": "report_only"}
     assert len(deps.confirmed_scams) == 1
     assert deps.confirmed_scams[0]["uploader_id"] == 333
     assert deps.confirmed_scams[0]["attachment_id"] == 1
@@ -781,7 +784,7 @@ async def test_reviewmsg_multiple_attachments_all_succeed() -> None:
     deps = FakeDeps()
     attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
     resp = await handle_command(_review_ctx(attachments=attachments), deps)
-    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
     assert resp.params["added"] == 3
     assert resp.params["failed"] == 0
     assert len(deps.confirmed_scams) == 3
@@ -793,7 +796,7 @@ async def test_reviewmsg_some_attachments_fail_are_skipped() -> None:
     deps = FakeDeps(attachment_outcomes={2: AttachmentHashError("bad image")})
     attachments = [(1, "https://x/1.png"), (2, "https://x/2.png"), (3, "https://x/3.png")]
     resp = await handle_command(_review_ctx(attachments=attachments), deps)
-    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
     assert resp.params["added"] == 2
     assert resp.params["failed"] == 1
     # The failed attachment never reaches the moderation pipeline.
@@ -823,7 +826,7 @@ async def test_reviewmsg_duplicate_hash_is_idempotent() -> None:
     existing = GuildHash(hash_id=f"{1:016x}", phash=1, dhash=1, whash=1, ahash=0, source="local")
     deps.hashes[existing.hash_id] = existing
     resp = await handle_command(_review_ctx(attachments=[(1, "https://x/1.png")]), deps)
-    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
     assert resp.params["added"] == 1
     assert len(deps.confirmed_scams) == 1
     assert deps.confirmed_scams[0]["matched_hash_id"] == existing.hash_id
@@ -885,6 +888,44 @@ async def test_reviewmsg_computes_all_hashes_before_storing_any() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reviewmsg_reply_reports_configured_action_when_policy_acts() -> None:
+    """With an acting policy the reply must state the queued action -- and with
+    a non-acting config the reply must never claim the author was "actioned".
+    The old unconditional reviewmsg_result told moderators the message was
+    handled even on servers whose policy meant the bot deliberately did
+    nothing (the default!), sending them hunting for a delivery bug that was
+    actually a config setting."""
+    deps = FakeDeps(config={"action_policy": "delete_ban"})
+    resp = await handle_command(
+        _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
+    )
+    assert resp.i18n_key == "command.reviewmsg_result_actioned"
+    assert resp.params["action"] == "delete_ban"
+    assert resp.params["author_id"] == 333
+    # The verdict still reaches the pipeline regardless of the reply wording.
+    assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_reply_says_report_only_under_report_only_policy() -> None:
+    deps = FakeDeps(config={"action_policy": "report_only"})
+    resp = await handle_command(_review_ctx(attachments=[(1, "https://x/1.png")]), deps)
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
+    assert resp.params["action"] == "report_only"
+    assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_reply_says_safe_mode_even_with_acting_policy() -> None:
+    """Safe mode overrides the configured action in policy.decide, so the
+    reply must lead with safe mode, not the (suppressed) acting policy."""
+    deps = FakeDeps(config={"action_policy": "delete_ban", "safe_mode": True})
+    resp = await handle_command(_review_ctx(attachments=[(1, "https://x/1.png")]), deps)
+    assert resp.i18n_key == "command.reviewmsg_result_safe_mode"
+    assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
 async def test_context_menu_review_message_routes_to_shared_core() -> None:
     """The context-menu entry point (``review_message``) shares ``_review_message``
     with the slash command -- both are gated by the same permission and both
@@ -892,7 +933,7 @@ async def test_context_menu_review_message_routes_to_shared_core() -> None:
     deps = FakeDeps()
     ctx = _review_ctx(command="review_message", subcommand=None)
     resp = await handle_command(ctx, deps)
-    assert resp.i18n_key == "command.reviewmsg_result"
+    assert resp.i18n_key == "command.reviewmsg_result_report_only"
     assert len(deps.confirmed_scams) == 1
 
 

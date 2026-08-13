@@ -297,10 +297,27 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         )
     if not added_hash_ids:
         return InteractionResponse("command.reviewmsg_all_failed", {"failed": failed})
-    return InteractionResponse(
-        "command.reviewmsg_result",
-        {"added": len(added_hash_ids), "failed": failed, "author_id": author_id},
-    )
+
+    # Report what the moderation pipeline will actually do with the submitted
+    # verdicts, mirroring optimus.services.moderation.policy.decide for a
+    # confirmed verdict (SCAM, confidence 1.0 -- always clears the auto-act
+    # bar): safe mode and a report_only/none policy both mean "report only,
+    # nothing deleted". The old unconditional "actioned <@user>" reply told a
+    # moderator the message was handled even when the configured policy meant
+    # the bot would deliberately do nothing to it.
+    config = await deps.get_config(ctx.guild_id)
+    policy = str(config.get("action_policy") or "report_only")
+    params: dict[str, Any] = {
+        "added": len(added_hash_ids),
+        "failed": failed,
+        "author_id": author_id,
+        "action": policy,
+    }
+    if bool(config.get("safe_mode", False)):
+        return InteractionResponse("command.reviewmsg_result_safe_mode", params)
+    if policy in ("none", "report_only"):
+        return InteractionResponse("command.reviewmsg_result_report_only", params)
+    return InteractionResponse("command.reviewmsg_result_actioned", params)
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:

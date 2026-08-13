@@ -170,6 +170,21 @@ class Settings(BaseSettings):
     health_host: str = "0.0.0.0"  # noqa: S104 - intended bind for containerized service
     health_port: int = 8080
 
+    # Gateway liveness watchdog (simple mode)
+    #: How often the watchdog samples shard connectivity, in seconds.
+    gateway_watchdog_interval_seconds: float = Field(default=30.0, gt=0)
+    #: How long every shard may stay disconnected before the watchdog declares
+    #: the gateway session dead: it fails ``/healthz`` and triggers a graceful
+    #: process shutdown so the platform's restart policy brings up a fresh
+    #: gateway session. hikari normally reconnects on its own; this is the
+    #: backstop for the observed failure mode where its reconnect loop wedges
+    #: ("Socket has closed" retrying for days) while the process, health
+    #: server, and schedulers all stay "healthy" -- and every slash command
+    #: times out because interactions never arrive. Generous by default (10
+    #: minutes) so an ordinary Discord blip or resume storm never kills the
+    #: process; ``0`` disables the watchdog entirely.
+    gateway_stale_exit_seconds: float = Field(default=600.0, ge=0)
+
     # Ingest
     ingest_max_bytes: int = 10 * 1024 * 1024
     #: Hard cap on the raw image size shipped inline (base64) through NATS in an

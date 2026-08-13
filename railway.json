@@ -1,6 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "overlapSeconds": 0
+    "overlapSeconds": 0,
+    "restartPolicyType": "ALWAYS"
   }
 }

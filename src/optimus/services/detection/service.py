@@ -97,40 +97,75 @@ class DetectionService:
         also miss a hash added in the same request, since :class:`IndexManager`
         caches the guild's index until explicitly invalidated. This method
         skips straight to persistence + publish with the caller-supplied
-        verdict, going through :meth:`_persist`'s same idempotent-insert
-        savepoint so a redelivered/duplicate submission is still a safe no-op.
+        verdict, going through the same idempotent-insert savepoint as live
+        detections so a redelivered/duplicate submission is still a safe no-op.
+
+        .. warning::
+            This opens its **own** DB session. Never call it while another
+            write transaction is open on the same SQLite database: the caller's
+            open transaction holds SQLite's single file-level write lock, so
+            the insert here (on a second pooled connection) blocks on that lock
+            until ``busy_timeout`` expires and raises "database is locked" --
+            a guaranteed self-deadlock, not contention (the exact failure mode
+            that broke ``/scamhash reviewmsg``). From inside a transaction use
+            :meth:`persist_confirmed_match` with the caller's session, then
+            :meth:`publish_confirmed_match` after that transaction commits.
         """
         await self._persist(DetectionResult(verdict=verdict))
+        await self.publish_confirmed_match(verdict)
+
+    async def persist_confirmed_match(self, session: AsyncSession, verdict: VerdictEvent) -> None:
+        """Persist a confirmed verdict inside the **caller's** session/transaction.
+
+        The transactional half of :meth:`submit_confirmed_match`, for callers
+        that are already inside an open write transaction (e.g. the
+        interactions layer, whose whole command runs in one session scope).
+        Writing through the caller's session reuses the write lock that
+        transaction already holds instead of deadlocking against it from a
+        second connection. The caller owns commit/rollback -- and must publish
+        the verdict (:meth:`publish_confirmed_match`) only after the
+        transaction commits, so a bus consumer never observes (or acts on) a
+        verdict whose row could still roll back.
+        """
+        await self._persist_in(session, verdict)
+
+    async def publish_confirmed_match(self, verdict: VerdictEvent) -> None:
+        """Publish an already-persisted confirmed verdict to the moderation bus.
+
+        Deduplicated by ``idempotency_key``, matching :meth:`submit_confirmed_match`.
+        """
         await self._bus.publish(SUBJECT_VERDICT, verdict, msg_id=verdict.idempotency_key)
 
     async def _persist(self, result: DetectionResult) -> None:
-        v = result.verdict
         async with self._scope() as session:
-            repo = DetectionRepository(session, v.guild_id)
-            if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
-                return
-            # The insert runs in a savepoint so a unique-constraint loss only
-            # rolls back the failed row, not the surrounding transaction.
-            # Concurrent redelivery can race two replicas past the read-check;
-            # the loser hits the unique key on idempotency_key. The constraint is
-            # the authority, so we swallow it as a no-op rather than nak (which
-            # would redeliver a message whose row already exists, forever).
-            try:
-                async with session.begin_nested():
-                    await repo.record(
-                        Detection(
-                            guild_id=v.guild_id,
-                            message_id=v.message_id,
-                            channel_id=v.channel_id,
-                            attachment_id=v.attachment_id,
-                            uploader_id=v.uploader_id,
-                            distances=dict(v.distances),
-                            verdict=v.verdict.value,
-                            idempotency_key=v.idempotency_key,
-                        )
+            await self._persist_in(session, result.verdict)
+
+    async def _persist_in(self, session: AsyncSession, v: VerdictEvent) -> None:
+        repo = DetectionRepository(session, v.guild_id)
+        if await repo.get_by_idempotency_key(v.idempotency_key) is not None:
+            return
+        # The insert runs in a savepoint so a unique-constraint loss only
+        # rolls back the failed row, not the surrounding transaction.
+        # Concurrent redelivery can race two replicas past the read-check;
+        # the loser hits the unique key on idempotency_key. The constraint is
+        # the authority, so we swallow it as a no-op rather than nak (which
+        # would redeliver a message whose row already exists, forever).
+        try:
+            async with session.begin_nested():
+                await repo.record(
+                    Detection(
+                        guild_id=v.guild_id,
+                        message_id=v.message_id,
+                        channel_id=v.channel_id,
+                        attachment_id=v.attachment_id,
+                        uploader_id=v.uploader_id,
+                        distances=dict(v.distances),
+                        verdict=v.verdict.value,
+                        idempotency_key=v.idempotency_key,
                     )
-            except IntegrityError:
-                pass
+                )
+        except IntegrityError:
+            pass
 
 
 def build_service(
