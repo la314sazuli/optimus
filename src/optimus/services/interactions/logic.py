@@ -357,7 +357,6 @@ class ModAction(StrEnum):
     """Actions carried in the ``om:mod`` custom-id scheme."""
 
     ADD_SCAM = "add_scam"
-    MARK_SAFE = "mark_safe"
     DISMISS = "dismiss"
     UNDO = "undo"
 

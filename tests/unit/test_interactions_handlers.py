@@ -55,6 +55,7 @@ class FakeDeps:
         #: attachment_id -> exception to raise, or a hash_id string to return.
         self._attachment_outcomes: dict[int, Any] = flags.get("attachment_outcomes", {})
         self.confirmed_scams: list[dict[str, Any]] = []
+        self.campaign_links: dict[str, str] = {}
 
     async def add_guild_hash(self, guild_id: int, gh: GuildHash) -> GuildHash:
         self.hashes[gh.hash_id] = gh
@@ -189,13 +190,17 @@ class FakeDeps:
         )
 
     async def link_campaign(self, guild_id: int, hash_id: str, campaign_id: str) -> None:
-        pass
+        self.campaign_links[hash_id] = campaign_id
 
     async def list_campaigns(self, guild_id: int) -> list[tuple[str, int]]:
         return []
 
     async def list_campaign_hashes(self, guild_id: int) -> list[tuple[str, int]]:
-        return []
+        return [
+            (cid, self.hashes[hash_id].phash)
+            for hash_id, cid in self.campaign_links.items()
+            if hash_id in self.hashes
+        ]
 
 
 class _FakeGlobalService:
@@ -780,7 +785,9 @@ async def test_reviewmsg_single_attachment_hashes_and_actions_author() -> None:
     assert resp.params["added"] == 1
     assert resp.params["failed"] == 0
     assert resp.params["author_id"] == 333
-    assert "campaign" in resp.params
+    # A first, isolated hash starts a campaign silently: no note.
+    assert resp.params["campaign"] == ""
+    assert len(deps.campaign_links) == 1
     assert len(deps.confirmed_scams) == 1
     assert deps.confirmed_scams[0]["uploader_id"] == 333
     assert deps.confirmed_scams[0]["attachment_id"] == 1
@@ -798,6 +805,19 @@ async def test_reviewmsg_multiple_attachments_all_succeed() -> None:
     assert resp.params["failed"] == 0
     assert len(deps.confirmed_scams) == 3
     assert len(deps.hashes) == 3
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_variant_joins_existing_campaign() -> None:
+    # FakeDeps derives phash from the attachment id, so ids 1 and 2 hash to
+    # values 0x1 and 0x2 -- Hamming distance 2, well within the campaign
+    # threshold. The second attachment must join the first one's campaign
+    # and the response must say so.
+    deps = FakeDeps()
+    attachments = [(1, "https://x/1.png"), (2, "https://x/2.png")]
+    resp = await handle_command(_review_ctx(attachments=attachments), deps)
+    assert resp.params["campaign"].startswith(" Variant of campaign")
+    assert len(set(deps.campaign_links.values())) == 1
 
 
 @pytest.mark.asyncio
