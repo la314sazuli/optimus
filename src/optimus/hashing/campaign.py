@@ -3,7 +3,7 @@
 A campaign is a group of scam images that are visually similar (small Hamming
 distance between perceptual hashes) — typically recompressed, resized, or
 watermarked variants of the same source image. Detecting campaigns lets
-modators see coordinated attacks rather than isolated incidents.
+moderators see coordinated attacks rather than isolated incidents.
 """
 
 from __future__ import annotations

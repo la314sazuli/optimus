@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError
 
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
@@ -27,7 +27,6 @@ from optimus.contracts.events import (
     IndexInvalidateEvent,
     VerdictEvent,
 )
-from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.config import Sensitivity, Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.idempotency import IdempotencyGuard
@@ -48,6 +47,7 @@ from optimus.db.repositories import (
     OutboxRepository,
     WhitelistRepository,
 )
+from optimus.db.retry import retry_sqlite_lock
 from optimus.hashing.decoder import DecodeLimits
 from optimus.services.detection.index import HashIndex, IndexManager
 from optimus.services.detection.matcher import WhitelistEntry
@@ -59,11 +59,6 @@ _log = get_logger(__name__)
 
 #: Releases a previously-claimed idempotency key so redelivery can re-run.
 IdempotencyRelease = Callable[[str], Awaitable[None]]
-_SQLITE_LOCK_RETRY = BackoffPolicy(base=0.05, multiplier=2.0, max_delay=0.5, max_attempts=5)
-
-
-class _NonRetryableDbError(Exception):
-    """Sentinel to keep the retry helper from retrying unrelated DB failures."""
 
 
 class DetectionService:
@@ -161,19 +156,7 @@ class DetectionService:
         return detection_id
 
     async def _persist(self, result: DetectionResult) -> int:
-        async def persist_once() -> int:
-            try:
-                return await self._persist_once(result)
-            except OperationalError as exc:
-                if "database is locked" not in str(exc.orig).lower():
-                    raise _NonRetryableDbError from exc
-                raise
-
-        try:
-            return await retry_async(persist_once, _SQLITE_LOCK_RETRY, retry_on=(OperationalError,))
-        except _NonRetryableDbError as exc:
-            assert exc.__cause__ is not None
-            raise exc.__cause__ from None
+        return await retry_sqlite_lock(lambda: self._persist_once(result))
 
     async def _persist_once(self, result: DetectionResult) -> int:
         v = result.verdict

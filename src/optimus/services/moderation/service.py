@@ -15,10 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-
-from sqlalchemy.exc import OperationalError
 
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
@@ -33,7 +30,6 @@ from optimus.contracts.events import (
     SwarmAlertEvent,
     VerdictEvent,
 )
-from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.circuit import CircuitBreaker
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
@@ -54,6 +50,7 @@ from optimus.db.repositories import (
     GuildRepository,
     ModActionRepository,
 )
+from optimus.db.retry import retry_sqlite_lock
 from optimus.services.moderation.actions import ActionExecutor, ActionResult
 from optimus.services.moderation.boundaries import TargetContext
 from optimus.services.moderation.cooldown import Cooldown
@@ -65,31 +62,11 @@ _log = get_logger(__name__)
 
 #: Audit actor id used when the system (not a human moderator) acts.
 SYSTEM_ACTOR = 0
-_SQLITE_LOCK_RETRY = BackoffPolicy(base=0.05, multiplier=2.0, max_delay=0.5, max_attempts=5)
 
 
-class _NonRetryableDbError(Exception):
-    """Sentinel to prevent retrying an unrelated database operational error."""
-
-
-async def _retry_transient_lock(operation: Callable[[], Awaitable[int | None]]) -> int | None:
-    """Retry only a brief SQLite writer collision around moderation persistence."""
-
-    async def attempt() -> int | None:
-        try:
-            return await operation()
-        except OperationalError as exc:
-            if "database is locked" not in str(exc.orig).lower():
-                raise _NonRetryableDbError from exc
-            _log.warning("moderation_db_locked_retry")
-            record_db_lock_retry("moderation")
-            raise
-
-    try:
-        return await retry_async(attempt, _SQLITE_LOCK_RETRY, retry_on=(OperationalError,))
-    except _NonRetryableDbError as exc:
-        assert exc.__cause__ is not None
-        raise exc.__cause__ from None
+def _on_lock_retry() -> None:
+    _log.warning("moderation_db_locked_retry")
+    record_db_lock_retry("moderation")
 
 
 class ModerationService:
@@ -251,7 +228,7 @@ def build_coordinator(
                 )
                 return detection.id
 
-        return await _retry_transient_lock(persist_once)
+        return await retry_sqlite_lock(persist_once, on_retry=_on_lock_retry)
 
     coordinator = ModerationCoordinator(
         config=config,

@@ -448,13 +448,13 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
     for attachment_id, hashes in computed:
         stored = await deps.store_attachment_hash(ctx.guild_id, hashes=hashes, added_by=ctx.user_id)
         added_hash_ids.append(stored.hash_id)
-        # Campaign detection: check if this hash is a variant of an existing scam.
+        # Campaign detection: link every hash so future variants can match it,
+        # but only announce a campaign when this hash joins an existing one.
         existing = await deps.list_campaign_hashes(ctx.guild_id)
-        campaign_id = find_campaign(hashes.phash, existing) if existing else None
-        if campaign_id is None:
-            campaign_id = new_campaign_id()
-        await deps.link_campaign(ctx.guild_id, stored.hash_id, campaign_id)
-        campaign_note = f"Part of campaign `{campaign_id}`."
+        matched = find_campaign(hashes.phash, existing) if existing else None
+        await deps.link_campaign(ctx.guild_id, stored.hash_id, matched or new_campaign_id())
+        if matched is not None:
+            campaign_note = f" Variant of campaign `{matched}`."
         await deps.audit(ctx.guild_id, ctx.user_id, "scamhash.reviewmsg", target=stored.hash_id)
         detection_ids.append(
             await deps.submit_confirmed_scam(
