@@ -1,6 +1,7 @@
 """Tests for OCR text extraction, URL extraction, and domain lookalike detection."""
 
 from optimus.hashing.ocr_extract import (
+    analyze_image,
     extract_urls,
     is_lookalike,
     normalize_domain,
@@ -37,6 +38,24 @@ def test_normalize_domain_lowercases():
 
 def test_normalize_domain_handles_bare_domain():
     assert normalize_domain("perplexity.ai") == "perplexity.ai"
+
+
+def test_normalize_domain_uses_hostname_not_userinfo():
+    assert normalize_domain("https://openai.com@evil.example/path") == "evil.example"
+
+
+def test_normalize_domain_returns_empty_for_invalid_idna():
+    assert normalize_domain("https://\u202eopenai.com.example") == ""
+
+
+def test_analyze_image_ignores_invalid_idna_domain(monkeypatch):
+    monkeypatch.setattr(
+        "optimus.hashing.ocr_extract.extract_text",
+        lambda _: "Claim now at https://\u202eopenai.com.example",
+    )
+    analysis = analyze_image(b"ignored")
+    assert analysis["urls"] == ["https://\u202eopenai.com.example"]
+    assert analysis["lookalikes"] == []
 
 
 def test_lookalike_exact_match_is_safe():

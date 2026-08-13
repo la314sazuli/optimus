@@ -93,14 +93,14 @@ async def test_compute_attachment_hashes_never_touches_the_session() -> None:
     assert hashes.attachment_id == 1
 
 
-async def test_two_reviews_do_not_serialize_on_the_slow_fetch_phase() -> None:
+async def test_two_reviews_do_not_serialize_on_the_slow_fetch_phase(tmp_path: Any) -> None:
     """Two 'requests' each computing an attachment hash concurrently (slow
     fetch, no DB) must both make progress in parallel -- proving the slow
     phase carries no lock that could serialize them -- and each can then
     independently complete its fast DB-only store phase against a real
     file-backed SQLite database without contending on the other's slow fetch.
     """
-    engine: AsyncEngine = create_engine("sqlite+aiosqlite://")
+    engine: AsyncEngine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'reviewmsg-lock.db'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = create_session_factory(engine)
