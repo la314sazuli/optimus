@@ -346,3 +346,45 @@ def decode_component_id(custom_id: str) -> ParsedComponentId | None:
     except ValueError:
         return None
     return ParsedComponentId(action=action, ref_id=ref_id)
+
+
+# --- Moderator action buttons (scanmsg / reviewmsg follow-ups) ---
+
+_MOD_PREFIX = "om:mod"
+
+
+class ModAction(StrEnum):
+    """Actions carried in the ``om:mod`` custom-id scheme."""
+
+    ADD_SCAM = "add_scam"
+    MARK_SAFE = "mark_safe"
+    DISMISS = "dismiss"
+    UNDO = "undo"
+
+
+def encode_mod_id(action: ModAction, channel_id: int, message_id: int) -> str:
+    """Build an ``om:mod:<action>:<channel_id>:<message_id>`` custom id."""
+    return f"{_MOD_PREFIX}:{action.value}:{channel_id}:{message_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedModId:
+    """A decoded moderator-action component custom id."""
+
+    action: ModAction
+    channel_id: int
+    message_id: int
+
+
+def decode_mod_id(custom_id: str) -> ParsedModId | None:
+    """Parse a mod-action custom id; ``None`` if not one of ours."""
+    parts = custom_id.split(":")
+    if len(parts) != 5 or f"{parts[0]}:{parts[1]}" != _MOD_PREFIX:
+        return None
+    try:
+        action = ModAction(parts[2])
+        channel_id = int(parts[3])
+        message_id = int(parts[4])
+    except ValueError:
+        return None
+    return ParsedModId(action=action, channel_id=channel_id, message_id=message_id)

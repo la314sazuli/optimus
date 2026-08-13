@@ -83,6 +83,7 @@
     "appeal_approved": "The appeal has been approved and the action reversed.",
     "appeal_denied": "The appeal has been denied.",
     "expired": "This interaction is no longer valid.",
-    "not_permitted": "You do not have permission to do that."
+    "not_permitted": "You do not have permission to do that.",
+    "dismissed": "Dismissed."
   }
 }
