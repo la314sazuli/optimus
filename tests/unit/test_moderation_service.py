@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import fakeredis.aioredis
 import pytest
 import pytest_asyncio
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.ext.asyncio import AsyncSession as _Session
 
@@ -164,6 +165,40 @@ async def test_build_coordinator_config_and_audit_persist_detection(
     assert len(mod_actions) == 1
     assert mod_actions[0].action == "report_only"
     assert mod_actions[0].target == "42"
+    await redis.aclose()
+
+
+async def test_build_coordinator_retries_a_transient_lock_in_moderation_audit(
+    scope: SessionScope,
+) -> None:
+    """The verdict handler must not redeliver for a brief SQLite writer collision."""
+    async with scope() as s:
+        s.add(Guild(guild_id=7, action_policy="delete_ban", mod_queue_threshold=0.5))
+
+    calls = 0
+
+    @asynccontextmanager
+    async def flaky_scope(guild_id: int | None = None) -> AsyncIterator[_Session]:
+        nonlocal calls
+        calls += 1
+        # The config lookup is first; fail the first audit transaction instead.
+        if calls == 2:
+            raise OperationalError("UPDATE detections", {}, Exception("database is locked"))
+        async with scope(guild_id) as session:
+            yield session
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    coordinator, _dispatcher = build_coordinator(
+        get_settings(), flaky_scope, rest=object(), redis=redis, bot_user_id=999
+    )
+
+    result = await coordinator.handle_verdict(_verdict())
+
+    assert result.action is Action.REPORT_ONLY
+    assert calls == 3  # config, failed audit, retried audit
+    async with scope() as s:
+        assert len((await s.execute(Detection.__table__.select())).fetchall()) == 1
+        assert len((await s.execute(ModAction.__table__.select())).fetchall()) == 1
     await redis.aclose()
 
 

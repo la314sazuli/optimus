@@ -23,6 +23,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic_core import PydanticSerializationError
 
+from optimus.bus import inprocess
 from optimus.bus.inprocess import InProcessBus
 
 
@@ -192,6 +193,46 @@ async def test_handler_failure_redelivers_then_drops() -> None:
     assert attempts == 3
 
     await _drain(stop, task)
+
+
+async def test_handler_failure_logs_exception_with_delivery_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeLog:
+        def exception(self, message: str, **fields: object) -> None:
+            calls.append((message, fields))
+
+        def warning(self, _message: str, **_fields: object) -> None:
+            return None
+
+    monkeypatch.setattr(inprocess, "_log", FakeLog())
+    bus = InProcessBus()
+
+    async def handler(_evt: _Evt) -> None:
+        raise RuntimeError("trace me")
+
+    stop = asyncio.Event()
+    task = await _consume_in_task(
+        bus,
+        stop,
+        subject="events.verdict.v1",
+        durable="moderation",
+        model=_Evt,
+        handler=handler,
+        max_deliver=1,
+    )
+    await bus.publish("events.verdict.v1", _Evt())
+    await _run_until(lambda: len(calls) == 1)
+    await _drain(stop, task)
+
+    assert calls == [
+        (
+            "bus_handler_failed",
+            {"subject": "events.verdict.v1", "durable": "moderation", "deliveries": 1},
+        )
+    ]
 
 
 async def test_successful_handler_delivered_once() -> None:

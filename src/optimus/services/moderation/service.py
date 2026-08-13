@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+
+from sqlalchemy.exc import OperationalError
 
 from optimus.bus import Bus
 from optimus.bus.nats import EventBus
@@ -30,11 +33,13 @@ from optimus.contracts.events import (
     SwarmAlertEvent,
     VerdictEvent,
 )
+from optimus.core.backoff import BackoffPolicy, retry_async
 from optimus.core.circuit import CircuitBreaker
 from optimus.core.config import Settings, get_settings
 from optimus.core.health import HealthServer
 from optimus.core.lifecycle import install_signal_handlers
 from optimus.core.logging import configure_logging, get_logger
+from optimus.core.metrics import record_db_lock_retry
 from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit, RateLimiter, RedisRateLimiter
 from optimus.core.readiness import db_check, nats_check, redis_check
 from optimus.db.engine import (
@@ -60,6 +65,31 @@ _log = get_logger(__name__)
 
 #: Audit actor id used when the system (not a human moderator) acts.
 SYSTEM_ACTOR = 0
+_SQLITE_LOCK_RETRY = BackoffPolicy(base=0.05, multiplier=2.0, max_delay=0.5, max_attempts=5)
+
+
+class _NonRetryableDbError(Exception):
+    """Sentinel to prevent retrying an unrelated database operational error."""
+
+
+async def _retry_transient_lock(operation: Callable[[], Awaitable[int | None]]) -> int | None:
+    """Retry only a brief SQLite writer collision around moderation persistence."""
+
+    async def attempt() -> int | None:
+        try:
+            return await operation()
+        except OperationalError as exc:
+            if "database is locked" not in str(exc.orig).lower():
+                raise _NonRetryableDbError from exc
+            _log.warning("moderation_db_locked_retry")
+            record_db_lock_retry("moderation")
+            raise
+
+    try:
+        return await retry_async(attempt, _SQLITE_LOCK_RETRY, retry_on=(OperationalError,))
+    except _NonRetryableDbError as exc:
+        assert exc.__cause__ is not None
+        raise exc.__cause__ from None
 
 
 class ModerationService:
@@ -195,30 +225,33 @@ def build_coordinator(
         return await _post_report(rest, channel_id, data)
 
     async def audit(event: VerdictEvent, action: str, result: ActionResult) -> int | None:
-        async with scope(event.guild_id) as session:
-            det_repo = DetectionRepository(session, event.guild_id)
-            detection = await det_repo.get_by_idempotency_key(event.idempotency_key)
-            if detection is None:
-                detection = await det_repo.record(
-                    Detection(
-                        guild_id=event.guild_id,
-                        message_id=event.message_id,
-                        channel_id=event.channel_id,
-                        attachment_id=event.attachment_id,
-                        uploader_id=event.uploader_id,
-                        distances=dict(event.distances),
-                        verdict=event.verdict.value,
-                        idempotency_key=event.idempotency_key,
+        async def persist_once() -> int | None:
+            async with scope(event.guild_id) as session:
+                det_repo = DetectionRepository(session, event.guild_id)
+                detection = await det_repo.get_by_idempotency_key(event.idempotency_key)
+                if detection is None:
+                    detection = await det_repo.record(
+                        Detection(
+                            guild_id=event.guild_id,
+                            message_id=event.message_id,
+                            channel_id=event.channel_id,
+                            attachment_id=event.attachment_id,
+                            uploader_id=event.uploader_id,
+                            distances=dict(event.distances),
+                            verdict=event.verdict.value,
+                            idempotency_key=event.idempotency_key,
+                        )
                     )
+                await det_repo.set_action_taken(detection.id, action)
+                await ModActionRepository(session, event.guild_id).record(
+                    actor_id=SYSTEM_ACTOR,
+                    action=action,
+                    target=str(event.uploader_id),
+                    payload={"success": result.success, "detail": result.detail},
                 )
-            await det_repo.set_action_taken(detection.id, action)
-            await ModActionRepository(session, event.guild_id).record(
-                actor_id=SYSTEM_ACTOR,
-                action=action,
-                target=str(event.uploader_id),
-                payload={"success": result.success, "detail": result.detail},
-            )
-            return detection.id
+                return detection.id
+
+        return await _retry_transient_lock(persist_once)
 
     coordinator = ModerationCoordinator(
         config=config,
