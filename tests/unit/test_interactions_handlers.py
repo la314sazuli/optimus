@@ -503,28 +503,43 @@ async def test_scamhash_list_non_empty() -> None:
     deps = FakeDeps()
     for hash_id in ("def", "abc"):
         deps.hashes[hash_id] = GuildHash(
-            hash_id=hash_id, phash=1, dhash=2, whash=3, ahash=0, source="local"
+            hash_id=hash_id, phash=1, dhash=2, whash=3, ahash=0, source="local", added_by=42
         )
     resp = await handle_command(_ctx("scamhash", subcommand="list"), deps)
     assert resp.i18n_key == "command.hash_list_header"
-    assert render(resp, "en") == ("This server has 2 scam hash(es):\n- `abc`\n- `def`")
+    # Entries must actually be rendered (the header alone showed an empty list
+    # after the colon in production), sorted, with source and adder attribution.
+    assert render(resp, "en") == (
+        "This server has 2 scam hash(es):\n"
+        "\u2022 `abc` \u2014 local by <@42>\n"
+        "\u2022 `def` \u2014 local by <@42>"
+    )
 
 
 @pytest.mark.asyncio
 async def test_scamhash_list_truncates_to_fit_discord_reply() -> None:
     deps = FakeDeps()
     for value in range(_HASH_LIST_PREVIEW_LIMIT + 1):
-        hash_id = f"{value:016x}"
+        # Worst-case rows: full 64-char hash ids, max-width source column, and
+        # a full-width snowflake mention on every line.
+        hash_id = f"{value:064x}"
         deps.hashes[hash_id] = GuildHash(
-            hash_id=hash_id, phash=value, dhash=0, whash=0, ahash=0, source="local"
+            hash_id=hash_id,
+            phash=value,
+            dhash=0,
+            whash=0,
+            ahash=0,
+            source="x" * 32,
+            added_by=2**63,
         )
 
     resp = await handle_command(_ctx("scamhash", subcommand="list"), deps)
     message = render(resp, "en")
 
     assert resp.i18n_key == "command.hash_list_truncated"
-    assert f"`{_HASH_LIST_PREVIEW_LIMIT - 1:016x}`" in message
-    assert f"`{_HASH_LIST_PREVIEW_LIMIT:016x}`" not in message
+    assert resp.params["count"] == _HASH_LIST_PREVIEW_LIMIT + 1
+    assert f"`{_HASH_LIST_PREVIEW_LIMIT - 1:064x}`" in message
+    assert f"`{_HASH_LIST_PREVIEW_LIMIT:064x}`" not in message
     assert "1 more" in message
     assert len(message) <= 2000
 
@@ -610,6 +625,7 @@ def test_every_config_view_field_is_settable_under_the_same_name(field: str) -> 
         "action_policy": "report_only",
         "mod_queue_threshold": "0.5",
         "review_channel": "none",
+        "ban_purge_hours": "24",
         "safe_mode": "false",
         "retention_days": "30",
         "locale": "en",
@@ -668,6 +684,7 @@ async def test_stats_non_empty() -> None:
     resp = await handle_command(_ctx("stats"), FakeDeps())
     assert resp.i18n_key == "command.stats_header"
     assert resp.params["hours"] == 24
+    assert "detections" in resp.params  # header renders a body, not a bare colon
 
 
 # --- submit_global -------------------------------------------------------------

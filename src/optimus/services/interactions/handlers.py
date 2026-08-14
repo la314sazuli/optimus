@@ -45,9 +45,10 @@ from optimus.services.moderation.review import ParsedCustomId, ReviewAction
 
 _log = get_logger(__name__)
 
-#: Keep ``/scamhash list`` safely below Discord's 2,000-character message
-#: limit even if every stored hash id uses the column's full 64 characters.
-_HASH_LIST_PREVIEW_LIMIT = 20
+#: Keep ``/scamhash list`` safely below Discord's 2,000-character message limit
+#: even if every rendered line maxes out (64-char hash id, 32-char source, and
+#: a full-width ``by <@user>`` mention ≈ 130 chars per line).
+_HASH_LIST_PREVIEW_LIMIT = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,15 +194,14 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         rows = await deps.list_guild_hashes(ctx.guild_id)
         if not rows:
             return InteractionResponse("command.hash_list_empty")
-        hash_ids = sorted(row.hash_id for row in rows)
-        visible_hashes = hash_ids[:_HASH_LIST_PREVIEW_LIMIT]
+        shown = sorted(rows, key=lambda r: r.hash_id)[:_HASH_LIST_PREVIEW_LIMIT]
         params: dict[str, Any] = {
-            "count": len(hash_ids),
-            "hashes": "\n".join(f"- `{hash_id}`" for hash_id in visible_hashes),
+            "count": len(rows),
+            "hashes": "\n".join(_render_hash_entry(r) for r in shown),
         }
-        if len(hash_ids) <= _HASH_LIST_PREVIEW_LIMIT:
+        if len(rows) <= _HASH_LIST_PREVIEW_LIMIT:
             return InteractionResponse("command.hash_list_header", params)
-        params["remaining"] = len(hash_ids) - len(visible_hashes)
+        params["remaining"] = len(rows) - len(shown)
         return InteractionResponse("command.hash_list_truncated", params)
     if sub == "import":
         entries = validate_import(str(ctx.options["file"]))
@@ -219,6 +219,12 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
     if sub == "reviewmsg":
         return await _review_message(ctx, deps)
     raise InteractionRejected(CommandError.UNKNOWN_FIELD)  # pragma: no cover
+
+
+def _render_hash_entry(row: GuildHash) -> str:
+    """One display line per hash: id, source, and who added it (when known)."""
+    added_by = f" by <@{row.added_by}>" if row.added_by is not None else ""
+    return f"\u2022 `{row.hash_id}` \u2014 {row.source}{added_by}"
 
 
 async def _cmd_review_message(
@@ -364,6 +370,7 @@ _CONFIG_VIEW_ORDER = (
     "action_policy",
     "mod_queue_threshold",
     "review_channel",
+    "ban_purge_hours",
     "safe_mode",
     "retention_days",
     "locale",
@@ -412,7 +419,10 @@ async def _cmd_stats(ctx: InteractionContext, deps: InteractionDeps) -> Interact
     summary = await deps.stats_summary(ctx.guild_id)
     if not summary or summary.get("detections", 0) == 0:
         return InteractionResponse("command.stats_empty")
-    return InteractionResponse("command.stats_header", {"hours": summary.get("hours", 24)})
+    return InteractionResponse(
+        "command.stats_header",
+        {"hours": summary.get("hours", 24), "detections": summary.get("detections", 0)},
+    )
 
 
 async def _cmd_submit_global(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:

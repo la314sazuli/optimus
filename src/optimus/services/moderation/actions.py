@@ -74,7 +74,9 @@ class RestActions(Protocol):
 
     async def kick_member(self, guild_id: int, user_id: int, reason: str) -> None: ...
 
-    async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None: ...
+    async def ban_member(
+        self, guild_id: int, user_id: int, reason: str, purge_seconds: int = 0
+    ) -> None: ...
 
     async def unban_member(self, guild_id: int, user_id: int, reason: str) -> None: ...
 
@@ -95,6 +97,10 @@ class ActionRequest:
     locale: str = "en"
     timeout_seconds: int = 3600
     reason: str = "Automated scam-image removal"
+    #: Discord-native "delete message history" window applied with a ban: the
+    #: banned user's messages from the last N seconds are purged in ALL
+    #: channels (like the manual ban dialog). 0 disables the purge.
+    ban_purge_seconds: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +193,9 @@ class ActionExecutor:
         elif req.action is Action.DELETE_KICK:
             await self._rest.kick_member(req.guild_id, req.uploader_id, req.reason)
         elif req.action is Action.DELETE_BAN:
-            await self._rest.ban_member(req.guild_id, req.uploader_id, req.reason)
+            await self._rest.ban_member(
+                req.guild_id, req.uploader_id, req.reason, purge_seconds=req.ban_purge_seconds
+            )
         await self._maybe_dm(req)
 
     async def _maybe_dm(self, req: ActionRequest) -> None:

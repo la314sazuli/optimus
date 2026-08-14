@@ -22,6 +22,7 @@ class _FakeRest:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.dms: list[int] = []
+        self.ban_purges: list[int] = []
 
     async def delete_message(self, channel_id: int, message_id: int) -> None:
         self.calls.append("delete_message")
@@ -32,8 +33,11 @@ class _FakeRest:
     async def kick_member(self, guild_id: int, user_id: int, reason: str) -> None:
         self.calls.append("kick_member")
 
-    async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None:
+    async def ban_member(
+        self, guild_id: int, user_id: int, reason: str, purge_seconds: int = 0
+    ) -> None:
         self.calls.append("ban_member")
+        self.ban_purges.append(purge_seconds)
 
     async def unban_member(self, guild_id: int, user_id: int, reason: str) -> None:
         self.calls.append("unban_member")
@@ -180,6 +184,23 @@ async def test_boundary_refusal_downgrades_to_report() -> None:
     assert audits == [("report_only", True)]
 
 
+async def test_ban_carries_configured_purge_window() -> None:
+    # The guild's ban_purge_seconds must flow from config through the request
+    # into the REST call — that's what sweeps the scammer's other messages.
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    reports: list[ReportData] = []
+    audits: list[tuple[str, bool]] = []
+    cfg = _cfg(ban_purge_seconds=86400)
+    coord = _build(
+        rest=rest, redis=redis, cfg=cfg, target=_target(), reports=reports, audits=audits
+    )
+    result = await coord.handle_verdict(_event())
+    assert result.success
+    assert "ban_member" in rest.calls
+    assert rest.ban_purges == [86400]
+
+
 async def test_missing_member_still_deletes_the_message() -> None:
     # The uploader left (or was already banned): the ban is impossible, but the
     # scam message itself must still be removed — not downgraded to report-only.
@@ -204,7 +225,7 @@ async def test_failed_enforcement_is_reported_with_detail() -> None:
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()
 
-    async def _boom(guild_id: int, user_id: int, reason: str) -> None:
+    async def _boom(guild_id: int, user_id: int, reason: str, purge_seconds: int = 0) -> None:
         raise RuntimeError("discord exploded")
 
     rest.ban_member = _boom  # type: ignore[method-assign]

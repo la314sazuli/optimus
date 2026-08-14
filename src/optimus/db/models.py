@@ -84,6 +84,10 @@ class Guild(Base):
     optin_evidence_storage: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     locale: Mapped[str] = mapped_column(String(8), default="en", nullable=False)
     safe_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # How far back (in hours, 0-168) Discord purges the banned user's messages
+    # across ALL channels when a ban executes — mirrors the native ban dialog's
+    # "delete message history" option. 0 disables the purge.
+    ban_purge_hours: Mapped[int] = mapped_column(Integer, default=24, nullable=False)
     created_at: Mapped[datetime] = _ts()
 
 

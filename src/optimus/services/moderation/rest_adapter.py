@@ -52,8 +52,14 @@ class HikariRestActions:
     async def kick_member(self, guild_id: int, user_id: int, reason: str) -> None:
         await self._rest.kick_user(guild_id, user_id, reason=reason)
 
-    async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None:
-        await self._rest.ban_user(guild_id, user_id, reason=reason)
+    async def ban_member(
+        self, guild_id: int, user_id: int, reason: str, purge_seconds: int = 0
+    ) -> None:
+        # delete_message_seconds is Discord's native cross-channel purge — the
+        # same "delete message history" option as the manual ban dialog (max 7d).
+        await self._rest.ban_user(
+            guild_id, user_id, delete_message_seconds=purge_seconds, reason=reason
+        )
 
     async def unban_member(self, guild_id: int, user_id: int, reason: str) -> None:
         await self._rest.unban_user(guild_id, user_id, reason=reason)

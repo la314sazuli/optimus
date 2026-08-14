@@ -236,6 +236,15 @@ def validate_config_set(field: str, raw_value: str) -> ConfigChange:
         if not 1 <= days <= 365:
             raise InteractionRejected(CommandError.INVALID_VALUE)
         return ConfigChange(field, days)
+    if field == "ban_purge_hours":
+        # Discord caps delete_message_seconds at 7 days (604800s) = 168 hours.
+        try:
+            hours = int(text)
+        except ValueError as exc:
+            raise InteractionRejected(CommandError.INVALID_VALUE) from exc
+        if not 0 <= hours <= 168:
+            raise InteractionRejected(CommandError.INVALID_VALUE)
+        return ConfigChange(field, hours)
     if field == "locale":
         from optimus.i18n import available_locales
 

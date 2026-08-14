@@ -182,6 +182,7 @@ class DbDeps:
             # accepts -- the DB column name is an internal storage detail and
             # must not leak into the user-facing config surface.
             "review_channel": guild.review_channel_id,
+            "ban_purge_hours": guild.ban_purge_hours,
             "optin_global_db": guild.optin_global_db,
             "optin_scan_bots": guild.optin_scan_bots,
             "optin_evidence_storage": guild.optin_evidence_storage,

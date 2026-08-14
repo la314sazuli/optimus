@@ -29,7 +29,12 @@ def rest() -> Any:
 
 async def test_ban_member_binds_with_keyword_reason(rest: Any) -> None:
     await HikariRestActions(rest).ban_member(1, 2, "scam")
-    rest.ban_user.assert_awaited_once_with(1, 2, reason="scam")
+    rest.ban_user.assert_awaited_once_with(1, 2, delete_message_seconds=0, reason="scam")
+
+
+async def test_ban_member_forwards_purge_window(rest: Any) -> None:
+    await HikariRestActions(rest).ban_member(1, 2, "scam", purge_seconds=86400)
+    rest.ban_user.assert_awaited_once_with(1, 2, delete_message_seconds=86400, reason="scam")
 
 
 async def test_kick_member_binds_with_keyword_reason(rest: Any) -> None:

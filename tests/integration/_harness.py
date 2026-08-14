@@ -104,7 +104,9 @@ class RecordingRest:
     async def kick_member(self, guild_id: int, user_id: int, reason: str) -> None:
         self._record("kick_member", guild_id, user_id)
 
-    async def ban_member(self, guild_id: int, user_id: int, reason: str) -> None:
+    async def ban_member(
+        self, guild_id: int, user_id: int, reason: str, purge_seconds: int = 0
+    ) -> None:
         self._record("ban_member", guild_id, user_id)
 
     async def unban_member(self, guild_id: int, user_id: int, reason: str) -> None:

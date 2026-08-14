@@ -57,6 +57,9 @@ class GuildModConfig:
     guild_name: str = ""
     review_channel_id: int | None = None
     timeout_seconds: int = 3600
+    #: Seconds of the banned user's message history Discord purges across all
+    #: channels when a ban executes (native ban-dialog behavior). 0 disables.
+    ban_purge_seconds: int = 0
 
 
 #: Resolves a guild's moderation config (Redis-cached / DB-backed at runtime).
@@ -161,6 +164,7 @@ class ModerationCoordinator:
             guild_name=cfg.guild_name,
             locale=cfg.locale,
             timeout_seconds=cfg.timeout_seconds,
+            ban_purge_seconds=cfg.ban_purge_seconds,
         )
         result = await self._dispatch(action, request)
         ACTIONS_TAKEN.labels(action=action.value, success=str(result.success).lower()).inc()
