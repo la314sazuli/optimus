@@ -45,6 +45,10 @@ from optimus.services.moderation.review import ParsedCustomId, ReviewAction
 
 _log = get_logger(__name__)
 
+#: Keep ``/scamhash list`` safely below Discord's 2,000-character message
+#: limit even if every stored hash id uses the column's full 64 characters.
+_HASH_LIST_PREVIEW_LIMIT = 20
+
 
 @dataclass(frozen=True, slots=True)
 class InteractionContext:
@@ -189,7 +193,16 @@ async def _cmd_scamhash(ctx: InteractionContext, deps: InteractionDeps) -> Inter
         rows = await deps.list_guild_hashes(ctx.guild_id)
         if not rows:
             return InteractionResponse("command.hash_list_empty")
-        return InteractionResponse("command.hash_list_header", {"count": len(rows)})
+        hash_ids = sorted(row.hash_id for row in rows)
+        visible_hashes = hash_ids[:_HASH_LIST_PREVIEW_LIMIT]
+        params: dict[str, Any] = {
+            "count": len(hash_ids),
+            "hashes": "\n".join(f"- `{hash_id}`" for hash_id in visible_hashes),
+        }
+        if len(hash_ids) <= _HASH_LIST_PREVIEW_LIMIT:
+            return InteractionResponse("command.hash_list_header", params)
+        params["remaining"] = len(hash_ids) - len(visible_hashes)
+        return InteractionResponse("command.hash_list_truncated", params)
     if sub == "import":
         entries = validate_import(str(ctx.options["file"]))
         added = await _import_hashes(deps, ctx.guild_id, entries, added_by=ctx.user_id)
@@ -317,7 +330,11 @@ async def _review_message(ctx: InteractionContext, deps: InteractionDeps) -> Int
         return InteractionResponse("command.reviewmsg_result_safe_mode", params)
     if policy in ("none", "report_only"):
         return InteractionResponse("command.reviewmsg_result_report_only", params)
-    return InteractionResponse("command.reviewmsg_result_actioned", params)
+    review_channel = config.get("review_channel")
+    if review_channel is None:
+        return InteractionResponse("command.reviewmsg_result_submitted_no_channel", params)
+    params["review_channel"] = review_channel
+    return InteractionResponse("command.reviewmsg_result_submitted", params)
 
 
 async def _cmd_config(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:

@@ -14,6 +14,7 @@ from optimus.services.interactions.attachment_hash import (
 )
 from optimus.services.interactions.handlers import (
     _CONFIG_VIEW_ORDER,
+    _HASH_LIST_PREVIEW_LIMIT,
     InteractionContext,
     handle_command,
     handle_component,
@@ -25,6 +26,7 @@ from optimus.services.interactions.logic import (
     InteractionRejected,
     Permission,
 )
+from optimus.services.interactions.service import render
 from optimus.services.moderation.review import ParsedCustomId, ReviewAction
 
 ADMIN = int(Permission.ADMINISTRATOR)
@@ -499,12 +501,32 @@ async def test_scamhash_remove_not_found_does_not_audit() -> None:
 @pytest.mark.asyncio
 async def test_scamhash_list_non_empty() -> None:
     deps = FakeDeps()
-    deps.hashes["abc"] = GuildHash(
-        hash_id="abc", phash=1, dhash=2, whash=3, ahash=0, source="local"
-    )
+    for hash_id in ("def", "abc"):
+        deps.hashes[hash_id] = GuildHash(
+            hash_id=hash_id, phash=1, dhash=2, whash=3, ahash=0, source="local"
+        )
     resp = await handle_command(_ctx("scamhash", subcommand="list"), deps)
     assert resp.i18n_key == "command.hash_list_header"
-    assert resp.params["count"] == 1
+    assert render(resp, "en") == ("This server has 2 scam hash(es):\n- `abc`\n- `def`")
+
+
+@pytest.mark.asyncio
+async def test_scamhash_list_truncates_to_fit_discord_reply() -> None:
+    deps = FakeDeps()
+    for value in range(_HASH_LIST_PREVIEW_LIMIT + 1):
+        hash_id = f"{value:016x}"
+        deps.hashes[hash_id] = GuildHash(
+            hash_id=hash_id, phash=value, dhash=0, whash=0, ahash=0, source="local"
+        )
+
+    resp = await handle_command(_ctx("scamhash", subcommand="list"), deps)
+    message = render(resp, "en")
+
+    assert resp.i18n_key == "command.hash_list_truncated"
+    assert f"`{_HASH_LIST_PREVIEW_LIMIT - 1:016x}`" in message
+    assert f"`{_HASH_LIST_PREVIEW_LIMIT:016x}`" not in message
+    assert "1 more" in message
+    assert len(message) <= 2000
 
 
 @pytest.mark.asyncio
@@ -889,21 +911,38 @@ async def test_reviewmsg_computes_all_hashes_before_storing_any() -> None:
 
 @pytest.mark.asyncio
 async def test_reviewmsg_reply_reports_configured_action_when_policy_acts() -> None:
-    """With an acting policy the reply must state the queued action -- and with
+    """With an acting policy the reply must state the submitted action -- and with
     a non-acting config the reply must never claim the author was "actioned".
     The old unconditional reviewmsg_result told moderators the message was
     handled even on servers whose policy meant the bot deliberately did
     nothing (the default!), sending them hunting for a delivery bug that was
     actually a config setting."""
-    deps = FakeDeps(config={"action_policy": "delete_ban"})
+    deps = FakeDeps(config={"action_policy": "delete_ban", "review_channel": 444})
     resp = await handle_command(
         _review_ctx(attachments=[(1, "https://x/1.png")], author_id=333), deps
     )
-    assert resp.i18n_key == "command.reviewmsg_result_actioned"
+    assert resp.i18n_key == "command.reviewmsg_result_submitted"
     assert resp.params["action"] == "delete_ban"
     assert resp.params["author_id"] == 333
+    message = render(resp, "en")
+    assert "Submitted delete_ban" in message
+    assert "Queued" not in message
+    assert "<#444>" in message
+    assert "final outcome" in message
     # The verdict still reaches the pipeline regardless of the reply wording.
     assert len(deps.confirmed_scams) == 1
+
+
+@pytest.mark.asyncio
+async def test_reviewmsg_reply_explains_async_outcome_without_review_channel() -> None:
+    deps = FakeDeps(config={"action_policy": "delete_ban"})
+    resp = await handle_command(_review_ctx(), deps)
+
+    assert resp.i18n_key == "command.reviewmsg_result_submitted_no_channel"
+    message = render(resp, "en")
+    assert "Submitted delete_ban" in message
+    assert "asynchronously" in message
+    assert "does not show its final outcome" in message
 
 
 @pytest.mark.asyncio
