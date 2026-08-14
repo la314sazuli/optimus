@@ -180,14 +180,86 @@ async def test_boundary_refusal_downgrades_to_report() -> None:
     assert audits == [("report_only", True)]
 
 
-async def test_missing_member_downgrades_to_report() -> None:
+async def test_missing_member_still_deletes_the_message() -> None:
+    # The uploader left (or was already banned): the ban is impossible, but the
+    # scam message itself must still be removed — not downgraded to report-only.
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     rest = _FakeRest()
     reports: list[ReportData] = []
     audits: list[tuple[str, bool]] = []
     coord = _build(rest=rest, redis=redis, cfg=_cfg(), target=None, reports=reports, audits=audits)
     result = await coord.handle_verdict(_event())
-    assert result.action is Action.REPORT_ONLY
+    assert result.action is Action.DELETE
+    assert result.success
+    assert "delete_message" in rest.calls
+    assert "ban_member" not in rest.calls
+    assert audits == [("delete", True)]
+    assert len(reports) == 1
+    assert reports[0].action_taken == "delete"
+
+
+async def test_failed_enforcement_is_reported_with_detail() -> None:
+    # A crashing REST call must surface in the review-channel report, not just
+    # in a silent audit row.
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+
+    async def _boom(guild_id: int, user_id: int, reason: str) -> None:
+        raise RuntimeError("discord exploded")
+
+    rest.ban_member = _boom  # type: ignore[method-assign]
+    reports: list[ReportData] = []
+    audits: list[tuple[str, bool]] = []
+    coord = _build(
+        rest=rest, redis=redis, cfg=_cfg(), target=_target(), reports=reports, audits=audits
+    )
+    result = await coord.handle_verdict(_event())
+    assert not result.success
+    assert audits == [("delete_ban", False)]
+    assert len(reports) == 1
+    assert reports[0].action_taken == "delete_ban (failed: error:RuntimeError)"
+
+
+async def test_report_poster_failure_does_not_fail_the_verdict() -> None:
+    # The action already ran and was audited; a review-channel posting failure
+    # (missing permission, deleted channel) must not raise out of the handler —
+    # a bus redelivery would only re-run the action into a "duplicate".
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    rest = _FakeRest()
+    audits: list[tuple[str, bool]] = []
+    from optimus.services.moderation.service import _ActionIdempotency
+
+    executor = ActionExecutor(
+        rest,
+        InMemoryRateLimiter(),
+        bot_user_id=999,
+        rate=RateLimit(capacity=10.0, refill_rate=0.001),
+        idempotency_acquire=_ActionIdempotency(redis).acquire,
+        dm_cooldown=Cooldown(redis, window_seconds=3600),
+        breaker=CircuitBreaker(),
+        backoff=BackoffPolicy(base=0.001, max_delay=0.002, max_attempts=2),
+    )
+
+    async def config(_gid: int) -> GuildModConfig:
+        return _cfg()
+
+    async def resolve_target(_gid: int, _uid: int) -> TargetContext | None:
+        return _target()
+
+    async def post(_chan: int, _data: ReportData) -> int | None:
+        raise RuntimeError("no send permission in review channel")
+
+    async def audit(event: VerdictEvent, action: str, result: object) -> int | None:
+        audits.append((action, result.success))  # type: ignore[attr-defined]
+        return 7
+
+    coord = ModerationCoordinator(
+        config=config, target=resolve_target, executor=executor, report=post, audit=audit
+    )
+    result = await coord.handle_verdict(_event())
+    assert result.success
+    assert "ban_member" in rest.calls
+    assert audits == [("delete_ban", True)]
 
 
 async def test_queued_verdict_reports_without_action() -> None:

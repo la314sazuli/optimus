@@ -314,7 +314,13 @@ class InProcessBus:
                 subject=subject,
                 reason="max_deliver",
                 deliveries=delivery.deliveries,
+                exc_info=True,
             )
             return False
-        _log.warning("bus_handler_failed", subject=subject, deliveries=delivery.deliveries)
+        # Without exc_info this line was the ONLY trace of a failing consumer —
+        # a broken moderation handler surfaced as a bare "bus_handler_failed"
+        # with no traceback, which made production failures undiagnosable.
+        _log.warning(
+            "bus_handler_failed", subject=subject, deliveries=delivery.deliveries, exc_info=True
+        )
         return True

@@ -325,7 +325,13 @@ async def run_simple() -> None:  # pragma: no cover - runtime entrypoint
 
     await _register_commands(rest, bot_user_id)
 
-    app = await SimpleApp.build(settings, rest=rest, bot_user_id=bot_user_id)
+    # Moderation must talk to hikari through the adapter: the executor's
+    # RestActions protocol (ban_member(guild, user, reason), timeout_member,
+    # send_dm) does not match hikari's real client, so the raw client would make
+    # every punitive action raise TypeError/AttributeError at runtime.
+    from optimus.services.moderation.rest_adapter import HikariRestActions
+
+    app = await SimpleApp.build(settings, rest=HikariRestActions(rest), bot_user_id=bot_user_id)
     await app.dispatcher.start()
     await app.health.start()
     app.start_pipeline()

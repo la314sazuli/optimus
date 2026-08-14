@@ -318,8 +318,10 @@ async def _amain() -> None:  # pragma: no cover - runtime entrypoint
     def scope() -> AbstractAsyncContextManager[AsyncSession]:
         return session_scope(factory)
 
+    from optimus.services.moderation.rest_adapter import HikariRestActions
+
     coordinator, dispatcher = build_coordinator(
-        settings, scope, rest=rest, redis=redis, bot_user_id=bot_user_id
+        settings, scope, rest=HikariRestActions(rest), redis=redis, bot_user_id=bot_user_id
     )
     await dispatcher.start()
     service = ModerationService(settings, bus, coordinator, scope)

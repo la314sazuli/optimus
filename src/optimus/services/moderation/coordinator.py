@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from prometheus_client import Counter
 
 from optimus.contracts.events import Action, VerdictEvent
+from optimus.core.logging import get_logger
 from optimus.services.moderation.actions import ActionExecutor, ActionRequest, ActionResult
-from optimus.services.moderation.boundaries import TargetContext, check_target
+from optimus.services.moderation.boundaries import BoundaryRefusal, TargetContext, check_target
 from optimus.services.moderation.policy import Decision, PolicyInput, decide
 from optimus.services.moderation.priority import (
     PriorityDispatcher,
@@ -23,6 +24,8 @@ from optimus.services.moderation.priority import (
     classify_action,
 )
 from optimus.services.moderation.review import ReportData
+
+_log = get_logger(__name__)
 
 ACTIONS_TAKEN = Counter(
     "optimus_moderation_actions_total",
@@ -119,7 +122,7 @@ class ModerationCoordinator:
 
         result = await self._execute(event, cfg, action, decision)
         detection_id = await self._audit(event, action.value, result)
-        await self._post_report(event, cfg, action, detection_id)
+        await self._post_report(event, cfg, action, detection_id, result)
         return result
 
     async def _apply_boundaries(
@@ -127,12 +130,18 @@ class ModerationCoordinator:
     ) -> tuple[Action, Decision]:
         ctx = await self._target(event.guild_id, event.uploader_id)
         if ctx is None:
+            # The uploader is gone (left, or already banned). The punitive half
+            # is impossible, but the scam message itself must still be removed —
+            # downgrading all the way to report-only would leave old scam posts
+            # standing whenever the scammer has already departed.
             BOUNDARY_REFUSALS.labels(reason="not_in_guild").inc()
-            return Action.REPORT_ONLY, Decision.MOD_QUEUE
+            return Action.DELETE, decision
         result = check_target(ctx)
         if not result.allowed:
             reason = result.refusal.value if result.refusal else "unknown"
             BOUNDARY_REFUSALS.labels(reason=reason).inc()
+            if result.refusal is BoundaryRefusal.NOT_IN_GUILD:
+                return Action.DELETE, decision
             return Action.REPORT_ONLY, Decision.MOD_QUEUE
         return action, decision
 
@@ -182,21 +191,41 @@ class ModerationCoordinator:
         cfg: GuildModConfig,
         action: Action,
         detection_id: int | None,
+        result: ActionResult,
     ) -> None:
         if cfg.review_channel_id is None or detection_id is None:
             return
-        await self._report(
-            cfg.review_channel_id,
-            ReportData(
-                detection_id=detection_id,
-                guild_id=event.guild_id,
-                channel_id=event.channel_id,
-                message_id=event.message_id,
-                uploader_id=event.uploader_id,
-                verdict=event.verdict.value,
-                confidence=event.confidence,
-                action_taken=action.value,
-                matched_hash_id=event.matched_hash_id,
-                locale=cfg.locale,
-            ),
+        # The report doubles as the guild's status feed: surface the actual
+        # outcome, not just the intended action, so a failed enforcement is
+        # visible in Discord instead of only in an audit row.
+        action_taken = (
+            action.value if result.success else f"{action.value} (failed: {result.detail})"
         )
+        try:
+            await self._report(
+                cfg.review_channel_id,
+                ReportData(
+                    detection_id=detection_id,
+                    guild_id=event.guild_id,
+                    channel_id=event.channel_id,
+                    message_id=event.message_id,
+                    uploader_id=event.uploader_id,
+                    verdict=event.verdict.value,
+                    confidence=event.confidence,
+                    action_taken=action_taken,
+                    matched_hash_id=event.matched_hash_id,
+                    locale=cfg.locale,
+                ),
+            )
+        except Exception:
+            # Posting the report is best-effort status: a failure here (missing
+            # send permission in the review channel, deleted channel) must not
+            # fail the verdict handler — the action already ran and was audited,
+            # and a bus redelivery would only re-run it into a "duplicate".
+            _log.error(
+                "review_report_failed",
+                guild_id=event.guild_id,
+                channel_id=cfg.review_channel_id,
+                detection_id=detection_id,
+                exc_info=True,
+            )

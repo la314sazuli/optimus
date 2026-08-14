@@ -158,6 +158,18 @@ class ActionExecutor:
         except CircuitOpenError:
             return ActionResult(req.action, success=False, detail="circuit_open")
         except Exception as exc:
+            # An enforcement failure must be loud: the caller converts this into
+            # an audit row and a report, but the traceback exists only here.
+            _log.warning(
+                "moderation_action_failed",
+                action=req.action.value,
+                guild_id=req.guild_id,
+                channel_id=req.channel_id,
+                message_id=req.message_id,
+                uploader_id=req.uploader_id,
+                error=type(exc).__name__,
+                exc_info=True,
+            )
             return ActionResult(req.action, success=False, detail=f"error:{type(exc).__name__}")
         return ActionResult(req.action, success=True)
 
