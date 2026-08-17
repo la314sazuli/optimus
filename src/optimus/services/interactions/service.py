@@ -33,6 +33,7 @@ from optimus.db.engine import SessionScope
 from optimus.db.models import Guild, GuildHash, GuildWhitelist
 from optimus.db.repositories import (
     AppealRepository,
+    DeploymentBootRepository,
     DetectionRepository,
     GlobalHashRepository,
     GlobalSubmitterRepository,
@@ -217,7 +218,16 @@ class DbDeps:
         detections = await DetectionRepository(self._session, guild_id).count_in_window(
             now - timedelta(hours=24), now
         )
-        return {"detections": detections, "hours": 24}
+        boot = await DeploymentBootRepository(self._session).summary()
+        first_boot = (
+            boot.first_boot_at.date().isoformat() if boot.first_boot_at is not None else "unknown"
+        )
+        return {
+            "detections": detections,
+            "hours": 24,
+            "boots": boot.boots,
+            "first_boot": first_boot,
+        }
 
     async def opt_out_user(self, user_id: int) -> int:
         repo = UserOptoutRepository(self._session)

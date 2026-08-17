@@ -49,7 +49,7 @@
     "config_set_ok": "Updated **{field}** to `{value}`.",
     "config_unknown_field": "Unknown configuration field `{field}`.",
     "config_invalid_value": "Invalid value for **{field}**: {reason}",
-    "stats_header": "Statistics for the last {hours} hours:\n• Detections: {detections}",
+    "stats_header": "Statistics for the last {hours} hours:\n• Detections: {detections}\n• Database: boot #{boots}, storing data since {first_boot}",
     "stats_empty": "No statistics recorded yet for this server.",
     "stats_detections": "Detections",
     "stats_false_positives": "False positives",

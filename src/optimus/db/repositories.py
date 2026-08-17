@@ -8,7 +8,8 @@ top of Postgres RLS (multi-tenant mode).
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, delete, func, select
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from optimus.db.models import (
     Appeal,
+    DeploymentBoot,
     Detection,
     Evidence,
     GlobalHash,
@@ -31,6 +33,35 @@ from optimus.db.models import (
     StatsRollup,
     UserOptout,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class BootSummary:
+    """Persistence-canary readout: how many boots, and when the first one was."""
+
+    boots: int
+    first_boot_at: datetime | None
+
+
+class DeploymentBootRepository:
+    """Deployment-wide (not guild-scoped) boot markers for persistence checks."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record_boot(self, *, now: datetime | None = None) -> BootSummary:
+        """Insert one boot row and return the updated summary."""
+        self._session.add(DeploymentBoot(booted_at=now or datetime.now(UTC)))
+        await self._session.flush()
+        return await self.summary()
+
+    async def summary(self) -> BootSummary:
+        row = (
+            await self._session.execute(
+                select(func.count(DeploymentBoot.id), func.min(DeploymentBoot.booted_at))
+            )
+        ).one()
+        return BootSummary(boots=int(row[0]), first_boot_at=row[1])
 
 
 class GuildRepository:

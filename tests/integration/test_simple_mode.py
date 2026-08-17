@@ -29,6 +29,7 @@ from optimus.core.config import Settings
 from optimus.core.ratelimit import InMemoryRateLimiter, RateLimit
 from optimus.db.models import Guild, GuildHash
 from optimus.db.repositories import (
+    DeploymentBootRepository,
     DetectionRepository,
     GuildHashRepository,
     GuildRepository,
@@ -215,6 +216,33 @@ async def test_synthetic_image_flows_end_to_end_then_clean_shutdown(
     async with application._scope() as session:  # type: ignore[attr-defined]
         detections = await DetectionRepository(session, GUILD_ID).list_recent()
     assert any(d.action_taken == "delete_ban" for d in detections)
+
+
+async def test_boot_counter_survives_restarts_on_same_database(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # The persistence self-check end to end: two app boots against the SAME
+    # database file must show a growing boot counter and an unchanged first-boot
+    # timestamp. (On Railway this is what proves the /data volume is mounted:
+    # a redeploy that reset the counter to 1 would mean the file was lost.)
+    settings = _settings(tmp_path)
+
+    application = await SimpleApp.build(settings, bot_user_id=0)
+    try:
+        async with application._scope() as session:  # type: ignore[attr-defined]
+            first = await DeploymentBootRepository(session).summary()
+    finally:
+        await application.aclose()
+
+    rebooted = await SimpleApp.build(settings, bot_user_id=0)
+    try:
+        async with rebooted._scope() as session:  # type: ignore[attr-defined]
+            second = await DeploymentBootRepository(session).summary()
+    finally:
+        await rebooted.aclose()
+
+    assert first.boots == 1
+    assert second.boots == 2
+    assert first.first_boot_at is not None
+    assert second.first_boot_at == first.first_boot_at
 
 
 async def test_build_runs_migrations_and_is_ready(tmp_path) -> None:  # type: ignore[no-untyped-def]

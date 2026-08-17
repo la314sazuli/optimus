@@ -56,6 +56,7 @@ from optimus.core.logging import configure_logging, get_logger
 from optimus.core.ratelimit import InMemoryRateLimiter
 from optimus.core.readiness import db_check
 from optimus.db.engine import SessionScope, create_engine, create_session_factory, session_scope
+from optimus.db.repositories import DeploymentBootRepository
 from optimus.services.detection.service import DetectionService
 from optimus.services.detection.service import build_service as build_detection
 from optimus.services.ingest.service import _handle as ingest_handle
@@ -145,6 +146,20 @@ class SimpleApp:
 
         health = HealthServer(host=settings.health_host, port=settings.health_port)
         health.add_readiness_check(db_check(scope), name="database")
+
+        # Persistence canary: record this boot and log the running totals. On a
+        # healthy volume the boot counter grows across redeploys while the
+        # first-boot date stays fixed; a counter reset to 1 with a fresh
+        # first-boot date means the database did not survive the redeploy.
+        async with scope() as session:
+            boot = await DeploymentBootRepository(session).record_boot()
+        _log.info(
+            "persistence_check",
+            boots=boot.boots,
+            first_boot_at=(
+                boot.first_boot_at.isoformat() if boot.first_boot_at is not None else None
+            ),
+        )
 
         return cls(
             settings=settings,

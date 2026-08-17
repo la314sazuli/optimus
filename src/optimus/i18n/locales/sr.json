@@ -49,7 +49,7 @@
     "config_set_ok": "Polje **{field}** je ažurirano na `{value}`.",
     "config_unknown_field": "Nepoznato polje konfiguracije `{field}`.",
     "config_invalid_value": "Nevažeća vrednost za **{field}**: {reason}",
-    "stats_header": "Statistika za poslednjih {hours} sati:\n• Otkrivanja: {detections}",
+    "stats_header": "Statistika za poslednjih {hours} sati:\n• Otkrivanja: {detections}\n• Baza: pokretanje #{boots}, čuva podatke od {first_boot}",
     "stats_empty": "Još uvek nema zabeležene statistike za ovaj server.",
     "stats_detections": "Otkrivanja",
     "stats_false_positives": "Lažni pozitivi",

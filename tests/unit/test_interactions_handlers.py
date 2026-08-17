@@ -81,7 +81,7 @@ class FakeDeps:
         self.config_set.append((field, value))
 
     async def stats_summary(self, guild_id: int) -> dict[str, Any]:
-        return {"detections": 3, "hours": 24}
+        return {"detections": 3, "hours": 24, "boots": 5, "first_boot": "2026-08-01"}
 
     async def opt_out_user(self, user_id: int) -> int:
         self.opted_out.append(user_id)
@@ -685,6 +685,27 @@ async def test_stats_non_empty() -> None:
     assert resp.i18n_key == "command.stats_header"
     assert resp.params["hours"] == 24
     assert "detections" in resp.params  # header renders a body, not a bare colon
+    # The persistence canary is rendered for moderators to eyeball after deploys.
+    assert render(resp, "en") == (
+        "Statistics for the last 24 hours:\n"
+        "\u2022 Detections: 3\n"
+        "\u2022 Database: boot #5, storing data since 2026-08-01"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stats_zero_detections_still_shows_persistence_canary() -> None:
+    deps = FakeDeps()
+
+    async def _quiet(guild_id: int) -> dict[str, Any]:
+        return {"detections": 0, "hours": 24, "boots": 2, "first_boot": "2026-08-01"}
+
+    deps.stats_summary = _quiet  # type: ignore[method-assign]
+    resp = await handle_command(_ctx("stats"), deps)
+    # A quiet server must still surface the boot counter — that's the whole
+    # point of the canary: verify persistence even when nothing was detected.
+    assert resp.i18n_key == "command.stats_header"
+    assert resp.params["boots"] == 2
 
 
 # --- submit_global -------------------------------------------------------------

@@ -262,3 +262,22 @@ async def test_guild_purge_removes_every_owned_row(session: AsyncSession) -> Non
     # Guild 2 is left intact.
     assert await GuildRepository(session).get(2) is not None
     assert await other.get_by_idempotency_key("keep") is not None
+
+
+async def test_deployment_boot_counter_grows_first_boot_stays(session: AsyncSession) -> None:
+    from datetime import UTC, datetime
+
+    from optimus.db.repositories import DeploymentBootRepository
+
+    repo = DeploymentBootRepository(session)
+    empty = await repo.summary()
+    assert empty.boots == 0 and empty.first_boot_at is None
+
+    first = await repo.record_boot(now=datetime(2026, 8, 1, tzinfo=UTC))
+    assert first.boots == 1
+
+    second = await repo.record_boot(now=datetime(2026, 8, 17, tzinfo=UTC))
+    assert second.boots == 2
+    # The persistence canary: the first-boot timestamp never moves.
+    assert second.first_boot_at is not None
+    assert second.first_boot_at.replace(tzinfo=UTC) == datetime(2026, 8, 1, tzinfo=UTC)

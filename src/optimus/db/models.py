@@ -295,6 +295,21 @@ class StatsRollup(Base):
     actions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
+class DeploymentBoot(Base):
+    """One row per process boot — a persistence canary for the database file.
+
+    The row count only ever grows and the first row's timestamp never changes,
+    so a redeploy that silently swapped in a fresh database (e.g. a missing
+    Railway volume) is immediately visible: the boot counter resets to 1 and
+    the first-boot date jumps to "today".
+    """
+
+    __tablename__ = "deployment_boots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    booted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Evidence(Base):
     """A reference to a stored (encrypted, TTL'd) evidence object."""
 

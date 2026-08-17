@@ -417,11 +417,19 @@ def _render_config_value(field: str, value: Any) -> str:
 async def _cmd_stats(ctx: InteractionContext, deps: InteractionDeps) -> InteractionResponse:
     assert ctx.guild_id is not None
     summary = await deps.stats_summary(ctx.guild_id)
-    if not summary or summary.get("detections", 0) == 0:
+    if not summary:
         return InteractionResponse("command.stats_empty")
+    # Zero detections still renders the header: the database line doubles as the
+    # persistence canary (boot count + stable first-boot date), which moderators
+    # need to see on quiet servers too.
     return InteractionResponse(
         "command.stats_header",
-        {"hours": summary.get("hours", 24), "detections": summary.get("detections", 0)},
+        {
+            "hours": summary.get("hours", 24),
+            "detections": summary.get("detections", 0),
+            "boots": summary.get("boots", 0),
+            "first_boot": summary.get("first_boot", "unknown"),
+        },
     )
 
 
