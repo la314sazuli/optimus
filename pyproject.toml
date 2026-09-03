@@ -7,19 +7,19 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "optimus contributors" }]
 dependencies = [
-    "hikari>=2.5.0",
-    "pydantic>=2.13.4",
-    "pydantic-settings>=2.14.2",
-    "sqlalchemy[asyncio]>=2.0.51",
+    "hikari>=2.6.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy[asyncio]>=2.0.52",
     "asyncpg>=0.31.0",
-    "alembic>=1.18.5",
+    "alembic>=1.19.1",
     "redis>=8.1.0",
     "nats-py>=2.15.0",
     "fastapi>=0.141.1",
-    "uvicorn>=0.52.1",
+    "uvicorn>=0.52.4",
     "httpx>=0.28.1",
     "pillow>=12.3.0",
-    "numpy>=2.5.1",
+    "numpy>=2.5.2",
     "PyWavelets>=1.9.0",
     "structlog>=26.1.0",
     "prometheus-client>=0.26.0",
@@ -28,7 +28,7 @@ dependencies = [
     "pynacl>=1.6.2",
     "aiohttp>=3.14.3",
     "aiosqlite>=0.22.1",
-    "opencv-python-headless>=4.10.0",
+    "opencv-python-headless>=5.0.0.93",
     "pytesseract>=0.3.13",
 ]
 
@@ -36,17 +36,17 @@ dependencies = [
 optimus = "optimus.__main__:main"
 
 [project.optional-dependencies]
-embedding = ["onnxruntime>=1.28.0"]
+embedding = ["onnxruntime>=1.29.0"]
 evidence = ["aioboto3>=15.5.0"]
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
-    "hypothesis>=6.165.0",
-    "fakeredis>=2.37.0",
-    "ruff>=0.16.1",
-    "mypy>=2.3.0",
-    "pre-commit>=4.6.1",
+    "hypothesis>=6.167.1",
+    "fakeredis>=2.37.1",
+    "ruff>=0.16.5",
+    "mypy>=2.3.1",
+    "pre-commit>=4.6.2",
     "qrcode[pil]>=8.2",
     "types-redis",
 ]
